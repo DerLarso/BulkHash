@@ -1,2 +1,2 @@
 pub mod file_info;
-pub mod hashed_file_struct;
+pub mod bulk_hash_file_struct;

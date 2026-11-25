@@ -45,7 +45,7 @@ impl HashManager {
                 }
 
                 let final_hash = hasher.finalize();
-
+                println!("File {} hashed!", path);
                 final_hash.to_string()
             }
             HashAlgorithm::Sha256 => {

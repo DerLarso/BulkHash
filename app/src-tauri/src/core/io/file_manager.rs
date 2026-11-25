@@ -1,15 +1,16 @@
 use std::{
+    borrow::Cow,
     fs::File,
     io::{BufReader, BufWriter, Read, Write},
     path::Path,
 };
 
-use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
+use zip::{ZipArchive, ZipWriter, result::ZipResult, write::SimpleFileOptions};
 
 use crate::core::{
     hash_manager::HashAlgorithm,
-    io::{directory_node::DirectoryNode, hashed_error::HashedError, meta_data::MetaData},
-    structs::hashed_file_struct::HashedFileStruct,
+    io::{bulk_hash_error::BulkHashError, directory_node::DirectoryNode, meta_data::MetaData},
+    structs::bulk_hash_file_struct::BulkHashFileStruct,
 };
 
 pub struct FileManager {}
@@ -44,26 +45,26 @@ impl FileManager {
         Ok(())
     }
 
-    pub fn open_file(path: &str) -> Result<HashedFileStruct, HashedError> {
+    pub fn open_file(path: &str) -> Result<BulkHashFileStruct, BulkHashError> {
         if !Path::new(path).exists() {
-            return Err(HashedError::FileNotFound(path.to_string()));
+            return Err(BulkHashError::FileNotFound(path.to_string()));
         }
 
         if !path.ends_with(".hashed") {
-            return Err(HashedError::InvalidEnding(path.to_string()));
+            return Err(BulkHashError::InvalidEnding(path.to_string()));
         }
 
         let file = File::open(path)?;
         let reader = BufReader::new(file);
 
         let mut content = ZipArchive::new(reader)?;
-        FileManager::validate_zip(&content)?;
+        //FileManager::validate_zip(&content)?;
         let meta: MetaData = serde_json::from_reader(content.by_name("meta.json")?)?;
 
         let version = meta.get_version();
 
         if version != 1 {
-            return Err(HashedError::UnsupportedVersion(version));
+            return Err(BulkHashError::UnsupportedVersion(version));
         }
 
         let mut hash_of_tree = String::from("");
@@ -78,24 +79,24 @@ impl FileManager {
         let hash = HashAlgorithm::Sha256.get_hash_from_bytes(&s);
 
         if trimmed != hash {
-            return Err(HashedError::HashMissmatch {
+            return Err(BulkHashError::HashMismatch {
                 expected: trimmed,
                 actual: hash,
             });
         }
 
         let dic: DirectoryNode = serde_json::from_slice(&s)?;
-        Ok(HashedFileStruct::new(meta, dic, hash))
+        Ok(BulkHashFileStruct::new(meta, dic, hash))
     }
-
-    fn validate_zip(f: &ZipArchive<BufReader<File>>) -> Result<(), HashedError> {
-        let file_names: Vec<&str> = f.file_names().collect();
-        let array = ["meta.json", "hash.sha256", "tree.json"];
-        for &a in &array {
-            if !file_names.contains(&a) {
-                return Err(HashedError::FileIsCorrupted(String::from("")));
-            }
-        }
-        Ok(())
-    }
+    //Need a rewrite
+    // fn validate_zip(f: &ZipArchive<BufReader<File>>) -> Result<(), HashedError> {
+    //     let file_names: Vec<_> = f.file_names().collect::<Result<_, _>>()?;
+    //     let array = ["meta.json", "hash.sha256", "tree.json"];
+    //     for &a in &array {
+    //         if !file_names.contains(&a) {
+    //             return Err(HashedError::FileIsCorrupted(String::from("")));
+    //         }
+    //     }
+    //     Ok(())
+    // }
 }

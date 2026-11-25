@@ -1,19 +1,14 @@
 use crate::core::io::{directory_node::DirectoryNode, meta_data::MetaData};
 
-
-pub struct HashedFileStruct {
+pub struct BulkHashFileStruct {
     meta: MetaData,
     tree: DirectoryNode,
     hash: String,
 }
 
-impl HashedFileStruct {
-    pub fn new(meta: MetaData, tree: DirectoryNode, hash: String) -> HashedFileStruct {
-        HashedFileStruct {
-            meta,
-            tree,
-            hash,
-        }
+impl BulkHashFileStruct {
+    pub fn new(meta: MetaData, tree: DirectoryNode, hash: String) -> BulkHashFileStruct {
+        BulkHashFileStruct { meta, tree, hash }
     }
     pub fn get_meta(&self) -> &MetaData {
         &self.meta

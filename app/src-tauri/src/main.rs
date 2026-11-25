@@ -1,5 +1,5 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 fn main() {
-    hashed_lib::run();
+    bulk_hash_lib::run();
 }

@@ -1,5 +1,5 @@
 [package]
-name = "Hashed"
+name = "BulkHash"
 version = "0.1.0"
 description = "Hashing :D"
 authors = ["DerLarso"]
@@ -11,7 +11,7 @@ edition = "2024"
 # The `_lib` suffix may seem redundant but it is necessary
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
-name = "hashed_lib"
+name = "bulk_hash_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
@@ -25,6 +25,6 @@ serde_json = "1"
 sha2 = "0.11.0"
 hex = "0.4.3"
 blake3 = "1.8.7"
-zip = "8.6.0"
+zip = "9.8.2"
 chrono = {version = "0.4.45", features = ["serde"] }
 
