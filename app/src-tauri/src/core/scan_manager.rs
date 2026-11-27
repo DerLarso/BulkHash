@@ -1,4 +1,5 @@
 use crate::core::hash_manager::{HashAlgorithm, HashManager};
+pub use crate::core::ignore_list::IgnoreList;
 use crate::core::io::bulk_hash_error::BulkHashError;
 pub use crate::core::scan_control::{ScanCancelToken, ScanControl, ScanControlState};
 use crate::core::structs::{file_info::FileInfo, single_file_hash::SingleFileHash};
@@ -23,6 +24,7 @@ impl AsRef<Path> for DiscoveredFile {
 struct DiscoveredEntries {
     files: Vec<DiscoveredFile>,
     errors: Vec<FileInfo>,
+    ignored_count: usize,
 }
 
 pub struct ScanManager {
@@ -33,6 +35,8 @@ pub struct ScanManager {
     paused_time: Duration,
     thread_count: Option<usize>,
     control: ScanControl,
+    ignore_list: IgnoreList,
+    ignored_count: usize,
 }
 
 impl ScanManager {
@@ -45,6 +49,8 @@ impl ScanManager {
             paused_time: Duration::ZERO,
             thread_count: None,
             control: ScanControl::new(),
+            ignore_list: IgnoreList::new(),
+            ignored_count: 0,
         }
     }
 
@@ -63,6 +69,25 @@ impl ScanManager {
         self
     }
 
+    pub fn with_ignore_list(mut self, ignore_list: IgnoreList) -> Self {
+        self.ignore_list = ignore_list;
+        self
+    }
+
+    /// Configures the scanner with gitignore-style patterns.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BulkHashError::InvalidIgnorePattern`] if any pattern has invalid syntax.
+    pub fn with_ignore_patterns<I, S>(mut self, patterns: I) -> Result<Self, BulkHashError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.ignore_list = IgnoreList::from_patterns(patterns)?;
+        Ok(self)
+    }
+
     pub fn set_thread_count(&mut self, thread_count: Option<usize>) {
         self.thread_count = thread_count.filter(|&count| count > 0);
     }
@@ -73,6 +98,35 @@ impl ScanManager {
 
     pub fn set_cancel_token(&mut self, cancel_token: impl Into<ScanCancelToken>) {
         self.control.set_cancel_token(cancel_token);
+    }
+
+    pub fn set_ignore_list(&mut self, ignore_list: IgnoreList) {
+        self.ignore_list = ignore_list;
+    }
+
+    /// Appends a single gitignore-style pattern to this scanner's ignore list.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BulkHashError::InvalidIgnorePattern`] if the pattern has invalid syntax.
+    pub fn add_ignore_pattern(&mut self, pattern: impl AsRef<str>) -> Result<(), BulkHashError> {
+        self.ignore_list.add_pattern(pattern)
+    }
+
+    pub fn clear_ignore_list(&mut self) {
+        self.ignore_list.clear();
+    }
+
+    pub fn get_ignore_list(&self) -> &IgnoreList {
+        &self.ignore_list
+    }
+
+    pub fn get_ignore_list_mut(&mut self) -> &mut IgnoreList {
+        &mut self.ignore_list
+    }
+
+    pub fn get_ignored_count(&self) -> usize {
+        self.ignored_count
     }
 
     pub fn get_control(&self) -> ScanControl {
@@ -149,20 +203,41 @@ impl ScanManager {
 
         self.control.checkpoint()?;
 
+        if Self::is_excluded_system_path(root_path) {
+            let (active_time, paused_time) = timer.finish(&self.control);
+            self.hash_time = active_time;
+            self.paused_time = paused_time;
+            return Ok(());
+        }
+
         let root_metadata =
             fs::metadata(root_path).map_err(|err| BulkHashError::from_io(err, path.clone()))?;
 
         if root_metadata.is_file() {
-            match self.compute_hash(root_path) {
-                Err(BulkHashError::ScanCancelled) => return Err(BulkHashError::ScanCancelled),
-                result => self.file_list.push(FileInfo::new(path, result)),
+            let file_ignored = !self.ignore_list.is_empty()
+                && root_path
+                    .file_name()
+                    .map(|name| name.to_string_lossy())
+                    .is_some_and(|name| self.ignore_list.matches_child(&[], name.as_ref(), false));
+
+            if file_ignored {
+                self.ignored_count = self.ignored_count.saturating_add(1);
+            } else {
+                match self.compute_hash(root_path) {
+                    Err(BulkHashError::ScanCancelled) => return Err(BulkHashError::ScanCancelled),
+                    result => self.file_list.push(FileInfo::new(path, result)),
+                }
             }
         } else if root_metadata.is_dir() {
             // Verify the root directory itself is readable so top-level access errors surface directly.
             let initial_entries =
                 fs::read_dir(root_path).map_err(|err| BulkHashError::from_io(err, path.clone()))?;
-            let mut discovered =
-                Self::collect_directory_iterative(initial_entries, root_path, &self.control)?;
+            let mut discovered = Self::collect_directory_iterative(
+                initial_entries,
+                root_path,
+                &self.control,
+                &self.ignore_list,
+            )?;
 
             self.control.checkpoint()?;
 
@@ -177,6 +252,7 @@ impl ScanManager {
                 &self.control,
             )?;
 
+            self.ignored_count = discovered.ignored_count;
             self.file_list
                 .reserve(discovered.errors.len().saturating_add(hashed_files.len()));
             self.file_list.extend(discovered.errors);
@@ -200,11 +276,40 @@ impl ScanManager {
         let timer = self.control.start_timer();
         self.control.checkpoint()?;
 
-        self.file_list = self.hasher.hash_files_with_threads_controlled(
-            paths,
-            self.thread_count,
-            &self.control,
-        )?;
+        if self.ignore_list.is_empty() {
+            self.file_list = self.hasher.hash_files_with_threads_controlled(
+                paths,
+                self.thread_count,
+                &self.control,
+            )?;
+        } else {
+            let mut filtered_paths: Vec<&Path> = Vec::with_capacity(paths.len());
+            let mut ignored_count = 0usize;
+
+            for path in paths {
+                self.control.checkpoint()?;
+                let path_ref = path.as_ref();
+                if Self::is_excluded_system_path(path_ref) {
+                    continue;
+                }
+                let is_dir = path_ref
+                    .symlink_metadata()
+                    .map(|meta| meta.is_dir())
+                    .unwrap_or(false);
+                if self.ignore_list.is_ignored(path_ref, is_dir) {
+                    ignored_count = ignored_count.saturating_add(1);
+                    continue;
+                }
+                filtered_paths.push(path_ref);
+            }
+
+            self.file_list = self.hasher.hash_files_with_threads_controlled(
+                &filtered_paths,
+                self.thread_count,
+                &self.control,
+            )?;
+            self.ignored_count = ignored_count;
+        }
 
         let (active_time, paused_time) = timer.finish(&self.control);
         self.hash_time = active_time;
@@ -243,6 +348,7 @@ impl ScanManager {
         self.hasher.reset_counter();
         self.hash_time = Duration::ZERO;
         self.paused_time = Duration::ZERO;
+        self.ignored_count = 0;
         self.start_path.clear();
         self.start_path.push_str(start_path);
     }
@@ -251,21 +357,25 @@ impl ScanManager {
         initial_entries: fs::ReadDir,
         root_path: &Path,
         control: &ScanControl,
+        ignore_list: &IgnoreList,
     ) -> Result<DiscoveredEntries, BulkHashError> {
         let mut discovered = DiscoveredEntries {
             files: Vec::new(),
             errors: Vec::new(),
+            ignored_count: 0,
         };
-        let mut dir_stack: Vec<PathBuf> = Vec::new();
+        let mut dir_stack: Vec<(PathBuf, Vec<String>)> = Vec::new();
         Self::process_read_dir(
             initial_entries,
             root_path,
+            &[],
             &mut dir_stack,
             &mut discovered,
             control,
+            ignore_list,
         )?;
 
-        while let Some(current_dir) = dir_stack.pop() {
+        while let Some((current_dir, current_rel)) = dir_stack.pop() {
             control.checkpoint()?;
 
             if Self::is_excluded_system_path(&current_dir) {
@@ -277,9 +387,11 @@ impl ScanManager {
                     Self::process_read_dir(
                         entries,
                         &current_dir,
+                        &current_rel,
                         &mut dir_stack,
                         &mut discovered,
                         control,
+                        ignore_list,
                     )?;
                 }
                 Err(err) => {
@@ -298,10 +410,14 @@ impl ScanManager {
     fn process_read_dir(
         entries: fs::ReadDir,
         parent_dir: &Path,
-        dir_stack: &mut Vec<PathBuf>,
+        parent_rel: &[String],
+        dir_stack: &mut Vec<(PathBuf, Vec<String>)>,
         discovered: &mut DiscoveredEntries,
         control: &ScanControl,
+        ignore_list: &IgnoreList,
     ) -> Result<(), BulkHashError> {
+        let has_ignore_rules = !ignore_list.is_empty();
+
         for entry_result in entries {
             control.checkpoint()?;
 
@@ -322,6 +438,48 @@ impl ScanManager {
                 continue;
             }
 
+            let file_type = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(err) => {
+                    let entry_str = entry_path.to_string_lossy().into_owned();
+                    discovered.errors.push(FileInfo::new(
+                        entry_str.clone(),
+                        Err(BulkHashError::from_io(err, entry_str)),
+                    ));
+                    continue;
+                }
+            };
+
+            if file_type.is_symlink() {
+                continue;
+            }
+
+            let is_dir = file_type.is_dir();
+            let is_file = file_type.is_file();
+            if !is_dir && !is_file {
+                continue;
+            }
+
+            if has_ignore_rules {
+                let os_name = entry.file_name();
+                let name_cow = os_name.to_string_lossy();
+                if ignore_list.matches_child(parent_rel, name_cow.as_ref(), is_dir) {
+                    discovered.ignored_count = discovered.ignored_count.saturating_add(1);
+                    continue;
+                }
+
+                if is_dir {
+                    let mut child_rel = Vec::with_capacity(parent_rel.len().saturating_add(1));
+                    child_rel.extend(parent_rel.iter().cloned());
+                    child_rel.push(name_cow.into_owned());
+                    dir_stack.push((entry_path, child_rel));
+                    continue;
+                }
+            } else if is_dir {
+                dir_stack.push((entry_path, Vec::new()));
+                continue;
+            }
+
             let metadata = match entry_path.symlink_metadata() {
                 Ok(meta) => meta,
                 Err(err) => {
@@ -334,18 +492,14 @@ impl ScanManager {
                 }
             };
 
-            if metadata.is_symlink() {
+            if metadata.is_symlink() || !metadata.is_file() {
                 continue;
             }
 
-            if metadata.is_file() {
-                discovered.files.push(DiscoveredFile {
-                    path: entry_path,
-                    size: metadata.len(),
-                });
-            } else if metadata.is_dir() {
-                dir_stack.push(entry_path);
-            }
+            discovered.files.push(DiscoveredFile {
+                path: entry_path,
+                size: metadata.len(),
+            });
         }
 
         Ok(())

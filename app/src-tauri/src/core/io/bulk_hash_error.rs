@@ -16,6 +16,10 @@ pub enum BulkHashError {
     },
     UnsupportedAlgorithm(String),
     UnsupportedVersion(usize),
+    InvalidIgnorePattern {
+        pattern: String,
+        reason: String,
+    },
     FileIsCorrupted(String),
     ScanCancelled,
     Io {
@@ -52,6 +56,7 @@ impl BulkHashError {
             Self::HashMismatch { .. } => "HashMismatch",
             Self::UnsupportedAlgorithm(_) => "UnsupportedAlgorithm",
             Self::UnsupportedVersion(_) => "UnsupportedVersion",
+            Self::InvalidIgnorePattern { .. } => "InvalidIgnorePattern",
             Self::FileIsCorrupted(_) => "FileIsCorrupted",
             Self::ScanCancelled => "ScanCancelled",
             Self::Io { .. } => "Io",
@@ -84,6 +89,9 @@ impl fmt::Display for BulkHashError {
             }
             Self::UnsupportedVersion(version) => {
                 write!(f, "Unsupported version: {version}")
+            }
+            Self::InvalidIgnorePattern { pattern, reason } => {
+                write!(f, "Invalid ignore pattern '{pattern}': {reason}")
             }
             Self::FileIsCorrupted(file) => write!(f, "File is corrupted: {file}"),
             Self::ScanCancelled => write!(f, "Scan was cancelled"),

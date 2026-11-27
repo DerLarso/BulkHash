@@ -1,5 +1,6 @@
 use bulk_hash_lib::core::{
     hash_manager::{HashAlgorithm, HashManager},
+    ignore_list::IgnoreList,
     io::{
         bulk_hash_error::BulkHashError, directory_node::DirectoryNode, file_manager::FileManager,
         meta_data::MetaData,
@@ -1955,4 +1956,506 @@ fn pause_and_resume_during_deep_directory_traversal_discovers_all_files() {
     let resumed_tree = DirectoryNode::build_tree(scanner.get_path(), scanner.get_list());
     assert_eq!(resumed_tree, baseline_tree);
     assert!(scanner.get_paused_time() >= Duration::from_millis(40));
+}
+
+#[test]
+fn scan_manager_default_ignore_list_skips_nothing_except_mandatory_system_paths() {
+    assert!(IgnoreList::new().is_empty());
+    assert!(IgnoreList::default().is_empty());
+    assert_eq!(IgnoreList::new().len(), 0);
+    assert!(IgnoreList::new().patterns().is_empty());
+
+    let dir = TempDir::new("ignore_default_empty");
+    let git_dir = dir.path().join(".git");
+    let nm_dir = dir.path().join("node_modules").join("pkg");
+    let target_dir = dir.path().join("target").join("debug");
+    fs::create_dir_all(&git_dir).expect("create .git");
+    fs::create_dir_all(&nm_dir).expect("create node_modules");
+    fs::create_dir_all(&target_dir).expect("create target");
+
+    // Even when a .gitignore file exists in the scanned directory, nothing is skipped by default.
+    let expected_files = vec![
+        git_dir.join("config"),
+        dir.path().join(".gitignore"),
+        nm_dir.join("index.js"),
+        target_dir.join("app.bin"),
+        dir.path().join("app.log"),
+        dir.path().join(".hidden_file"),
+        dir.path().join("normal.txt"),
+    ];
+
+    fs::write(&expected_files[0], b"[core]\n\trepositoryformatversion = 0\n").expect("write");
+    fs::write(&expected_files[1], b"node_modules/\n*.log\ntarget/\n").expect("write .gitignore");
+    fs::write(&expected_files[2], b"module.exports = {};").expect("write");
+    fs::write(&expected_files[3], b"\x7fELF").expect("write");
+    fs::write(&expected_files[4], b"log entry").expect("write");
+    fs::write(&expected_files[5], b"dotfile content").expect("write");
+    fs::write(&expected_files[6], b"hello").expect("write");
+
+    let mut scanner = ScanManager::new(HashAlgorithm::Blake3);
+    assert!(scanner.get_ignore_list().is_empty());
+    assert_eq!(scanner.get_ignored_count(), 0);
+
+    scanner
+        .start_hash(dir.path().to_string_lossy().into_owned())
+        .expect("default scan should succeed");
+
+    assert_eq!(scanner.get_list().len(), expected_files.len());
+    assert_eq!(
+        scanner.get_hash_manager().get_files_counted(),
+        expected_files.len()
+    );
+    assert_eq!(scanner.get_ignored_count(), 0);
+
+    for path in &expected_files {
+        let path_str = path.to_string_lossy();
+        assert!(
+            scanner
+                .get_list()
+                .iter()
+                .any(|entry| entry.get_path() == path_str && entry.get_result().is_ok()),
+            "default scan must include {path_str}"
+        );
+    }
+
+    // Mandatory OS paths (such as /dev on Linux) are always skipped even with empty or negated ignore lists.
+    #[cfg(target_os = "linux")]
+    if Path::new("/dev").exists() {
+        let mut dev_scanner = ScanManager::new(HashAlgorithm::Blake3);
+        dev_scanner
+            .start_hash(String::from("/dev"))
+            .expect("/dev scan should skip safely");
+        assert!(dev_scanner.get_list().is_empty());
+        assert_eq!(dev_scanner.get_ignored_count(), 0);
+
+        let mut negated_scanner = ScanManager::new(HashAlgorithm::Blake3)
+            .with_ignore_patterns(["!/dev", "!*"])
+            .expect("valid negation patterns");
+        negated_scanner
+            .start_hash(String::from("/dev"))
+            .expect("mandatory system path /dev must not be un-ignored");
+        assert!(negated_scanner.get_list().is_empty());
+        assert_eq!(negated_scanner.get_ignored_count(), 0);
+    }
+}
+
+#[test]
+fn ignore_list_glob_syntax_anchoring_negation_and_case_sensitivity() {
+    let list = IgnoreList::from_patterns([
+        "node_modules",
+        ".git/",
+        "/dist",
+        "./cache/",
+        "docs/*.md",
+        "src/**/*.tmp",
+        "a/**/b",
+        "foo/**",
+        "logs/*",
+        "!logs/keep.log",
+        "*.log",
+        "!important.log",
+        "temp_?.bin",
+        "part_[0-9].dat",
+        "tag_[!0-9].txt",
+        r"\#hash.txt",
+        r"\!bang.txt",
+        r"trail\   ",
+        r"star\*lit.txt",
+    ])
+    .expect("compile comprehensive pattern list");
+
+    // Unanchored basename match (files and directories, plus children via ancestor check)
+    assert!(list.is_ignored("node_modules", true));
+    assert!(list.is_ignored("node_modules", false));
+    assert!(list.is_ignored("apps/web/node_modules", true));
+    assert!(list.is_ignored("apps/web/node_modules/pkg/index.js", false));
+    assert!(!list.is_ignored("my_node_modules", true));
+
+    // Directory-only pattern
+    assert!(list.is_ignored(".git", true));
+    assert!(list.is_ignored("sub/.git/HEAD", false));
+    assert!(!list.is_ignored(".git", false));
+
+    // Root-anchored patterns (`/dist` and `./cache/`)
+    assert!(list.is_ignored("dist", true));
+    assert!(list.is_ignored("dist/app.js", false));
+    assert!(!list.is_ignored("packages/web/dist", true));
+    assert!(!list.is_ignored("packages/web/dist/app.js", false));
+    assert!(list.is_ignored("cache", true));
+    assert!(list.is_ignored("cache/item.bin", false));
+    assert!(!list.is_ignored("cache", false));
+    assert!(!list.is_ignored("nested/cache", true));
+
+    // Mid-slash anchored pattern (`docs/*.md`)
+    assert!(list.is_ignored("docs/readme.md", false));
+    assert!(!list.is_ignored("docs/sub/readme.md", false));
+    assert!(!list.is_ignored("other/docs/readme.md", false));
+
+    // Double-star recursive patterns
+    assert!(list.is_ignored("src/a.tmp", false));
+    assert!(list.is_ignored("src/x/y/z/a.tmp", false));
+    assert!(!list.is_ignored("other/src/a.tmp", false));
+    assert!(list.is_ignored("a/b", false));
+    assert!(list.is_ignored("a/x/b", false));
+    assert!(list.is_ignored("a/x/y/b", false));
+    assert!(!list.is_ignored("x/a/b", false));
+
+    // Trailing `/**` matches everything *inside* `foo`, not `foo` itself
+    assert!(!list.is_ignored("foo", true));
+    assert!(list.is_ignored("foo/bar.txt", false));
+    assert!(list.is_ignored("foo/sub/deep.txt", false));
+
+    // Negation rules (last match wins)
+    assert!(list.is_ignored("app.log", false));
+    assert!(list.is_ignored("sub/app.log", false));
+    assert!(!list.is_ignored("important.log", false));
+    assert!(!list.is_ignored("sub/important.log", false));
+    assert!(!list.is_ignored("logs", true));
+    assert!(list.is_ignored("logs/drop.txt", false));
+    assert!(list.is_ignored("logs/drop.log", false));
+    // Note: `logs/keep.log` matches `logs/*` (ignored), `!logs/keep.log` (un-ignored),
+    // then `*.log` (ignored again because last rule wins!).
+    assert!(list.is_ignored("logs/keep.log", false));
+
+    // Wildcards `?`, character classes, and escaped literals
+    assert!(list.is_ignored("temp_1.bin", false));
+    assert!(list.is_ignored("sub/temp_a.bin", false));
+    assert!(!list.is_ignored("temp_12.bin", false));
+    assert!(list.is_ignored("part_5.dat", false));
+    assert!(!list.is_ignored("part_x.dat", false));
+    assert!(list.is_ignored("tag_a.txt", false));
+    assert!(!list.is_ignored("tag_7.txt", false));
+    assert!(list.is_ignored("#hash.txt", false));
+    assert!(list.is_ignored("!bang.txt", false));
+    assert!(list.is_ignored("trail ", false));
+    assert!(!list.is_ignored("trail", false));
+    assert!(list.is_ignored("star*lit.txt", false));
+    assert!(!list.is_ignored("starXYZlit.txt", false));
+
+    // Re-including nested entries inside `logs/**` + allowlist pattern `*` + `!*/` + `!*.rs`
+    let allowlist = IgnoreList::from_patterns(["*", "!*/", "!*.rs"]).expect("allowlist");
+    assert!(!allowlist.is_ignored("src", true));
+    assert!(!allowlist.is_ignored("src/main.rs", false));
+    assert!(allowlist.is_ignored("src/readme.txt", false));
+    assert!(allowlist.is_ignored("notes.md", false));
+
+    // Excluded parent directory cannot have children re-included (gitignore semantics)
+    let pruned_parent =
+        IgnoreList::from_patterns(["build/", "!build/keep.bin"]).expect("pruned parent");
+    assert!(pruned_parent.is_ignored("build", true));
+    assert!(pruned_parent.is_ignored("build/keep.bin", false));
+
+    // Re-enabling the directory itself works
+    let reenabled = IgnoreList::from_patterns(["build/", "!build/"]).expect("reenabled dir");
+    assert!(!reenabled.is_ignored("build", true));
+    assert!(!reenabled.is_ignored("build/keep.bin", false));
+
+    // Case-sensitive by default vs opt-in case-insensitive (including Unicode & ranges)
+    let mut ci = IgnoreList::from_patterns(["*.log", "[a-z]_item.txt", "[A-Z]_cap.txt", "äpfel.*"])
+        .expect("case sensitivity list");
+    assert!(!ci.is_case_insensitive());
+    assert!(ci.is_ignored("debug.log", false));
+    assert!(!ci.is_ignored("DEBUG.LOG", false));
+    assert!(!ci.is_ignored("K_item.txt", false));
+    assert!(!ci.is_ignored("k_cap.txt", false));
+    assert!(!ci.is_ignored("Äpfel.txt", false));
+
+    ci.set_case_insensitive(true);
+    assert!(ci.is_case_insensitive());
+    assert!(ci.is_ignored("DEBUG.LOG", false));
+    assert!(ci.is_ignored("App.Log", false));
+    assert!(ci.is_ignored("K_item.txt", false));
+    assert!(ci.is_ignored("k_cap.txt", false));
+    assert!(ci.is_ignored("Äpfel.txt", false));
+
+    // `is_ignored_under` and `extend_from` and `clear`
+    assert!(list.is_ignored_under("/workspace/proj", "/workspace/proj/dist/out.js", false));
+    assert!(!list.is_ignored_under(
+        "/workspace/proj",
+        "/workspace/proj/packages/dist/out.js",
+        false
+    ));
+
+    let mut merged = IgnoreList::new();
+    merged.extend_from(&allowlist);
+    assert_eq!(merged.len(), 3);
+    merged.clear();
+    assert!(merged.is_empty());
+}
+
+#[test]
+fn ignore_list_validation_file_loading_and_serde() {
+    // Invalid syntax patterns produce BulkHashError::InvalidIgnorePattern
+    let invalid_patterns = ["!", "/", "///", "./", "[abc", "[]", "[!]", "[z-a]", r"bad\"];
+    for bad in invalid_patterns {
+        let err = IgnoreList::from_patterns([bad])
+            .expect_err(&format!("expected InvalidIgnorePattern for {bad:?}"));
+        assert!(
+            matches!(err, BulkHashError::InvalidIgnorePattern { .. }),
+            "unexpected error for {bad:?}: {err:?}"
+        );
+        assert_eq!(err.kind(), "InvalidIgnorePattern");
+        let json = serde_json::to_value(&err).expect("serialize error");
+        assert_eq!(json["kind"], "InvalidIgnorePattern");
+    }
+
+    // Atomic batch updates: existing list stays intact when any pattern fails validation
+    let mut atomic = IgnoreList::from_patterns(["*.tmp"]).expect("valid initial");
+    assert!(atomic.add_patterns(["*.log", "[unclosed"]).is_err());
+    assert_eq!(atomic.patterns(), &[String::from("*.tmp")]);
+    assert!(!atomic.is_ignored("debug.log", false));
+    assert!(atomic.is_ignored("scratch.tmp", false));
+
+    // Parsing text with BOM, CRLF, comments, blank lines, and FromStr
+    let text = "\u{feff}# Comment line\r\n\r\n   \r\nnode_modules/   \r\n*.log\r\n!keep.log\r\n";
+    let parsed: IgnoreList = text.parse().expect("parse ignore text");
+    assert_eq!(
+        parsed.patterns(),
+        &[
+            String::from("node_modules/"),
+            String::from("*.log"),
+            String::from("!keep.log"),
+        ]
+    );
+    assert!(parsed.is_ignored("node_modules/a.js", false));
+    assert!(parsed.is_ignored("error.log", false));
+    assert!(!parsed.is_ignored("keep.log", false));
+
+    // Only comments and whitespace produce an empty IgnoreList
+    let comments_only = IgnoreList::parse("# just a comment\n\n   \t  \n").expect("comments only");
+    assert!(comments_only.is_empty());
+
+    // Loading from file + error cases
+    let dir = TempDir::new("ignore_file_loading");
+    let ignore_file = dir.path().join(".bulkhashignore");
+    fs::write(&ignore_file, text).expect("write ignore file");
+    let from_file = IgnoreList::from_file(&ignore_file).expect("load ignore file");
+    assert_eq!(from_file, parsed);
+
+    let missing_err =
+        IgnoreList::from_file(dir.path().join("missing.ignore")).expect_err("FileNotFound");
+    assert!(matches!(missing_err, BulkHashError::FileNotFound(_)));
+
+    let dir_err = IgnoreList::from_file(dir.path()).expect_err("NotAFile");
+    assert!(matches!(dir_err, BulkHashError::NotAFile(_)));
+
+    let bad_utf8 = dir.path().join("binary.ignore");
+    fs::write(&bad_utf8, [0xffu8, 0xfe, 0x00, 0x80]).expect("write invalid utf8");
+    let utf8_err = IgnoreList::from_file(&bad_utf8).expect_err("invalid UTF-8");
+    assert!(matches!(utf8_err, BulkHashError::Io { .. }));
+
+    // Serde JSON roundtrip + invalid deserialization rejection
+    let configured = IgnoreList::from_patterns(["node_modules", "*.bak"])
+        .expect("valid list")
+        .with_case_insensitive(true);
+    let json = serde_json::to_value(&configured).expect("serialize IgnoreList");
+    assert_eq!(json["case_insensitive"], true);
+    assert_eq!(json["patterns"], serde_json::json!(["node_modules", "*.bak"]));
+
+    let restored: IgnoreList = serde_json::from_value(json).expect("deserialize IgnoreList");
+    assert_eq!(restored, configured);
+    assert!(restored.is_ignored("FILE.BAK", false));
+    assert!(restored.is_ignored("NODE_MODULES/a.js", false));
+
+    let bad_json = serde_json::json!({
+        "patterns": ["*.log", "[unclosed"],
+        "case_insensitive": false
+    });
+    assert!(serde_json::from_value::<IgnoreList>(bad_json).is_err());
+}
+
+#[test]
+fn scan_manager_ignore_list_directory_pruning_and_snapshot_roundtrip() {
+    let dir = TempDir::new("ignore_scan_e2e");
+    let root = dir.path();
+
+    fs::create_dir_all(root.join("src")).expect("create src");
+    fs::create_dir_all(root.join("node_modules/pkg/deep")).expect("create node_modules");
+    fs::create_dir_all(root.join(".git/objects/ab")).expect("create .git");
+    fs::create_dir_all(root.join("dist")).expect("create root dist");
+    fs::create_dir_all(root.join("packages/web/dist")).expect("create nested dist");
+    fs::create_dir_all(root.join("logs")).expect("create logs");
+    fs::create_dir_all(root.join("sub/build")).expect("create sub/build dir");
+
+    let expected_included = vec![
+        root.join("src/main.rs"),
+        root.join("src/lib.rs"),
+        root.join("packages/web/dist/keep.js"),
+        root.join("logs/important.log"),
+        root.join("build"), // regular FILE named `build` must NOT be ignored by `build/`
+        root.join("readme.md"),
+    ];
+
+    fs::write(&expected_included[0], b"fn main() {}").expect("write");
+    fs::write(&expected_included[1], b"pub fn lib() {}").expect("write");
+    fs::write(&expected_included[2], b"console.log('keep');").expect("write");
+    fs::write(&expected_included[3], b"critical log").expect("write");
+    fs::write(&expected_included[4], b"build script file").expect("write");
+    fs::write(&expected_included[5], b"# Readme").expect("write");
+
+    // Ignored files and directories
+    fs::write(root.join("src/debug.log"), b"debug").expect("write");
+    fs::write(root.join("node_modules/pkg/index.js"), b"nm1").expect("write");
+    fs::write(root.join("node_modules/pkg/deep/a.js"), b"nm2").expect("write");
+    fs::write(root.join(".git/HEAD"), b"ref: refs/heads/main").expect("write");
+    fs::write(root.join(".git/objects/ab/cd"), b"gitobj").expect("write");
+    fs::write(root.join("dist/bundle.js"), b"root dist").expect("write");
+    fs::write(root.join("logs/error.log"), b"err log").expect("write");
+    fs::write(root.join("sub/build/artifact.o"), b"obj").expect("write");
+
+    let patterns = [
+        "node_modules",
+        ".git/",
+        "/dist",
+        "build/",
+        "*.log",
+        "!important.log",
+    ];
+    let root_str = root.to_string_lossy().into_owned();
+
+    let mut single_threaded = ScanManager::new(HashAlgorithm::Blake3)
+        .with_thread_count(1)
+        .with_ignore_patterns(patterns)
+        .expect("valid patterns");
+    single_threaded
+        .start_hash(root_str.clone())
+        .expect("single-threaded ignored scan");
+
+    let mut parallel = ScanManager::new(HashAlgorithm::Blake3)
+        .with_thread_count(4)
+        .with_ignore_patterns(patterns)
+        .expect("valid patterns");
+    parallel
+        .start_hash(root_str.clone())
+        .expect("parallel ignored scan");
+
+    assert_eq!(single_threaded.get_list().len(), expected_included.len());
+    assert_eq!(parallel.get_list().len(), expected_included.len());
+    assert_eq!(
+        parallel.get_hash_manager().get_files_counted(),
+        expected_included.len()
+    );
+    // 4 pruned directories (node_modules, .git, /dist, sub/build) + 2 ignored files (src/debug.log, logs/error.log)
+    assert_eq!(single_threaded.get_ignored_count(), 6);
+    assert_eq!(parallel.get_ignored_count(), 6);
+
+    let tree_single = DirectoryNode::build_tree(single_threaded.get_path(), single_threaded.get_list());
+    let tree_parallel = DirectoryNode::build_tree(parallel.get_path(), parallel.get_list());
+    assert_eq!(tree_parallel, tree_single);
+
+    for path in &expected_included {
+        let path_str = path.to_string_lossy();
+        assert!(
+            parallel
+                .get_list()
+                .iter()
+                .any(|entry| entry.get_path() == path_str && entry.get_result().is_ok()),
+            "expected included file missing: {path_str}"
+        );
+    }
+
+    // Verify ignored directory pruning prevents reading unreadable directories (non-root Unix check)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let locked_dir = root.join("locked_cache");
+        fs::create_dir_all(&locked_dir).expect("create locked_cache");
+        fs::write(locked_dir.join("secret.bin"), b"secret").expect("write secret");
+        fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o000))
+            .expect("chmod 000 locked_cache");
+
+        // Only assert pruning skips permission error when the OS actually enforces chmod 000
+        let enforces_chmod = fs::read_dir(&locked_dir).is_err();
+        if enforces_chmod {
+            let mut pruned_scan = ScanManager::new(HashAlgorithm::Blake3)
+                .with_ignore_patterns(patterns)
+                .expect("patterns");
+            pruned_scan
+                .add_ignore_pattern("locked_cache/")
+                .expect("add locked_cache");
+            pruned_scan
+                .start_hash(root_str.clone())
+                .expect("scan with pruned unreadable dir");
+
+            assert_eq!(pruned_scan.get_list().len(), expected_included.len());
+            assert!(pruned_scan.get_list().iter().all(|f| f.get_result().is_ok()));
+            assert_eq!(pruned_scan.get_ignored_count(), 7);
+        }
+
+        // Restore permissions so TempDir cleanup succeeds cleanly
+        let _ = fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o755));
+        let _ = fs::remove_dir_all(&locked_dir);
+    }
+
+    // Single-file start_hash honors ignore list, while hash_single_file always hashes explicitly chosen file
+    let log_file = root.join("logs/error.log");
+    parallel
+        .start_hash(log_file.to_string_lossy().into_owned())
+        .expect("single-file start_hash with ignore list");
+    assert!(parallel.get_list().is_empty());
+    assert_eq!(parallel.get_ignored_count(), 1);
+
+    let single_res = parallel
+        .hash_single_file(&log_file)
+        .expect("hash_single_file must hash explicitly chosen file");
+    assert_eq!(single_res.get_file_name(), "error.log");
+    assert_eq!(parallel.get_ignored_count(), 0);
+
+    // Batch `hash_files` respects ignore list and resets `ignored_count` after clearing
+    let batch_inputs = vec![
+        root.join("src/main.rs"),
+        root.join("logs/error.log"),
+        root.join("node_modules/pkg/index.js"),
+        root.join("logs/important.log"),
+    ];
+    parallel
+        .hash_files(&batch_inputs)
+        .expect("hash_files with ignore list");
+    assert_eq!(parallel.get_list().len(), 2);
+    assert_eq!(parallel.get_ignored_count(), 2);
+
+    parallel.clear_ignore_list();
+    assert!(parallel.get_ignore_list().is_empty());
+    parallel
+        .hash_files(&batch_inputs)
+        .expect("hash_files after clearing ignore list");
+    assert_eq!(parallel.get_list().len(), 4);
+    assert_eq!(parallel.get_ignored_count(), 0);
+
+    // Cancelled scan with ignore list leaves ignored_count and file_list clean
+    let mut cancelled_scan = ScanManager::new(HashAlgorithm::Blake3)
+        .with_ignore_patterns(patterns)
+        .expect("patterns");
+    cancelled_scan.cancel();
+    let cancel_err = cancelled_scan
+        .start_hash(root_str.clone())
+        .expect_err("expected ScanCancelled");
+    assert!(cancel_err.is_cancelled());
+    assert!(cancelled_scan.get_list().is_empty());
+    assert_eq!(cancelled_scan.get_ignored_count(), 0);
+
+    // Snapshot MetaData roundtrip preserves non-empty IgnoreList and omits empty IgnoreList
+    let output_dir = TempDir::new("ignore_snapshot_out");
+    let ignore_cfg = IgnoreList::from_patterns(patterns)
+        .expect("patterns")
+        .with_case_insensitive(true);
+    let meta_with_ignore = MetaData::new(
+        single_threaded.get_hash_manager().get_files_counted(),
+        single_threaded.get_hash_time(),
+        Utc::now(),
+    )
+    .with_algorithm(HashAlgorithm::Blake3)
+    .with_ignore_list(ignore_cfg.clone());
+
+    let saved =
+        FileManager::save_file(output_dir.path(), &tree_single, &meta_with_ignore).expect("save");
+    let loaded = FileManager::open_file(&saved).expect("open");
+    assert_eq!(loaded.get_meta().get_ignore_list(), Some(&ignore_cfg));
+
+    let meta_empty_ignore =
+        MetaData::new(0, Duration::ZERO, Utc::now()).with_ignore_list(IgnoreList::new());
+    assert_eq!(meta_empty_ignore.get_ignore_list(), None);
+    let meta_json = serde_json::to_value(&meta_empty_ignore).expect("serialize meta");
+    assert!(meta_json.get("ignore_list").is_none());
 }
