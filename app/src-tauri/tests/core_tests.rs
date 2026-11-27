@@ -4,7 +4,7 @@ use bulk_hash_lib::core::{
         bulk_hash_error::BulkHashError, directory_node::DirectoryNode, file_manager::FileManager,
         meta_data::MetaData,
     },
-    scan_manager::{ScanCancelToken, ScanManager},
+    scan_manager::{ScanCancelToken, ScanControl, ScanControlState, ScanManager},
     structs::file_info::FileInfo,
 };
 use chrono::Utc;
@@ -1214,4 +1214,745 @@ fn live_concurrent_cancellation_stops_multithreaded_and_single_file_scans_prompt
         assert!(scanner.get_list().is_empty());
         assert_eq!(scanner.get_hash_manager().get_files_counted(), 0);
     }
+}
+
+#[test]
+fn scan_control_state_transitions_serialization_and_interop() {
+    let control = ScanControl::new();
+    let cloned = control.clone();
+
+    assert_eq!(control.state(), ScanControlState::Running);
+    assert_eq!(control.state().to_string(), "Running");
+    assert!(!control.is_paused());
+    assert!(!control.is_cancelled());
+    assert_eq!(control.paused_thread_count(), 0);
+    assert!(control.checkpoint().is_ok());
+
+    // Pause is idempotent and shared across clones
+    control.pause();
+    assert!(control.is_paused());
+    assert!(cloned.is_paused());
+    assert_eq!(control.state(), ScanControlState::Paused);
+    assert_eq!(control.state().to_string(), "Paused");
+    control.pause();
+    assert!(control.is_paused());
+
+    // Resume is idempotent and restores Running state
+    cloned.resume();
+    assert!(!control.is_paused());
+    assert!(!cloned.is_paused());
+    assert_eq!(control.state(), ScanControlState::Running);
+    control.resume();
+    assert!(!control.is_paused());
+
+    // Atomic toggle_pause flips cleanly between paused and running
+    assert!(control.toggle_pause());
+    assert!(cloned.is_paused());
+    assert!(!cloned.toggle_pause());
+    assert!(!control.is_paused());
+
+    // Cancelled state takes precedence over paused state
+    control.pause();
+    assert_eq!(control.state(), ScanControlState::Paused);
+    control.cancel();
+    assert!(control.is_cancelled());
+    assert!(control.is_paused());
+    assert_eq!(control.state(), ScanControlState::Cancelled);
+    assert_eq!(control.state().to_string(), "Cancelled");
+    assert!(
+        control
+            .checkpoint()
+            .expect_err("cancelled checkpoint must fail even when paused")
+            .is_cancelled()
+    );
+
+    // GUI JSON serialization for ScanControlState
+    assert_eq!(
+        serde_json::to_value(ScanControlState::Running).expect("serialize Running"),
+        "Running"
+    );
+    assert_eq!(
+        serde_json::to_value(ScanControlState::Paused).expect("serialize Paused"),
+        "Paused"
+    );
+    assert_eq!(
+        serde_json::to_value(ScanControlState::Cancelled).expect("serialize Cancelled"),
+        "Cancelled"
+    );
+
+    // reset_cancel clears only cancel; reset clears both cancel and pause
+    control.reset_cancel();
+    assert!(!control.is_cancelled());
+    assert!(control.is_paused());
+    assert_eq!(control.state(), ScanControlState::Paused);
+
+    control.cancel();
+    control.reset();
+    assert!(!control.is_cancelled());
+    assert!(!control.is_paused());
+    assert_eq!(control.state(), ScanControlState::Running);
+    assert!(control.checkpoint().is_ok());
+
+    // ScanManager builder / setter / accessor interop
+    let shared_control = ScanControl::new();
+    let mut scanner =
+        ScanManager::new(HashAlgorithm::Blake3).with_control(shared_control.clone());
+    assert_eq!(scanner.get_control_state(), ScanControlState::Running);
+
+    shared_control.pause();
+    assert!(scanner.is_paused());
+    assert_eq!(scanner.get_control_state(), ScanControlState::Paused);
+
+    assert!(!scanner.toggle_pause());
+    assert!(!shared_control.is_paused());
+
+    scanner.pause();
+    assert!(shared_control.is_paused());
+    scanner.resume();
+    assert!(!shared_control.is_paused());
+
+    let replacement = ScanControl::new();
+    scanner.set_control(replacement.clone());
+    replacement.pause();
+    assert!(scanner.is_paused());
+    assert!(!shared_control.is_paused());
+
+    scanner.cancel();
+    assert!(replacement.is_cancelled());
+    scanner.reset_control();
+    assert_eq!(scanner.get_control_state(), ScanControlState::Running);
+    assert_eq!(replacement.state(), ScanControlState::Running);
+}
+
+#[test]
+fn pre_paused_scans_block_until_resumed_and_exclude_pause_from_hash_time() {
+    let dir = TempDir::new("pre_pause_scan");
+    let sub = dir.path().join("nested");
+    fs::create_dir_all(&sub).expect("create nested dir");
+
+    let f1 = dir.path().join("alpha.txt");
+    let f2 = sub.join("beta.txt");
+    let f3 = sub.join("gamma.txt");
+    fs::write(&f1, b"alpha-pause-payload").expect("write alpha");
+    fs::write(&f2, b"beta-pause-payload").expect("write beta");
+    fs::write(&f3, b"gamma-pause-payload").expect("write gamma");
+
+    let pause_hold = Duration::from_millis(120);
+    let min_expected_pause = Duration::from_millis(80);
+    let wait_timeout = Duration::from_secs(2);
+
+    // 1. Pre-paused directory start_hash
+    {
+        let mut scanner = ScanManager::new(HashAlgorithm::Sha256).with_thread_count(2);
+        let control = scanner.get_control();
+        control.pause();
+
+        let dir_str = dir.path().to_string_lossy().into_owned();
+        let handle = thread::spawn(move || {
+            let result = scanner.start_hash(dir_str);
+            (scanner, result)
+        });
+
+        assert!(
+            control.wait_for_paused_threads(1, wait_timeout),
+            "directory scan thread should park at initial pause checkpoint"
+        );
+        thread::sleep(pause_hold);
+        assert!(
+            !handle.is_finished(),
+            "paused directory scan must not complete before resume"
+        );
+
+        control.resume();
+        let (scanner, result) = handle.join().expect("directory scan thread panicked");
+        result.expect("resumed directory scan must succeed");
+
+        assert_eq!(scanner.get_list().len(), 3);
+        assert_eq!(scanner.get_hash_manager().get_files_counted(), 3);
+        assert!(
+            scanner.get_paused_time() >= min_expected_pause,
+            "expected paused_time >= {min_expected_pause:?}, got {:?}",
+            scanner.get_paused_time()
+        );
+        assert!(
+            scanner.get_hash_time() < scanner.get_paused_time(),
+            "active hash_time ({:?}) should exclude paused_time ({:?})",
+            scanner.get_hash_time(),
+            scanner.get_paused_time()
+        );
+    }
+
+    // 2. Pre-paused single-file start_hash
+    {
+        let mut scanner = ScanManager::new(HashAlgorithm::Sha256);
+        let control = scanner.get_control();
+        control.pause();
+
+        let file_str = f1.to_string_lossy().into_owned();
+        let handle = thread::spawn(move || {
+            let result = scanner.start_hash(file_str);
+            (scanner, result)
+        });
+
+        assert!(
+            control.wait_for_paused_threads(1, wait_timeout),
+            "single-file start_hash should park when pre-paused"
+        );
+        thread::sleep(pause_hold);
+        assert!(!handle.is_finished());
+
+        control.resume();
+        let (scanner, result) = handle.join().expect("single-file start_hash thread panicked");
+        result.expect("resumed single-file start_hash must succeed");
+
+        assert_eq!(scanner.get_list().len(), 1);
+        assert_eq!(
+            scanner.get_list()[0].get_result().as_deref().ok(),
+            Some(HashAlgorithm::Sha256.get_hash_from_bytes(b"alpha-pause-payload").as_str())
+        );
+        assert!(scanner.get_paused_time() >= min_expected_pause);
+        assert!(scanner.get_hash_time() < scanner.get_paused_time());
+    }
+
+    // 3. Pre-paused ScanManager::hash_files
+    {
+        let mut scanner = ScanManager::new(HashAlgorithm::Blake3).with_thread_count(2);
+        let control = scanner.get_control();
+        control.pause();
+
+        let files = vec![f1.clone(), f2.clone(), f3.clone()];
+        let handle = thread::spawn(move || {
+            let result = scanner.hash_files(&files);
+            (scanner, result)
+        });
+
+        assert!(
+            control.wait_for_paused_threads(1, wait_timeout),
+            "hash_files should park when pre-paused"
+        );
+        thread::sleep(pause_hold);
+        assert!(!handle.is_finished());
+
+        control.resume();
+        let (scanner, result) = handle.join().expect("hash_files thread panicked");
+        result.expect("resumed hash_files must succeed");
+
+        assert_eq!(scanner.get_list().len(), 3);
+        assert_eq!(scanner.get_hash_manager().get_files_counted(), 3);
+        assert!(scanner.get_paused_time() >= min_expected_pause);
+        assert!(scanner.get_hash_time() < scanner.get_paused_time());
+    }
+
+    // 4. Pre-paused ScanManager::hash_single_file
+    {
+        let mut scanner = ScanManager::new(HashAlgorithm::Blake3);
+        let control = scanner.get_control();
+        control.pause();
+
+        let file_path = f2.clone();
+        let handle = thread::spawn(move || {
+            let result = scanner.hash_single_file(&file_path);
+            (scanner, result)
+        });
+
+        assert!(
+            control.wait_for_paused_threads(1, wait_timeout),
+            "hash_single_file should park when pre-paused"
+        );
+        thread::sleep(pause_hold);
+        assert!(!handle.is_finished());
+
+        control.resume();
+        let (scanner, result) = handle.join().expect("hash_single_file thread panicked");
+        let single_hash = result.expect("resumed hash_single_file must succeed");
+
+        assert_eq!(
+            single_hash.get_hash(),
+            HashAlgorithm::Blake3.get_hash_from_bytes(b"beta-pause-payload")
+        );
+        assert!(scanner.get_paused_time() >= min_expected_pause);
+        assert!(
+            single_hash.get_hash_time() < scanner.get_paused_time(),
+            "SingleFileHash hash_time ({:?}) should exclude paused_time ({:?})",
+            single_hash.get_hash_time(),
+            scanner.get_paused_time()
+        );
+    }
+}
+
+#[test]
+fn live_pause_and_resume_preserves_exact_hashes_across_multithreaded_and_single_file_scans() {
+    let dir = TempDir::new("live_pause_resume");
+    let nested = dir.path().join("sub");
+    fs::create_dir_all(&nested).expect("create sub dir");
+
+    // Build 4 deterministic non-zero multi-chunk files (4 MiB = 64 chunks each) so SHA-512 runs
+    // long enough to pause mid-file and any offset/buffer corruption during pause/resume is
+    // guaranteed to fail hash verification.
+    let file_len = 4 * 1024 * 1024_usize;
+    let mut paths = Vec::new();
+    let mut expected_hashes = Vec::new();
+
+    for idx in 0..4usize {
+        let mut payload = vec![0u8; file_len];
+        for (offset, byte) in payload.iter_mut().enumerate() {
+            *byte = ((offset.wrapping_mul(31 + idx * 7) ^ (offset >> 8) ^ (idx * 53)) & 0xFF) as u8;
+        }
+        let path = if idx % 2 == 0 {
+            dir.path().join(format!("chunked_{idx}.bin"))
+        } else {
+            nested.join(format!("chunked_{idx}.bin"))
+        };
+        fs::write(&path, &payload).expect("write deterministic file");
+        expected_hashes.push(HashAlgorithm::Sha512.get_hash_from_bytes(&payload));
+        paths.push(path);
+    }
+
+    let dir_str = dir.path().to_string_lossy().into_owned();
+
+    // Unpaused baseline directory scan for exact tree comparison
+    let mut baseline = ScanManager::new(HashAlgorithm::Sha512).with_thread_count(2);
+    baseline
+        .start_hash(dir_str.clone())
+        .expect("baseline scan should succeed");
+    let baseline_tree = DirectoryNode::build_tree(baseline.get_path(), baseline.get_list());
+    assert_eq!(baseline.get_paused_time(), Duration::ZERO);
+
+    // 1. Live multi-cycle pause & resume on multithreaded directory scan
+    {
+        let mut scanner = ScanManager::new(HashAlgorithm::Sha512).with_thread_count(2);
+        let control = scanner.get_control();
+        let barrier = Arc::new(Barrier::new(2));
+        let worker_barrier = Arc::clone(&barrier);
+        let dir_clone = dir_str.clone();
+
+        let handle = thread::spawn(move || {
+            worker_barrier.wait();
+            let result = scanner.start_hash(dir_clone);
+            (scanner, result)
+        });
+
+        barrier.wait();
+        thread::sleep(Duration::from_millis(2));
+
+        // First pause cycle
+        control.pause();
+        assert!(
+            control.wait_for_paused_threads(1, Duration::from_secs(2)),
+            "multithreaded directory scan must park at least one worker when paused"
+        );
+        thread::sleep(Duration::from_millis(80));
+        assert!(
+            !handle.is_finished(),
+            "scan must remain suspended while paused"
+        );
+        control.resume();
+
+        // Second pause cycle (if still running)
+        thread::sleep(Duration::from_millis(2));
+        control.pause();
+        if control.wait_for_paused_threads(1, Duration::from_millis(150)) {
+            thread::sleep(Duration::from_millis(50));
+            assert!(!handle.is_finished());
+        }
+        control.resume();
+
+        let (scanner, result) = handle.join().expect("paused directory scan panicked");
+        result.expect("resumed directory scan must succeed");
+
+        assert_eq!(scanner.get_list().len(), 4);
+        assert_eq!(scanner.get_hash_manager().get_files_counted(), 4);
+        assert!(scanner.get_paused_time() >= Duration::from_millis(50));
+        let resumed_tree = DirectoryNode::build_tree(scanner.get_path(), scanner.get_list());
+        assert_eq!(
+            resumed_tree, baseline_tree,
+            "resumed multithreaded directory scan must match unpaused baseline exactly"
+        );
+        assert_eq!(control.paused_thread_count(), 0);
+    }
+
+    // 2. Live mid-file pause & resume on hash_single_file
+    {
+        let mut scanner = ScanManager::new(HashAlgorithm::Sha512);
+        let control = scanner.get_control();
+        let barrier = Arc::new(Barrier::new(2));
+        let worker_barrier = Arc::clone(&barrier);
+        let target_file = paths[0].clone();
+
+        let handle = thread::spawn(move || {
+            worker_barrier.wait();
+            let result = scanner.hash_single_file(&target_file);
+            (scanner, result)
+        });
+
+        barrier.wait();
+        thread::sleep(Duration::from_millis(2));
+        control.pause();
+        assert!(
+            control.wait_for_paused_threads(1, Duration::from_secs(2)),
+            "single-file scan must park mid-file when paused"
+        );
+        thread::sleep(Duration::from_millis(80));
+        assert!(!handle.is_finished());
+        control.resume();
+
+        let (scanner, result) = handle.join().expect("single-file pause thread panicked");
+        let hashed = result.expect("resumed hash_single_file must succeed");
+        assert_eq!(hashed.get_hash(), expected_hashes[0]);
+        assert_eq!(scanner.get_hash_manager().get_files_counted(), 1);
+        assert!(scanner.get_paused_time() >= Duration::from_millis(50));
+        assert_eq!(control.paused_thread_count(), 0);
+    }
+
+    // 3. Live pause & resume on ScanManager::hash_files (1 thread and 2 threads) preserving order
+    for thread_count in [1usize, 2usize] {
+        let mut scanner = ScanManager::new(HashAlgorithm::Sha512).with_thread_count(thread_count);
+        let control = scanner.get_control();
+        let barrier = Arc::new(Barrier::new(2));
+        let worker_barrier = Arc::clone(&barrier);
+        let files_clone = paths.clone();
+
+        let handle = thread::spawn(move || {
+            worker_barrier.wait();
+            let result = scanner.hash_files(&files_clone);
+            (scanner, result)
+        });
+
+        barrier.wait();
+        thread::sleep(Duration::from_millis(2));
+        control.pause();
+        assert!(
+            control.wait_for_paused_threads(1, Duration::from_secs(2)),
+            "hash_files (threads={thread_count}) must park when paused"
+        );
+        thread::sleep(Duration::from_millis(70));
+        assert!(!handle.is_finished());
+        control.resume();
+
+        let (scanner, result) = handle.join().expect("hash_files pause thread panicked");
+        result.expect("resumed hash_files must succeed");
+
+        assert_eq!(scanner.get_list().len(), paths.len());
+        assert_eq!(scanner.get_hash_manager().get_files_counted(), paths.len());
+        assert!(scanner.get_paused_time() >= Duration::from_millis(40));
+        for ((entry, expected_path), expected_hash) in scanner
+            .get_list()
+            .iter()
+            .zip(&paths)
+            .zip(&expected_hashes)
+        {
+            assert_eq!(entry.get_path(), expected_path.to_string_lossy());
+            assert_eq!(
+                entry.get_result().as_deref().ok(),
+                Some(expected_hash.as_str()),
+                "hash mismatch for thread_count={thread_count}"
+            );
+        }
+    }
+}
+
+#[test]
+fn hash_manager_controlled_methods_support_pause_resume_cancel_and_error_isolation() {
+    let dir = TempDir::new("hash_manager_controlled");
+    let subdir = dir.path().join("folder");
+    fs::create_dir_all(&subdir).expect("create subdir");
+
+    let f1 = dir.path().join("01_a.txt");
+    let f2 = dir.path().join("02_b.bin");
+    let missing = dir.path().join("03_missing.txt");
+    let f3 = dir.path().join("04_c.txt");
+
+    let payload_b: Vec<u8> = (0..(180 * 1024))
+        .map(|i| ((i * 17 + 11) % 256) as u8)
+        .collect();
+    fs::write(&f1, b"controlled-a").expect("write f1");
+    fs::write(&f2, &payload_b).expect("write f2");
+    fs::write(&f3, b"controlled-c").expect("write f3");
+
+    let inputs = vec![f1.clone(), f2.clone(), missing.clone(), subdir.clone(), f3.clone()];
+    let control = ScanControl::new();
+
+    // 1. Running control succeeds across all HashManager *_controlled methods
+    let mut mgr = HashManager::new(HashAlgorithm::Sha256);
+    let code = mgr
+        .get_hash_code_controlled(&f1, &control)
+        .expect("get_hash_code_controlled");
+    assert_eq!(
+        code,
+        HashAlgorithm::Sha256.get_hash_from_bytes(b"controlled-a")
+    );
+
+    let single = mgr
+        .hash_single_file_controlled(&f2, &control)
+        .expect("hash_single_file_controlled");
+    assert_eq!(
+        single.get_hash(),
+        HashAlgorithm::Sha256.get_hash_from_bytes(&payload_b)
+    );
+
+    mgr.reset_counter();
+    let results = mgr
+        .hash_files_controlled(&inputs, &control)
+        .expect("hash_files_controlled");
+    assert_eq!(results.len(), inputs.len());
+    assert_eq!(mgr.get_files_counted(), 3);
+    assert!(matches!(
+        results[2].get_result(),
+        Err(BulkHashError::FileNotFound(_))
+    ));
+    assert!(matches!(
+        results[3].get_result(),
+        Err(BulkHashError::NotAFile(_))
+    ));
+
+    // 2. Pre-paused HashManager::hash_files_with_threads_controlled resumes cleanly
+    control.pause();
+    let worker_control = control.clone();
+    let worker_inputs = inputs.clone();
+    let handle = thread::spawn(move || {
+        let mut worker_mgr = HashManager::new(HashAlgorithm::Blake3);
+        let res = worker_mgr.hash_files_with_threads_controlled(
+            &worker_inputs,
+            Some(2),
+            &worker_control,
+        );
+        (worker_mgr, res)
+    });
+
+    assert!(control.wait_for_paused_threads(1, Duration::from_secs(2)));
+    thread::sleep(Duration::from_millis(60));
+    assert!(!handle.is_finished());
+    control.resume();
+
+    let (worker_mgr, res) = handle.join().expect("controlled worker thread panicked");
+    let batch = res.expect("resumed controlled batch must succeed");
+    assert_eq!(batch.len(), inputs.len());
+    assert_eq!(worker_mgr.get_files_counted(), 3);
+    assert_eq!(
+        batch[0].get_result().as_deref().ok(),
+        Some(HashAlgorithm::Blake3.get_hash_from_bytes(b"controlled-a").as_str())
+    );
+    assert_eq!(
+        batch[1].get_result().as_deref().ok(),
+        Some(HashAlgorithm::Blake3.get_hash_from_bytes(&payload_b).as_str())
+    );
+    assert_eq!(
+        batch[4].get_result().as_deref().ok(),
+        Some(HashAlgorithm::Blake3.get_hash_from_bytes(b"controlled-c").as_str())
+    );
+
+    // 3. Cancelled control aborts immediately (even on empty slice)
+    control.cancel();
+    let empty_paths: Vec<PathBuf> = Vec::new();
+    assert!(
+        mgr.get_hash_code_controlled(&f1, &control)
+            .expect_err("expected ScanCancelled")
+            .is_cancelled()
+    );
+    assert!(
+        mgr.hash_single_file_controlled(&f1, &control)
+            .expect_err("expected ScanCancelled")
+            .is_cancelled()
+    );
+    assert!(
+        mgr.hash_files_controlled(&empty_paths, &control)
+            .expect_err("expected ScanCancelled")
+            .is_cancelled()
+    );
+}
+
+#[test]
+fn cancelling_a_paused_scan_wakes_workers_immediately_across_all_cancel_paths() {
+    let dir = TempDir::new("cancel_while_paused");
+    let mut sparse_files = Vec::new();
+    let sparse_len = 1024 * 1024 * 1024_u64;
+
+    for idx in 0..4usize {
+        let path = dir.path().join(format!("sparse_{idx}.bin"));
+        let file = File::create(&path).expect("create sparse file");
+        file.set_len(sparse_len).expect("set sparse file length");
+        sparse_files.push(path);
+    }
+
+    let dir_str = dir.path().to_string_lossy().into_owned();
+
+    // 1. Cancel a paused multithreaded scan via ScanControl::cancel()
+    {
+        let mut scanner = ScanManager::new(HashAlgorithm::Sha512).with_thread_count(2);
+        let control = scanner.get_control();
+        let dir_clone = dir_str.clone();
+
+        let handle = thread::spawn(move || {
+            let result = scanner.start_hash(dir_clone);
+            (scanner, result)
+        });
+
+        thread::sleep(Duration::from_millis(15));
+        control.pause();
+        assert!(
+            control.wait_for_paused_threads(2, Duration::from_secs(2)),
+            "both worker threads should park while paused"
+        );
+
+        let cancelled_at = Instant::now();
+        control.cancel();
+
+        let (mut scanner, result) = handle.join().expect("worker thread panicked");
+        let shutdown_elapsed = cancelled_at.elapsed();
+
+        assert!(
+            result
+                .expect_err("cancelling paused scan must return ScanCancelled")
+                .is_cancelled()
+        );
+        assert!(
+            shutdown_elapsed < Duration::from_secs(1),
+            "cancelling paused scan via ScanControl took too long: {shutdown_elapsed:?}"
+        );
+        assert!(scanner.get_list().is_empty());
+        assert_eq!(scanner.get_hash_manager().get_files_counted(), 0);
+        assert_eq!(scanner.get_hash_time(), Duration::ZERO);
+        assert_eq!(scanner.get_paused_time(), Duration::ZERO);
+        assert_eq!(control.paused_thread_count(), 0);
+
+        // Recovery after reset_control()
+        scanner.reset_control();
+        assert_eq!(scanner.get_control_state(), ScanControlState::Running);
+        let small_dir = TempDir::new("recover_after_paused_cancel");
+        let small_file = small_dir.path().join("ok.txt");
+        fs::write(&small_file, b"recovered").expect("write ok.txt");
+        scanner
+            .start_hash(small_dir.path().to_string_lossy().into_owned())
+            .expect("scan after reset_control must succeed");
+        assert_eq!(scanner.get_list().len(), 1);
+    }
+
+    // 2. Cancel a paused scan via externally supplied ScanCancelToken::cancel()
+    {
+        let cancel_token = ScanCancelToken::new();
+        let mut scanner = ScanManager::new(HashAlgorithm::Sha512)
+            .with_thread_count(2)
+            .with_cancel_token(cancel_token.clone());
+        let control = scanner.get_control();
+        let files_clone = sparse_files.clone();
+
+        let handle = thread::spawn(move || {
+            let result = scanner.hash_files(&files_clone);
+            (scanner, result)
+        });
+
+        thread::sleep(Duration::from_millis(15));
+        control.pause();
+        assert!(
+            control.wait_for_paused_threads(2, Duration::from_secs(2)),
+            "both hash_files workers should park while paused"
+        );
+
+        let cancelled_at = Instant::now();
+        cancel_token.cancel();
+
+        let (scanner, result) = handle.join().expect("hash_files thread panicked");
+        let shutdown_elapsed = cancelled_at.elapsed();
+
+        assert!(result.expect_err("expected ScanCancelled").is_cancelled());
+        assert!(
+            shutdown_elapsed < Duration::from_secs(1),
+            "cancelling paused scan via ScanCancelToken took too long: {shutdown_elapsed:?}"
+        );
+        assert!(scanner.get_list().is_empty());
+        assert_eq!(control.paused_thread_count(), 0);
+    }
+
+    // 3. Cancel a paused single-file scan via raw Arc<AtomicBool> (bypassing token methods)
+    {
+        let raw_flag = Arc::new(AtomicBool::new(false));
+        let mut scanner = ScanManager::new(HashAlgorithm::Sha512)
+            .with_cancel_token(Arc::clone(&raw_flag));
+        let control = scanner.get_control();
+        let file_path = sparse_files[0].clone();
+
+        let handle = thread::spawn(move || {
+            let result = scanner.hash_single_file(&file_path);
+            (scanner, result)
+        });
+
+        thread::sleep(Duration::from_millis(15));
+        control.pause();
+        assert!(
+            control.wait_for_paused_threads(1, Duration::from_secs(2)),
+            "single-file scan should park while paused"
+        );
+
+        let cancelled_at = Instant::now();
+        raw_flag.store(true, Ordering::Release);
+
+        let (scanner, result) = handle.join().expect("single-file thread panicked");
+        let shutdown_elapsed = cancelled_at.elapsed();
+
+        assert!(result.expect_err("expected ScanCancelled").is_cancelled());
+        assert!(
+            shutdown_elapsed < Duration::from_secs(1),
+            "cancelling paused scan via raw AtomicBool took too long: {shutdown_elapsed:?}"
+        );
+        assert!(scanner.get_list().is_empty());
+        assert_eq!(scanner.get_hash_manager().get_files_counted(), 0);
+        assert_eq!(control.paused_thread_count(), 0);
+    }
+}
+
+#[test]
+fn pause_and_resume_during_deep_directory_traversal_discovers_all_files() {
+    let dir = TempDir::new("deep_traversal_pause");
+    let mut expected_count = 0usize;
+
+    for folder_idx in 0..40usize {
+        let sub = dir
+            .path()
+            .join(format!("group_{:02}", folder_idx / 8))
+            .join(format!("leaf_{folder_idx:02}"));
+        fs::create_dir_all(&sub).expect("create nested leaf dir");
+        for file_idx in 0..5usize {
+            let file_path = sub.join(format!("file_{file_idx}.txt"));
+            fs::write(&file_path, format!("payload-{folder_idx}-{file_idx}"))
+                .expect("write leaf file");
+            expected_count += 1;
+        }
+    }
+
+    let dir_str = dir.path().to_string_lossy().into_owned();
+
+    let mut baseline = ScanManager::new(HashAlgorithm::Blake3).with_thread_count(2);
+    baseline
+        .start_hash(dir_str.clone())
+        .expect("baseline deep scan");
+    let baseline_tree = DirectoryNode::build_tree(baseline.get_path(), baseline.get_list());
+    assert_eq!(baseline.get_list().len(), expected_count);
+
+    let mut scanner = ScanManager::new(HashAlgorithm::Blake3).with_thread_count(2);
+    let control = scanner.get_control();
+    control.pause();
+
+    let handle = thread::spawn(move || {
+        let result = scanner.start_hash(dir_str);
+        (scanner, result)
+    });
+
+    assert!(control.wait_for_paused_threads(1, Duration::from_secs(2)));
+    thread::sleep(Duration::from_millis(40));
+    control.resume();
+
+    // Pause briefly mid-traversal/mid-scan and resume
+    thread::sleep(Duration::from_millis(2));
+    control.pause();
+    thread::sleep(Duration::from_millis(40));
+    control.resume();
+
+    let (scanner, result) = handle.join().expect("deep traversal thread panicked");
+    result.expect("resumed deep directory scan must succeed");
+
+    assert_eq!(scanner.get_list().len(), expected_count);
+    assert_eq!(scanner.get_hash_manager().get_files_counted(), expected_count);
+    let resumed_tree = DirectoryNode::build_tree(scanner.get_path(), scanner.get_list());
+    assert_eq!(resumed_tree, baseline_tree);
+    assert!(scanner.get_paused_time() >= Duration::from_millis(40));
 }

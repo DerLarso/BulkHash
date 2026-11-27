@@ -1,4 +1,5 @@
 use crate::core::io::bulk_hash_error::BulkHashError;
+use crate::core::scan_control::ScanControl;
 use crate::core::structs::{file_info::FileInfo, single_file_hash::SingleFileHash};
 use md5::Md5;
 use rayon::{ThreadPoolBuilder, prelude::*};
@@ -16,6 +17,39 @@ use xxhash_rust::xxh64::{Xxh64, xxh64};
 
 const HASH_BUFFER_SIZE: usize = 64 * 1024;
 const XXHASH64_SEED: u64 = 0;
+
+#[derive(Clone, Copy)]
+enum ExecutionControl<'a> {
+    None,
+    CancelOnly(&'a AtomicBool),
+    Full(&'a ScanControl),
+}
+
+impl ExecutionControl<'_> {
+    #[inline]
+    fn is_cancelled(self) -> bool {
+        match self {
+            Self::None => false,
+            Self::CancelOnly(flag) => flag.load(Ordering::Acquire),
+            Self::Full(control) => control.is_cancelled(),
+        }
+    }
+
+    #[inline]
+    fn checkpoint(self) -> Result<(), BulkHashError> {
+        match self {
+            Self::None => Ok(()),
+            Self::CancelOnly(flag) => {
+                if flag.load(Ordering::Acquire) {
+                    Err(BulkHashError::ScanCancelled)
+                } else {
+                    Ok(())
+                }
+            }
+            Self::Full(control) => control.checkpoint(),
+        }
+    }
+}
 
 pub struct HashManager {
     files_counted: usize,
@@ -47,7 +81,7 @@ impl HashManager {
     }
 
     pub fn get_hash_code(&mut self, path: impl AsRef<Path>) -> Result<String, BulkHashError> {
-        self.get_hash_code_internal(path.as_ref(), None)
+        self.get_hash_code_internal(path.as_ref(), ExecutionControl::None)
     }
 
     pub fn get_hash_code_cancellable(
@@ -55,17 +89,23 @@ impl HashManager {
         path: impl AsRef<Path>,
         cancel_flag: &AtomicBool,
     ) -> Result<String, BulkHashError> {
-        self.get_hash_code_internal(path.as_ref(), Some(cancel_flag))
+        self.get_hash_code_internal(path.as_ref(), ExecutionControl::CancelOnly(cancel_flag))
+    }
+
+    pub fn get_hash_code_controlled(
+        &mut self,
+        path: impl AsRef<Path>,
+        control: &ScanControl,
+    ) -> Result<String, BulkHashError> {
+        self.get_hash_code_internal(path.as_ref(), ExecutionControl::Full(control))
     }
 
     fn get_hash_code_internal(
         &mut self,
         path_ref: &Path,
-        cancel_flag: Option<&AtomicBool>,
+        control: ExecutionControl<'_>,
     ) -> Result<String, BulkHashError> {
-        if is_cancelled(cancel_flag) {
-            return Err(BulkHashError::ScanCancelled);
-        }
+        control.checkpoint()?;
 
         let path_display = path_ref.to_string_lossy().into_owned();
         let hash = hash_file_with_buffer(
@@ -73,8 +113,11 @@ impl HashManager {
             &mut self.buffer,
             path_ref,
             &path_display,
-            cancel_flag,
+            control,
         )?;
+        if control.is_cancelled() {
+            return Err(BulkHashError::ScanCancelled);
+        }
         self.files_counted = self.files_counted.saturating_add(1);
         Ok(hash)
     }
@@ -83,7 +126,7 @@ impl HashManager {
         &mut self,
         path: impl AsRef<Path>,
     ) -> Result<SingleFileHash, BulkHashError> {
-        self.hash_single_file_internal(path.as_ref(), None)
+        self.hash_single_file_internal(path.as_ref(), ExecutionControl::None)
     }
 
     pub fn hash_single_file_cancellable(
@@ -91,21 +134,30 @@ impl HashManager {
         path: impl AsRef<Path>,
         cancel_flag: &AtomicBool,
     ) -> Result<SingleFileHash, BulkHashError> {
-        self.hash_single_file_internal(path.as_ref(), Some(cancel_flag))
+        self.hash_single_file_internal(path.as_ref(), ExecutionControl::CancelOnly(cancel_flag))
+    }
+
+    pub fn hash_single_file_controlled(
+        &mut self,
+        path: impl AsRef<Path>,
+        control: &ScanControl,
+    ) -> Result<SingleFileHash, BulkHashError> {
+        self.hash_single_file_internal(path.as_ref(), ExecutionControl::Full(control))
     }
 
     fn hash_single_file_internal(
         &mut self,
         path_ref: &Path,
-        cancel_flag: Option<&AtomicBool>,
+        control: ExecutionControl<'_>,
     ) -> Result<SingleFileHash, BulkHashError> {
-        if is_cancelled(cancel_flag) {
-            return Err(BulkHashError::ScanCancelled);
-        }
+        let timer = match control {
+            ExecutionControl::Full(ctrl) => Some(ctrl.start_timer()),
+            ExecutionControl::None | ExecutionControl::CancelOnly(_) => None,
+        };
+        let start_time = Instant::now();
+        control.checkpoint()?;
 
         let path_display = path_ref.to_string_lossy().into_owned();
-        let start_time = Instant::now();
-
         let metadata = fs::metadata(path_ref)
             .map_err(|err| BulkHashError::from_io(err, path_display.clone()))?;
 
@@ -119,10 +171,16 @@ impl HashManager {
             &mut self.buffer,
             path_ref,
             &path_display,
-            cancel_flag,
+            control,
         )?;
+        if control.is_cancelled() {
+            return Err(BulkHashError::ScanCancelled);
+        }
         self.files_counted = self.files_counted.saturating_add(1);
-        let hash_time = start_time.elapsed();
+        let hash_time = match (control, timer) {
+            (ExecutionControl::Full(ctrl), Some(t)) => t.finish(ctrl).0,
+            _ => start_time.elapsed(),
+        };
 
         let file_name = path_ref
             .file_name()
@@ -149,7 +207,7 @@ impl HashManager {
 
         if paths.len() == 1 {
             return self
-                .hash_files_sequential(paths, None)
+                .hash_files_sequential(paths, ExecutionControl::None)
                 .unwrap_or_default();
         }
 
@@ -166,7 +224,22 @@ impl HashManager {
     where
         P: AsRef<Path> + Sync,
     {
-        self.hash_files_with_threads_internal(paths, None, Some(cancel_flag))
+        self.hash_files_with_threads_internal(
+            paths,
+            None,
+            ExecutionControl::CancelOnly(cancel_flag),
+        )
+    }
+
+    pub fn hash_files_controlled<P>(
+        &mut self,
+        paths: &[P],
+        control: &ScanControl,
+    ) -> Result<Vec<FileInfo>, BulkHashError>
+    where
+        P: AsRef<Path> + Sync,
+    {
+        self.hash_files_with_threads_internal(paths, None, ExecutionControl::Full(control))
     }
 
     pub fn hash_files_with_threads<P>(
@@ -177,7 +250,7 @@ impl HashManager {
     where
         P: AsRef<Path> + Sync,
     {
-        self.hash_files_with_threads_internal(paths, thread_count, None)
+        self.hash_files_with_threads_internal(paths, thread_count, ExecutionControl::None)
     }
 
     pub fn hash_files_with_threads_cancellable<P>(
@@ -189,21 +262,35 @@ impl HashManager {
     where
         P: AsRef<Path> + Sync,
     {
-        self.hash_files_with_threads_internal(paths, thread_count, Some(cancel_flag))
+        self.hash_files_with_threads_internal(
+            paths,
+            thread_count,
+            ExecutionControl::CancelOnly(cancel_flag),
+        )
+    }
+
+    pub fn hash_files_with_threads_controlled<P>(
+        &mut self,
+        paths: &[P],
+        thread_count: Option<usize>,
+        control: &ScanControl,
+    ) -> Result<Vec<FileInfo>, BulkHashError>
+    where
+        P: AsRef<Path> + Sync,
+    {
+        self.hash_files_with_threads_internal(paths, thread_count, ExecutionControl::Full(control))
     }
 
     fn hash_files_with_threads_internal<P>(
         &mut self,
         paths: &[P],
         thread_count: Option<usize>,
-        cancel_flag: Option<&AtomicBool>,
+        control: ExecutionControl<'_>,
     ) -> Result<Vec<FileInfo>, BulkHashError>
     where
         P: AsRef<Path> + Sync,
     {
-        if is_cancelled(cancel_flag) {
-            return Err(BulkHashError::ScanCancelled);
-        }
+        control.checkpoint()?;
 
         if paths.is_empty() {
             return Ok(Vec::new());
@@ -211,13 +298,15 @@ impl HashManager {
 
         let normalized_threads = thread_count.filter(|&count| count > 0);
         if paths.len() == 1 || normalized_threads == Some(1) {
-            return self.hash_files_sequential(paths, cancel_flag);
+            return self.hash_files_sequential(paths, control);
         }
 
         let algorithm = self.algorithm;
-        let run_parallel = || match cancel_flag {
-            Some(flag) => hash_paths_parallel_cancellable(algorithm, paths, flag),
-            None => Ok(hash_paths_parallel(algorithm, paths)),
+        let run_parallel = || match control {
+            ExecutionControl::None => Ok(hash_paths_parallel(algorithm, paths)),
+            ExecutionControl::CancelOnly(_) | ExecutionControl::Full(_) => {
+                hash_paths_parallel_controlled(algorithm, paths, control)
+            }
         };
 
         let results = match normalized_threads {
@@ -229,7 +318,7 @@ impl HashManager {
             None => run_parallel()?,
         };
 
-        if is_cancelled(cancel_flag) {
+        if control.is_cancelled() {
             return Err(BulkHashError::ScanCancelled);
         }
 
@@ -240,7 +329,7 @@ impl HashManager {
     fn hash_files_sequential<P>(
         &mut self,
         paths: &[P],
-        cancel_flag: Option<&AtomicBool>,
+        control: ExecutionControl<'_>,
     ) -> Result<Vec<FileInfo>, BulkHashError>
     where
         P: AsRef<Path>,
@@ -248,9 +337,7 @@ impl HashManager {
         let mut results = Vec::with_capacity(paths.len());
 
         for path in paths {
-            if is_cancelled(cancel_flag) {
-                return Err(BulkHashError::ScanCancelled);
-            }
+            control.checkpoint()?;
 
             let path_ref = path.as_ref();
             let path_display = path_ref.to_string_lossy().into_owned();
@@ -259,7 +346,7 @@ impl HashManager {
                 &mut self.buffer,
                 path_ref,
                 &path_display,
-                cancel_flag,
+                control,
             );
             if matches!(result, Err(BulkHashError::ScanCancelled)) {
                 return Err(BulkHashError::ScanCancelled);
@@ -267,7 +354,7 @@ impl HashManager {
             results.push(FileInfo::new(path_display, result));
         }
 
-        if is_cancelled(cancel_flag) {
+        if control.is_cancelled() {
             return Err(BulkHashError::ScanCancelled);
         }
 
@@ -300,11 +387,6 @@ impl HashManager {
     }
 }
 
-#[inline]
-fn is_cancelled(cancel_flag: Option<&AtomicBool>) -> bool {
-    cancel_flag.is_some_and(|flag| flag.load(Ordering::Acquire))
-}
-
 fn hash_paths_parallel<P>(algorithm: HashAlgorithm, paths: &[P]) -> Vec<FileInfo>
 where
     P: AsRef<Path> + Sync,
@@ -316,18 +398,23 @@ where
             |buffer, path| {
                 let path_ref = path.as_ref();
                 let path_display = path_ref.to_string_lossy().into_owned();
-                let result =
-                    hash_file_with_buffer(algorithm, buffer, path_ref, &path_display, None);
+                let result = hash_file_with_buffer(
+                    algorithm,
+                    buffer,
+                    path_ref,
+                    &path_display,
+                    ExecutionControl::None,
+                );
                 FileInfo::new(path_display, result)
             },
         )
         .collect()
 }
 
-fn hash_paths_parallel_cancellable<P>(
+fn hash_paths_parallel_controlled<P>(
     algorithm: HashAlgorithm,
     paths: &[P],
-    cancel_flag: &AtomicBool,
+    control: ExecutionControl<'_>,
 ) -> Result<Vec<FileInfo>, BulkHashError>
 where
     P: AsRef<Path> + Sync,
@@ -337,19 +424,12 @@ where
         .map_init(
             || vec![0u8; HASH_BUFFER_SIZE],
             |buffer, path| {
-                if cancel_flag.load(Ordering::Acquire) {
-                    return Err(BulkHashError::ScanCancelled);
-                }
+                control.checkpoint()?;
 
                 let path_ref = path.as_ref();
                 let path_display = path_ref.to_string_lossy().into_owned();
-                let result = hash_file_with_buffer(
-                    algorithm,
-                    buffer,
-                    path_ref,
-                    &path_display,
-                    Some(cancel_flag),
-                );
+                let result =
+                    hash_file_with_buffer(algorithm, buffer, path_ref, &path_display, control);
                 if matches!(result, Err(BulkHashError::ScanCancelled)) {
                     return Err(BulkHashError::ScanCancelled);
                 }
@@ -365,11 +445,9 @@ fn hash_file_with_buffer(
     buffer: &mut [u8],
     path_ref: &Path,
     path_display: &str,
-    cancel_flag: Option<&AtomicBool>,
+    control: ExecutionControl<'_>,
 ) -> Result<String, BulkHashError> {
-    if is_cancelled(cancel_flag) {
-        return Err(BulkHashError::ScanCancelled);
-    }
+    control.checkpoint()?;
 
     let metadata = fs::metadata(path_ref)
         .map_err(|err| BulkHashError::from_io(err, path_display.to_owned()))?;
@@ -378,7 +456,7 @@ fn hash_file_with_buffer(
         return Err(BulkHashError::NotAFile(path_display.to_owned()));
     }
 
-    hash_regular_file_with_buffer(algorithm, buffer, path_ref, path_display, cancel_flag)
+    hash_regular_file_with_buffer(algorithm, buffer, path_ref, path_display, control)
 }
 
 fn hash_regular_file_with_buffer(
@@ -386,60 +464,58 @@ fn hash_regular_file_with_buffer(
     buffer: &mut [u8],
     path_ref: &Path,
     path_display: &str,
-    cancel_flag: Option<&AtomicBool>,
+    control: ExecutionControl<'_>,
 ) -> Result<String, BulkHashError> {
-    if is_cancelled(cancel_flag) {
-        return Err(BulkHashError::ScanCancelled);
-    }
+    control.checkpoint()?;
 
     let mut file = File::open(path_ref).map_err(|err| BulkHashError::from_io(err, path_display))?;
 
     let hex_string = match algorithm {
         HashAlgorithm::Blake3 => {
             let mut hasher = blake3::Hasher::new();
-            stream_file_into(buffer, &mut file, path_display, cancel_flag, |chunk| {
+            stream_file_into(buffer, &mut file, path_display, control, |chunk| {
                 hasher.update(chunk);
             })?;
             hasher.finalize().to_hex().to_string()
         }
         HashAlgorithm::Sha256 => {
             let mut hasher = Sha256::new();
-            stream_file_into(buffer, &mut file, path_display, cancel_flag, |chunk| {
+            stream_file_into(buffer, &mut file, path_display, control, |chunk| {
                 hasher.update(chunk);
             })?;
             hex::encode(hasher.finalize())
         }
         HashAlgorithm::Sha512 => {
             let mut hasher = Sha512::new();
-            stream_file_into(buffer, &mut file, path_display, cancel_flag, |chunk| {
+            stream_file_into(buffer, &mut file, path_display, control, |chunk| {
                 hasher.update(chunk);
             })?;
             hex::encode(hasher.finalize())
         }
         HashAlgorithm::Md5 => {
             let mut hasher = Md5::new();
-            stream_file_into(buffer, &mut file, path_display, cancel_flag, |chunk| {
+            stream_file_into(buffer, &mut file, path_display, control, |chunk| {
                 hasher.update(chunk);
             })?;
             hex::encode(hasher.finalize())
         }
         HashAlgorithm::XxHash64 => {
             let mut hasher = Xxh64::new(XXHASH64_SEED);
-            stream_file_into(buffer, &mut file, path_display, cancel_flag, |chunk| {
+            stream_file_into(buffer, &mut file, path_display, control, |chunk| {
                 hasher.write(chunk);
             })?;
             format!("{:016x}", hasher.finish())
         }
         HashAlgorithm::XxHash3 => {
             let mut hasher = Xxh3::new();
-            stream_file_into(buffer, &mut file, path_display, cancel_flag, |chunk| {
+            stream_file_into(buffer, &mut file, path_display, control, |chunk| {
                 hasher.update(chunk);
             })?;
             format!("{:016x}", hasher.digest())
         }
         HashAlgorithm::XxHash128 => {
             let mut hasher = Xxh3::new();
-            stream_file_into(buffer, &mut file, path_display, cancel_flag, |chunk| {
+            stream_file_into(buffer, &mut file, path_display, control, |chunk| {
                 hasher.update(chunk);
             })?;
             format!("{:032x}", hasher.digest128())
@@ -453,13 +529,11 @@ fn stream_file_into(
     buffer: &mut [u8],
     file: &mut File,
     path_display: &str,
-    cancel_flag: Option<&AtomicBool>,
+    control: ExecutionControl<'_>,
     mut update: impl FnMut(&[u8]),
 ) -> Result<(), BulkHashError> {
     loop {
-        if is_cancelled(cancel_flag) {
-            return Err(BulkHashError::ScanCancelled);
-        }
+        control.checkpoint()?;
 
         match file.read(buffer) {
             Ok(0) => return Ok(()),

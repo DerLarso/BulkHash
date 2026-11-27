@@ -13,7 +13,7 @@ Backend - Core & Hashing:
 	[#] Weitere Hash-Algorithmen: Unterstützung für MD5, SHA512 und xxHash (extrem schnell) ; Rust
 	[#] Multithreading-Scanner: Paralleles Hashen mehrerer Dateien über alle CPU-Kerne (Rayon) ; Rust
 	[#] Scan-Abbruchfunktion: Sicheres Stoppen eines laufenden Scan-Vorgangs über AtomicBool ; Rust
-	[X] Pause- & Fortsetzen-Funktion: Laufende Scans temporär pausieren und weiterführen ; Rust
+	[#] Pause- & Fortsetzen-Funktion: Laufende Scans temporär pausieren und weiterführen ; Rust
 	[X] Ignore-Listen Support: Überspringen von Ordnern/Dateien per Muster (z. B. node_modules, .git) ; Rust
 	[X] Versteckte Dateien filtern: Option zum Ein- oder Ausschließen von Dotfiles/Systemdateien ; Rust
 
