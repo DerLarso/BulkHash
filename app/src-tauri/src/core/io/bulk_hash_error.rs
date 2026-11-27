@@ -23,6 +23,7 @@ pub enum BulkHashError {
     },
     JsonError(serde_json::Error),
     ZipError(zip::result::ZipError),
+    ThreadPoolError(rayon::ThreadPoolBuildError),
     TauriError(tauri::Error),
 }
 
@@ -54,6 +55,7 @@ impl BulkHashError {
             Self::Io { .. } => "Io",
             Self::JsonError(_) => "JsonError",
             Self::ZipError(_) => "ZipError",
+            Self::ThreadPoolError(_) => "ThreadPoolError",
             Self::TauriError(_) => "TauriError",
         }
     }
@@ -85,6 +87,7 @@ impl fmt::Display for BulkHashError {
             Self::Io { path: None, source } => write!(f, "I/O error: {source}"),
             Self::JsonError(e) => write!(f, "JSON parsing error: {e}"),
             Self::ZipError(e) => write!(f, "ZIP archive error: {e}"),
+            Self::ThreadPoolError(e) => write!(f, "Thread pool error: {e}"),
             Self::TauriError(e) => write!(f, "Application error: {e}"),
         }
     }
@@ -96,6 +99,7 @@ impl std::error::Error for BulkHashError {
             Self::Io { source, .. } => Some(source),
             Self::ZipError(e) => Some(e),
             Self::JsonError(e) => Some(e),
+            Self::ThreadPoolError(e) => Some(e),
             Self::TauriError(e) => Some(e),
             _ => None,
         }
@@ -129,6 +133,12 @@ impl From<serde_json::Error> for BulkHashError {
 impl From<zip::result::ZipError> for BulkHashError {
     fn from(err: zip::result::ZipError) -> Self {
         Self::ZipError(err)
+    }
+}
+
+impl From<rayon::ThreadPoolBuildError> for BulkHashError {
+    fn from(err: rayon::ThreadPoolBuildError) -> Self {
+        Self::ThreadPoolError(err)
     }
 }
 

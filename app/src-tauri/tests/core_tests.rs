@@ -551,3 +551,260 @@ fn hash_algorithm_parsing_metadata_and_snapshot_roundtrip() {
         ))
     );
 }
+
+#[test]
+fn scan_manager_thread_count_configuration_and_normalization() {
+    let mut scanner = ScanManager::new(HashAlgorithm::Blake3);
+    assert_eq!(scanner.get_thread_count(), None);
+    assert!(scanner.effective_thread_count() >= 1);
+
+    let configured = ScanManager::new(HashAlgorithm::Blake3).with_thread_count(4);
+    assert_eq!(configured.get_thread_count(), Some(4));
+    assert_eq!(configured.effective_thread_count(), 4);
+
+    let auto_from_zero = ScanManager::new(HashAlgorithm::Blake3).with_thread_count(0);
+    assert_eq!(auto_from_zero.get_thread_count(), None);
+    assert!(auto_from_zero.effective_thread_count() >= 1);
+
+    scanner.set_thread_count(Some(2));
+    assert_eq!(scanner.get_thread_count(), Some(2));
+    assert_eq!(scanner.effective_thread_count(), 2);
+
+    scanner.set_thread_count(Some(0));
+    assert_eq!(scanner.get_thread_count(), None);
+    assert!(scanner.effective_thread_count() >= 1);
+
+    scanner.set_thread_count(Some(3));
+    scanner.set_thread_count(None);
+    assert_eq!(scanner.get_thread_count(), None);
+}
+
+#[test]
+fn parallel_directory_scan_matches_single_threaded_across_all_algorithms() {
+    let dir = TempDir::new("parallel_scan");
+    let nested = dir.path().join("nested").join("deep");
+    let mixed = dir.path().join("mixed");
+    let empty_subdir = dir.path().join("empty_subdir");
+    fs::create_dir_all(&nested).expect("create nested dir");
+    fs::create_dir_all(&mixed).expect("create mixed dir");
+    fs::create_dir_all(&empty_subdir).expect("create empty subdir");
+
+    let mut expected_files: Vec<(PathBuf, Vec<u8>)> = Vec::new();
+
+    // Empty 0-byte file
+    let empty_path = dir.path().join("empty.bin");
+    fs::write(&empty_path, b"").expect("write empty.bin");
+    expected_files.push((empty_path, Vec::new()));
+
+    // Multi-chunk files (> 64 KiB buffer) to verify per-worker buffer isolation
+    for idx in 0..4usize {
+        let size = (70 + idx * 25) * 1024;
+        let payload: Vec<u8> = (0..size)
+            .map(|b| ((b * (idx + 7) + idx * 19) % 256) as u8)
+            .collect();
+        let path = nested.join(format!("chunked_{idx}.bin"));
+        fs::write(&path, &payload).expect("write chunked file");
+        expected_files.push((path, payload));
+    }
+
+    // Many smaller files across directories (including special characters in filenames)
+    for idx in 0..30usize {
+        let payload = format!("parallel-file-payload-{idx:03}-{}", "x".repeat(idx * 37))
+            .into_bytes();
+        let path = if idx % 3 == 0 {
+            dir.path().join(format!("top_{idx:02}.txt"))
+        } else if idx % 3 == 1 {
+            mixed.join(format!("item {idx:02}.dat"))
+        } else {
+            nested.join(format!("leaf_{idx:02}.log"))
+        };
+        fs::write(&path, &payload).expect("write small file");
+        expected_files.push((path, payload));
+    }
+
+    #[cfg(unix)]
+    {
+        let loop_link = nested.join("root_symlink");
+        std::os::unix::fs::symlink(dir.path(), &loop_link).expect("create symlink");
+    }
+
+    let root_str = dir.path().to_string_lossy().into_owned();
+    let expected_count = expected_files.len();
+
+    for &algo in HashAlgorithm::all() {
+        let mut single = ScanManager::new(algo).with_thread_count(1);
+        single
+            .start_hash(root_str.clone())
+            .expect("single-threaded scan");
+
+        let mut custom_pool = ScanManager::new(algo).with_thread_count(4);
+        custom_pool
+            .start_hash(root_str.clone())
+            .expect("custom thread pool scan");
+
+        let mut all_cores = ScanManager::new(algo);
+        all_cores
+            .start_hash(root_str.clone())
+            .expect("all-cores parallel scan");
+
+        assert_eq!(single.get_list().len(), expected_count);
+        assert_eq!(custom_pool.get_list().len(), expected_count);
+        assert_eq!(all_cores.get_list().len(), expected_count);
+
+        assert_eq!(single.get_hash_manager().get_files_counted(), expected_count);
+        assert_eq!(
+            custom_pool.get_hash_manager().get_files_counted(),
+            expected_count
+        );
+        assert_eq!(
+            all_cores.get_hash_manager().get_files_counted(),
+            expected_count
+        );
+
+        let tree_single = DirectoryNode::build_tree(single.get_path(), single.get_list());
+        let tree_custom = DirectoryNode::build_tree(custom_pool.get_path(), custom_pool.get_list());
+        let tree_all = DirectoryNode::build_tree(all_cores.get_path(), all_cores.get_list());
+
+        assert_eq!(tree_custom, tree_single, "custom pool mismatch for {algo}");
+        assert_eq!(tree_all, tree_single, "all-cores mismatch for {algo}");
+
+        // Verify every computed hash against reference byte hashing
+        for (file_path, payload) in &expected_files {
+            let expected_hash = algo.get_hash_from_bytes(payload);
+            let path_str = file_path.to_string_lossy();
+            let found = all_cores
+                .get_list()
+                .iter()
+                .find(|entry| entry.get_path() == path_str)
+                .expect("file must be present in parallel scan output");
+            assert_eq!(
+                found.get_result().as_deref().ok(),
+                Some(expected_hash.as_str()),
+                "hash mismatch for {path_str} with {algo}"
+            );
+        }
+    }
+
+    // Verify .hashed snapshot roundtrip from a parallel scan
+    let output_dir = TempDir::new("parallel_snapshot_out");
+    let mut scanner = ScanManager::new(HashAlgorithm::Blake3);
+    scanner
+        .start_hash(root_str)
+        .expect("parallel snapshot scan");
+    let tree = DirectoryNode::build_tree(scanner.get_path(), scanner.get_list());
+    let meta = MetaData::new(
+        scanner.get_hash_manager().get_files_counted(),
+        scanner.get_hash_time(),
+        Utc::now(),
+    )
+    .with_algorithm(scanner.get_algorithm());
+    let saved = FileManager::save_file(output_dir.path(), &tree, &meta).expect("save snapshot");
+    let loaded = FileManager::open_file(&saved).expect("open snapshot");
+    assert_eq!(loaded.get_tree(), &tree);
+    assert_eq!(loaded.get_meta().get_files_hashed(), expected_count);
+}
+
+#[test]
+fn hash_files_in_parallel_preserves_order_and_isolates_errors() {
+    let dir = TempDir::new("parallel_multi_files");
+    let subdir = dir.path().join("a_folder");
+    fs::create_dir_all(&subdir).expect("create subdir");
+
+    let empty_file = dir.path().join("00_empty.bin");
+    let small_a = dir.path().join("01_small_a.txt");
+    let large_file = dir.path().join("02_large.bin");
+    let small_b = dir.path().join("03_small_b.txt");
+    let missing_file = dir.path().join("99_missing.txt");
+
+    let large_payload: Vec<u8> = (0..(150 * 1024))
+        .map(|i| ((i * 13 + 7) % 256) as u8)
+        .collect();
+
+    fs::write(&empty_file, b"").expect("write empty");
+    fs::write(&small_a, b"alpha-parallel").expect("write small_a");
+    fs::write(&large_file, &large_payload).expect("write large");
+    fs::write(&small_b, b"beta-parallel").expect("write small_b");
+
+    let inputs = vec![
+        empty_file.clone(),
+        small_a.clone(),
+        missing_file.clone(),
+        subdir.clone(),
+        large_file.clone(),
+        small_b.clone(),
+    ];
+
+    // 1. Empty slice edge case
+    let mut mgr = HashManager::new(HashAlgorithm::Sha256);
+    let empty_paths: Vec<PathBuf> = Vec::new();
+    assert!(mgr.hash_files(&empty_paths).is_empty());
+    assert_eq!(mgr.get_files_counted(), 0);
+
+    // 2. Single-file slice edge case
+    let single_res = mgr.hash_files(&inputs[1..2]);
+    assert_eq!(single_res.len(), 1);
+    assert_eq!(
+        single_res[0].get_result().as_deref().ok(),
+        Some(HashAlgorithm::Sha256.get_hash_from_bytes(b"alpha-parallel").as_str())
+    );
+    assert_eq!(mgr.get_files_counted(), 1);
+
+    // 3. Parallel multi-file hashing with mixed valid files and error entries
+    mgr.reset_counter();
+    let results = mgr.hash_files(&inputs);
+    assert_eq!(results.len(), inputs.len());
+    assert_eq!(mgr.get_files_counted(), 4);
+
+    // Order must match inputs 1:1
+    for (result, expected_path) in results.iter().zip(&inputs) {
+        assert_eq!(result.get_path(), expected_path.to_string_lossy());
+    }
+
+    assert_eq!(
+        results[0].get_result().as_deref().ok(),
+        Some(HashAlgorithm::Sha256.get_hash_from_bytes(b"").as_str())
+    );
+    assert_eq!(
+        results[1].get_result().as_deref().ok(),
+        Some(HashAlgorithm::Sha256.get_hash_from_bytes(b"alpha-parallel").as_str())
+    );
+    assert!(matches!(
+        results[2].get_result(),
+        Err(BulkHashError::FileNotFound(_))
+    ));
+    assert!(matches!(
+        results[3].get_result(),
+        Err(BulkHashError::NotAFile(_))
+    ));
+    assert_eq!(
+        results[4].get_result().as_deref().ok(),
+        Some(HashAlgorithm::Sha256.get_hash_from_bytes(&large_payload).as_str())
+    );
+    assert_eq!(
+        results[5].get_result().as_deref().ok(),
+        Some(HashAlgorithm::Sha256.get_hash_from_bytes(b"beta-parallel").as_str())
+    );
+
+    // 4. ScanManager::hash_files with custom thread count + state reset on subsequent call
+    let mut scanner = ScanManager::new(HashAlgorithm::Blake3).with_thread_count(3);
+    scanner
+        .hash_files(&inputs)
+        .expect("ScanManager::hash_files should succeed");
+    assert_eq!(scanner.get_list().len(), inputs.len());
+    assert_eq!(scanner.get_hash_manager().get_files_counted(), 4);
+
+    // Subsequent call resets previous state cleanly
+    scanner
+        .hash_files(&inputs[..2])
+        .expect("second ScanManager::hash_files");
+    assert_eq!(scanner.get_list().len(), 2);
+    assert_eq!(scanner.get_hash_manager().get_files_counted(), 2);
+
+    // 5. Empty directory scan works and resets state cleanly
+    let empty_dir = TempDir::new("parallel_empty_dir");
+    scanner
+        .start_hash(empty_dir.path().to_string_lossy().into_owned())
+        .expect("empty directory scan should succeed");
+    assert!(scanner.get_list().is_empty());
+    assert_eq!(scanner.get_hash_manager().get_files_counted(), 0);
+}

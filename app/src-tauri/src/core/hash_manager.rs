@@ -1,6 +1,7 @@
 use crate::core::io::bulk_hash_error::BulkHashError;
-use crate::core::structs::single_file_hash::SingleFileHash;
+use crate::core::structs::{file_info::FileInfo, single_file_hash::SingleFileHash};
 use md5::Md5;
+use rayon::{ThreadPoolBuilder, prelude::*};
 use sha2::{Digest, Sha256, Sha512};
 use std::fmt;
 use std::fs::{self, File};
@@ -47,15 +48,10 @@ impl HashManager {
     pub fn get_hash_code(&mut self, path: impl AsRef<Path>) -> Result<String, BulkHashError> {
         let path_ref = path.as_ref();
         let path_display = path_ref.to_string_lossy().into_owned();
-
-        let metadata = fs::metadata(path_ref)
-            .map_err(|err| BulkHashError::from_io(err, path_display.clone()))?;
-
-        if !metadata.is_file() {
-            return Err(BulkHashError::NotAFile(path_display));
-        }
-
-        self.hash_regular_file(path_ref, &path_display)
+        let hash =
+            hash_file_with_buffer(self.algorithm, &mut self.buffer, path_ref, &path_display)?;
+        self.files_counted = self.files_counted.saturating_add(1);
+        Ok(hash)
     }
 
     pub fn hash_single_file(
@@ -74,7 +70,13 @@ impl HashManager {
         }
 
         let file_size = metadata.len();
-        let hash = self.hash_regular_file(path_ref, &path_display)?;
+        let hash = hash_regular_file_with_buffer(
+            self.algorithm,
+            &mut self.buffer,
+            path_ref,
+            &path_display,
+        )?;
+        self.files_counted = self.files_counted.saturating_add(1);
         let hash_time = start_time.elapsed();
 
         let file_name = path_ref
@@ -92,77 +94,83 @@ impl HashManager {
         ))
     }
 
-    fn hash_regular_file(
-        &mut self,
-        path_ref: &Path,
-        path_display: &str,
-    ) -> Result<String, BulkHashError> {
-        let mut file =
-            File::open(path_ref).map_err(|err| BulkHashError::from_io(err, path_display))?;
+    pub fn hash_files<P>(&mut self, paths: &[P]) -> Vec<FileInfo>
+    where
+        P: AsRef<Path> + Sync,
+    {
+        if paths.is_empty() {
+            return Vec::new();
+        }
 
-        let hex_string = match self.algorithm {
-            HashAlgorithm::Blake3 => {
-                let mut hasher = blake3::Hasher::new();
-                self.stream_file_into(&mut file, path_display, |chunk| {
-                    hasher.update(chunk);
-                })?;
-                hasher.finalize().to_hex().to_string()
-            }
-            HashAlgorithm::Sha256 => {
-                let mut hasher = Sha256::new();
-                self.stream_file_into(&mut file, path_display, |chunk| hasher.update(chunk))?;
-                hex::encode(hasher.finalize())
-            }
-            HashAlgorithm::Sha512 => {
-                let mut hasher = Sha512::new();
-                self.stream_file_into(&mut file, path_display, |chunk| hasher.update(chunk))?;
-                hex::encode(hasher.finalize())
-            }
-            HashAlgorithm::Md5 => {
-                let mut hasher = Md5::new();
-                self.stream_file_into(&mut file, path_display, |chunk| hasher.update(chunk))?;
-                hex::encode(hasher.finalize())
-            }
-            HashAlgorithm::XxHash64 => {
-                let mut hasher = Xxh64::new(XXHASH64_SEED);
-                self.stream_file_into(&mut file, path_display, |chunk| hasher.write(chunk))?;
-                format!("{:016x}", hasher.finish())
-            }
-            HashAlgorithm::XxHash3 => {
-                let mut hasher = Xxh3::new();
-                self.stream_file_into(&mut file, path_display, |chunk| hasher.update(chunk))?;
-                format!("{:016x}", hasher.digest())
-            }
-            HashAlgorithm::XxHash128 => {
-                let mut hasher = Xxh3::new();
-                self.stream_file_into(&mut file, path_display, |chunk| hasher.update(chunk))?;
-                format!("{:032x}", hasher.digest128())
-            }
-        };
+        if paths.len() == 1 {
+            return self.hash_files_sequential(paths);
+        }
 
-        self.files_counted = self.files_counted.saturating_add(1);
-
-        Ok(hex_string)
+        let results = hash_paths_parallel(self.algorithm, paths);
+        self.record_hashed_results(&results);
+        results
     }
 
-    fn stream_file_into(
+    pub fn hash_files_with_threads<P>(
         &mut self,
-        file: &mut File,
-        path_display: &str,
-        mut update: impl FnMut(&[u8]),
-    ) -> Result<(), BulkHashError> {
-        loop {
-            match file.read(&mut self.buffer) {
-                Ok(0) => return Ok(()),
-                Ok(read_bytes) => {
-                    if let Some(chunk) = self.buffer.get(..read_bytes) {
-                        update(chunk);
-                    }
-                }
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
-                Err(err) => return Err(BulkHashError::from_io(err, path_display)),
-            }
+        paths: &[P],
+        thread_count: Option<usize>,
+    ) -> Result<Vec<FileInfo>, BulkHashError>
+    where
+        P: AsRef<Path> + Sync,
+    {
+        if paths.is_empty() {
+            return Ok(Vec::new());
         }
+
+        let normalized_threads = thread_count.filter(|&count| count > 0);
+        if paths.len() == 1 || normalized_threads == Some(1) {
+            return Ok(self.hash_files_sequential(paths));
+        }
+
+        let results = match normalized_threads {
+            Some(num_threads) => {
+                let pool_threads = num_threads.min(paths.len());
+                let pool = ThreadPoolBuilder::new().num_threads(pool_threads).build()?;
+                let algorithm = self.algorithm;
+                pool.install(|| hash_paths_parallel(algorithm, paths))
+            }
+            None => hash_paths_parallel(self.algorithm, paths),
+        };
+
+        self.record_hashed_results(&results);
+        Ok(results)
+    }
+
+    fn hash_files_sequential<P>(&mut self, paths: &[P]) -> Vec<FileInfo>
+    where
+        P: AsRef<Path>,
+    {
+        paths
+            .iter()
+            .map(|path| {
+                let path_ref = path.as_ref();
+                let path_display = path_ref.to_string_lossy().into_owned();
+                let result = hash_file_with_buffer(
+                    self.algorithm,
+                    &mut self.buffer,
+                    path_ref,
+                    &path_display,
+                );
+                if result.is_ok() {
+                    self.files_counted = self.files_counted.saturating_add(1);
+                }
+                FileInfo::new(path_display, result)
+            })
+            .collect()
+    }
+
+    fn record_hashed_results(&mut self, results: &[FileInfo]) {
+        let succeeded = results
+            .iter()
+            .filter(|info| info.get_result().is_ok())
+            .count();
+        self.files_counted = self.files_counted.saturating_add(succeeded);
     }
 
     pub fn get_files_counted(&self) -> usize {
@@ -179,6 +187,123 @@ impl HashManager {
 
     pub fn reset_counter(&mut self) {
         self.files_counted = 0;
+    }
+}
+
+fn hash_paths_parallel<P>(algorithm: HashAlgorithm, paths: &[P]) -> Vec<FileInfo>
+where
+    P: AsRef<Path> + Sync,
+{
+    paths
+        .par_iter()
+        .map_init(
+            || vec![0u8; HASH_BUFFER_SIZE],
+            |buffer, path| {
+                let path_ref = path.as_ref();
+                let path_display = path_ref.to_string_lossy().into_owned();
+                let result = hash_file_with_buffer(algorithm, buffer, path_ref, &path_display);
+                FileInfo::new(path_display, result)
+            },
+        )
+        .collect()
+}
+
+fn hash_file_with_buffer(
+    algorithm: HashAlgorithm,
+    buffer: &mut [u8],
+    path_ref: &Path,
+    path_display: &str,
+) -> Result<String, BulkHashError> {
+    let metadata = fs::metadata(path_ref)
+        .map_err(|err| BulkHashError::from_io(err, path_display.to_owned()))?;
+
+    if !metadata.is_file() {
+        return Err(BulkHashError::NotAFile(path_display.to_owned()));
+    }
+
+    hash_regular_file_with_buffer(algorithm, buffer, path_ref, path_display)
+}
+
+fn hash_regular_file_with_buffer(
+    algorithm: HashAlgorithm,
+    buffer: &mut [u8],
+    path_ref: &Path,
+    path_display: &str,
+) -> Result<String, BulkHashError> {
+    let mut file = File::open(path_ref).map_err(|err| BulkHashError::from_io(err, path_display))?;
+
+    let hex_string = match algorithm {
+        HashAlgorithm::Blake3 => {
+            let mut hasher = blake3::Hasher::new();
+            stream_file_into(buffer, &mut file, path_display, |chunk| {
+                hasher.update(chunk);
+            })?;
+            hasher.finalize().to_hex().to_string()
+        }
+        HashAlgorithm::Sha256 => {
+            let mut hasher = Sha256::new();
+            stream_file_into(buffer, &mut file, path_display, |chunk| {
+                hasher.update(chunk);
+            })?;
+            hex::encode(hasher.finalize())
+        }
+        HashAlgorithm::Sha512 => {
+            let mut hasher = Sha512::new();
+            stream_file_into(buffer, &mut file, path_display, |chunk| {
+                hasher.update(chunk);
+            })?;
+            hex::encode(hasher.finalize())
+        }
+        HashAlgorithm::Md5 => {
+            let mut hasher = Md5::new();
+            stream_file_into(buffer, &mut file, path_display, |chunk| {
+                hasher.update(chunk);
+            })?;
+            hex::encode(hasher.finalize())
+        }
+        HashAlgorithm::XxHash64 => {
+            let mut hasher = Xxh64::new(XXHASH64_SEED);
+            stream_file_into(buffer, &mut file, path_display, |chunk| {
+                hasher.write(chunk);
+            })?;
+            format!("{:016x}", hasher.finish())
+        }
+        HashAlgorithm::XxHash3 => {
+            let mut hasher = Xxh3::new();
+            stream_file_into(buffer, &mut file, path_display, |chunk| {
+                hasher.update(chunk);
+            })?;
+            format!("{:016x}", hasher.digest())
+        }
+        HashAlgorithm::XxHash128 => {
+            let mut hasher = Xxh3::new();
+            stream_file_into(buffer, &mut file, path_display, |chunk| {
+                hasher.update(chunk);
+            })?;
+            format!("{:032x}", hasher.digest128())
+        }
+    };
+
+    Ok(hex_string)
+}
+
+fn stream_file_into(
+    buffer: &mut [u8],
+    file: &mut File,
+    path_display: &str,
+    mut update: impl FnMut(&[u8]),
+) -> Result<(), BulkHashError> {
+    loop {
+        match file.read(buffer) {
+            Ok(0) => return Ok(()),
+            Ok(read_bytes) => {
+                if let Some(chunk) = buffer.get(..read_bytes) {
+                    update(chunk);
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(BulkHashError::from_io(err, path_display)),
+        }
     }
 }
 

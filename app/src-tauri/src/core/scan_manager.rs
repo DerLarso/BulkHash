@@ -1,15 +1,33 @@
 use crate::core::hash_manager::{HashAlgorithm, HashManager};
 use crate::core::io::bulk_hash_error::BulkHashError;
 use crate::core::structs::{file_info::FileInfo, single_file_hash::SingleFileHash};
+use std::cmp::Reverse;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+struct DiscoveredFile {
+    path: PathBuf,
+    size: u64,
+}
+
+impl AsRef<Path> for DiscoveredFile {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+struct DiscoveredEntries {
+    files: Vec<DiscoveredFile>,
+    errors: Vec<FileInfo>,
+}
 
 pub struct ScanManager {
     file_list: Vec<FileInfo>,
     hasher: HashManager,
     start_path: String,
     hash_time: Duration,
+    thread_count: Option<usize>,
 }
 
 impl ScanManager {
@@ -19,7 +37,25 @@ impl ScanManager {
             hasher: HashManager::new(algorithm),
             start_path: String::new(),
             hash_time: Duration::ZERO,
+            thread_count: None,
         }
+    }
+
+    pub fn with_thread_count(mut self, thread_count: usize) -> Self {
+        self.thread_count = (thread_count > 0).then_some(thread_count);
+        self
+    }
+
+    pub fn set_thread_count(&mut self, thread_count: Option<usize>) {
+        self.thread_count = thread_count.filter(|&count| count > 0);
+    }
+
+    pub fn get_thread_count(&self) -> Option<usize> {
+        self.thread_count
+    }
+
+    pub fn effective_thread_count(&self) -> usize {
+        self.thread_count.unwrap_or_else(rayon::current_num_threads)
     }
 
     pub fn start_hash(&mut self, path: String) -> Result<(), BulkHashError> {
@@ -46,12 +82,41 @@ impl ScanManager {
             // Verify the root directory itself is readable so top-level access errors surface directly.
             let initial_entries =
                 fs::read_dir(root_path).map_err(|err| BulkHashError::from_io(err, path.clone()))?;
-            self.scan_directory_iterative(initial_entries, root_path);
+            let mut discovered = Self::collect_directory_iterative(initial_entries, root_path);
+
+            // Schedule larger files first (LPT) so worker threads finish closer together.
+            discovered
+                .files
+                .sort_unstable_by_key(|file| Reverse(file.size));
+
+            let hashed_files = self
+                .hasher
+                .hash_files_with_threads(&discovered.files, self.thread_count)?;
+
+            self.file_list
+                .reserve(discovered.errors.len().saturating_add(hashed_files.len()));
+            self.file_list.extend(discovered.errors);
+            self.file_list.extend(hashed_files);
         } else {
             return Err(BulkHashError::NotAFile(path));
         }
 
         self.hash_time = start_time.elapsed();
+        Ok(())
+    }
+
+    pub fn hash_files<P>(&mut self, paths: &[P]) -> Result<(), BulkHashError>
+    where
+        P: AsRef<Path> + Sync,
+    {
+        self.reset_state("");
+
+        let start_time = Instant::now();
+        self.file_list = self
+            .hasher
+            .hash_files_with_threads(paths, self.thread_count)?;
+        self.hash_time = start_time.elapsed();
+
         Ok(())
     }
 
@@ -82,9 +147,16 @@ impl ScanManager {
         self.start_path.push_str(start_path);
     }
 
-    fn scan_directory_iterative(&mut self, initial_entries: fs::ReadDir, root_path: &Path) {
+    fn collect_directory_iterative(
+        initial_entries: fs::ReadDir,
+        root_path: &Path,
+    ) -> DiscoveredEntries {
+        let mut discovered = DiscoveredEntries {
+            files: Vec::new(),
+            errors: Vec::new(),
+        };
         let mut dir_stack: Vec<PathBuf> = Vec::new();
-        self.process_read_dir(initial_entries, root_path, &mut dir_stack);
+        Self::process_read_dir(initial_entries, root_path, &mut dir_stack, &mut discovered);
 
         while let Some(current_dir) = dir_stack.pop() {
             if Self::is_excluded_system_path(&current_dir) {
@@ -92,30 +164,34 @@ impl ScanManager {
             }
 
             match fs::read_dir(&current_dir) {
-                Ok(entries) => self.process_read_dir(entries, &current_dir, &mut dir_stack),
+                Ok(entries) => {
+                    Self::process_read_dir(entries, &current_dir, &mut dir_stack, &mut discovered);
+                }
                 Err(err) => {
                     let dir_str = current_dir.to_string_lossy().into_owned();
-                    self.file_list.push(FileInfo::new(
+                    discovered.errors.push(FileInfo::new(
                         dir_str.clone(),
                         Err(BulkHashError::from_io(err, dir_str)),
                     ));
                 }
             }
         }
+
+        discovered
     }
 
     fn process_read_dir(
-        &mut self,
         entries: fs::ReadDir,
         parent_dir: &Path,
         dir_stack: &mut Vec<PathBuf>,
+        discovered: &mut DiscoveredEntries,
     ) {
         for entry_result in entries {
             let entry = match entry_result {
                 Ok(entry) => entry,
                 Err(err) => {
                     let parent_str = parent_dir.to_string_lossy().into_owned();
-                    self.file_list.push(FileInfo::new(
+                    discovered.errors.push(FileInfo::new(
                         parent_str.clone(),
                         Err(BulkHashError::from_io(err, parent_str)),
                     ));
@@ -132,7 +208,7 @@ impl ScanManager {
                 Ok(meta) => meta,
                 Err(err) => {
                     let entry_str = entry_path.to_string_lossy().into_owned();
-                    self.file_list.push(FileInfo::new(
+                    discovered.errors.push(FileInfo::new(
                         entry_str.clone(),
                         Err(BulkHashError::from_io(err, entry_str)),
                     ));
@@ -145,9 +221,10 @@ impl ScanManager {
             }
 
             if metadata.is_file() {
-                let result = self.compute_hash(&entry_path);
-                let entry_str = entry_path.to_string_lossy().into_owned();
-                self.file_list.push(FileInfo::new(entry_str, result));
+                discovered.files.push(DiscoveredFile {
+                    path: entry_path,
+                    size: metadata.len(),
+                });
             } else if metadata.is_dir() {
                 dir_stack.push(entry_path);
             }
