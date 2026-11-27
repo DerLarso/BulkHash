@@ -1,6 +1,6 @@
 use crate::core::hash_manager::{HashAlgorithm, HashManager};
 use crate::core::io::bulk_hash_error::BulkHashError;
-use crate::core::structs::file_info::FileInfo;
+use crate::core::structs::{file_info::FileInfo, single_file_hash::SingleFileHash};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -23,10 +23,7 @@ impl ScanManager {
     }
 
     pub fn start_hash(&mut self, path: String) -> Result<(), BulkHashError> {
-        self.file_list.clear();
-        self.hasher.reset_counter();
-        self.hash_time = Duration::ZERO;
-        self.start_path.clone_from(&path);
+        self.reset_state(&path);
 
         let start_time = Instant::now();
         let root_path = Path::new(&path);
@@ -50,10 +47,39 @@ impl ScanManager {
             let initial_entries =
                 fs::read_dir(root_path).map_err(|err| BulkHashError::from_io(err, path.clone()))?;
             self.scan_directory_iterative(initial_entries, root_path);
+        } else {
+            return Err(BulkHashError::NotAFile(path));
         }
 
         self.hash_time = start_time.elapsed();
         Ok(())
+    }
+
+    pub fn hash_single_file(
+        &mut self,
+        path: impl AsRef<Path>,
+    ) -> Result<SingleFileHash, BulkHashError> {
+        let file_path = path.as_ref();
+        let path_display = file_path.to_string_lossy().into_owned();
+        self.reset_state(&path_display);
+
+        let result = self.hasher.hash_single_file(file_path)?;
+
+        self.hash_time = result.get_hash_time();
+        self.file_list.push(FileInfo::new(
+            result.get_path().to_string(),
+            Ok(result.get_hash().to_string()),
+        ));
+
+        Ok(result)
+    }
+
+    fn reset_state(&mut self, start_path: &str) {
+        self.file_list.clear();
+        self.hasher.reset_counter();
+        self.hash_time = Duration::ZERO;
+        self.start_path.clear();
+        self.start_path.push_str(start_path);
     }
 
     fn scan_directory_iterative(&mut self, initial_entries: fs::ReadDir, root_path: &Path) {

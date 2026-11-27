@@ -54,14 +54,20 @@ fn hash_manager_blake3_and_sha256_match_bytes_hash() {
     let b3_file_hash = blake3_mgr
         .get_hash_code(&file_path)
         .expect("blake3 file hash");
-    assert_eq!(b3_file_hash, HashAlgorithm::Blake3.get_hash_from_bytes(content));
+    assert_eq!(
+        b3_file_hash,
+        HashAlgorithm::Blake3.get_hash_from_bytes(content)
+    );
     assert_eq!(blake3_mgr.get_files_counted(), 1);
 
     let mut sha256_mgr = HashManager::new(HashAlgorithm::Sha256);
     let sha_file_hash = sha256_mgr
         .get_hash_code(&file_path)
         .expect("sha256 file hash");
-    assert_eq!(sha_file_hash, HashAlgorithm::Sha256.get_hash_from_bytes(content));
+    assert_eq!(
+        sha_file_hash,
+        HashAlgorithm::Sha256.get_hash_from_bytes(content)
+    );
     assert_eq!(sha256_mgr.get_files_counted(), 1);
 }
 
@@ -124,7 +130,12 @@ fn scan_manager_single_file_and_missing_path() {
     assert!(tree.files.contains_key("only.txt"));
 
     let missing_err = scanner
-        .start_hash(dir.path().join("does_not_exist").to_string_lossy().into_owned())
+        .start_hash(
+            dir.path()
+                .join("does_not_exist")
+                .to_string_lossy()
+                .into_owned(),
+        )
         .expect_err("expected PathNotFound");
     assert!(matches!(missing_err, BulkHashError::PathNotFound(_)));
 }
@@ -266,14 +277,14 @@ fn save_file_rejects_missing_or_non_dir_target() {
     let tree = DirectoryNode::new(String::from("root"));
     let meta = MetaData::new(0, Duration::ZERO, Utc::now());
 
-    let missing_err = FileManager::save_file(dir.path().join("nope"), &tree, &meta)
-        .expect_err("PathNotFound");
+    let missing_err =
+        FileManager::save_file(dir.path().join("nope"), &tree, &meta).expect_err("PathNotFound");
     assert!(matches!(missing_err, BulkHashError::PathNotFound(_)));
 
     let file_target = dir.path().join("a_file.txt");
     fs::write(&file_target, b"x").expect("write file");
-    let not_dir_err = FileManager::save_file(&file_target, &tree, &meta)
-        .expect_err("NotADirectory");
+    let not_dir_err =
+        FileManager::save_file(&file_target, &tree, &meta).expect_err("NotADirectory");
     assert!(matches!(not_dir_err, BulkHashError::NotADirectory(_)));
 }
 
@@ -286,4 +297,82 @@ fn bulk_hash_error_serializes_cleanly_for_gui() {
     let json = serde_json::to_value(&err).expect("serialize BulkHashError");
     assert_eq!(json["kind"], "HashMismatch");
     assert_eq!(json["message"], "Hash mismatch: expected 'aaa', got 'bbb'");
+}
+
+#[test]
+fn single_file_hashing_returns_metadata_and_verifies_hash() {
+    let dir = TempDir::new("single_file_feature");
+    let file_path = dir.path().join("archive.bin");
+    let payload = b"single file hashing payload 1234567890";
+    fs::write(&file_path, payload).expect("write test file");
+
+    let mut scanner = ScanManager::new(HashAlgorithm::Sha256);
+    let result = scanner
+        .hash_single_file(&file_path)
+        .expect("single file hash should succeed");
+
+    assert_eq!(result.get_file_name(), "archive.bin");
+    assert_eq!(result.get_algorithm(), HashAlgorithm::Sha256);
+    assert_eq!(result.get_file_size(), payload.len() as u64);
+    assert_eq!(
+        result.get_hash(),
+        HashAlgorithm::Sha256.get_hash_from_bytes(payload)
+    );
+    assert_eq!(scanner.get_list().len(), 1);
+    assert_eq!(scanner.get_hash_manager().get_files_counted(), 1);
+    assert_eq!(
+        scanner.get_hash_manager().get_algorithm(),
+        HashAlgorithm::Sha256
+    );
+
+    // Case-insensitive + whitespace-tolerant verification
+    let upper = format!("  {}  \n", result.get_hash().to_uppercase());
+    assert!(result.verify_hash(&upper).is_ok());
+
+    let mismatch = result
+        .verify_hash("deadbeef")
+        .expect_err("expected HashMismatch");
+    assert!(matches!(mismatch, BulkHashError::HashMismatch { .. }));
+
+    // GUI JSON serialization
+    let json = serde_json::to_value(&result).expect("serialize SingleFileHash");
+    assert_eq!(json["file_name"], "archive.bin");
+    assert_eq!(json["file_size"], payload.len());
+    assert_eq!(json["algorithm"], "Sha256");
+
+    // Roundtrip saving single-file scan into a .hashed file
+    let tree = DirectoryNode::build_tree(scanner.get_path(), scanner.get_list());
+    let meta = MetaData::new(
+        scanner.get_hash_manager().get_files_counted(),
+        scanner.get_hash_time(),
+        Utc::now(),
+    );
+    let saved = FileManager::save_file(dir.path(), &tree, &meta).expect("save single-file .hashed");
+    let loaded = FileManager::open_file(&saved).expect("open single-file .hashed");
+    assert_eq!(
+        loaded.get_tree().files.get("archive.bin"),
+        Some(&Ok(result.get_hash().to_string()))
+    );
+}
+
+#[test]
+fn single_file_hashing_rejects_directories_and_missing_files() {
+    let dir = TempDir::new("single_file_errors");
+    let mut scanner = ScanManager::new(HashAlgorithm::Blake3);
+
+    let dir_err = scanner
+        .hash_single_file(dir.path())
+        .expect_err("directory must be rejected with NotAFile");
+    assert!(matches!(dir_err, BulkHashError::NotAFile(_)));
+
+    let missing_err = scanner
+        .hash_single_file(dir.path().join("missing.txt"))
+        .expect_err("missing file must return FileNotFound");
+    assert!(matches!(missing_err, BulkHashError::FileNotFound(_)));
+
+    let mut hasher = HashManager::new(HashAlgorithm::Blake3);
+    let hasher_dir_err = hasher
+        .get_hash_code(dir.path())
+        .expect_err("HashManager::get_hash_code must also reject directories");
+    assert!(matches!(hasher_dir_err, BulkHashError::NotAFile(_)));
 }

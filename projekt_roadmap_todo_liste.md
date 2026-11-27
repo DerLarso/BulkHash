@@ -1,4 +1,4 @@
-# Projekt-Checkliste: Hashed
+# Projekt-Checkliste: BulkHash
 
 Legende:
 [X] = Feature fehlt
@@ -9,7 +9,7 @@ Backend - Core & Hashing:
 	[#] Datei-Hashing (Blake3 & SHA256): Speichereffizientes Hashen mit 64KB-Buffer ; Rust
 	[#] Rekursiver Ordner-Scanner: Durchsucht Verzeichnisse inklusive Systempfad-Ausnahmen ; Rust
 	[#] Symlink-Filter: Überspringt symbolische Links zur Vermeidung von Endlosschleifen ; Rust
-	[O] Einzeldatei-Hashing: Gezieltes Hashen einer einzelnen Datei statt eines ganzen Ordners ; Rust
+	[#] Einzeldatei-Hashing: Gezieltes Hashen einer einzelnen Datei statt eines ganzen Ordners ; Rust
 	[X] Weitere Hash-Algorithmen: Unterstützung für MD5, SHA512 und xxHash (extrem schnell) ; Rust
 	[X] Multithreading-Scanner: Paralleles Hashen mehrerer Dateien über alle CPU-Kerne (Rayon) ; Rust
 	[X] Scan-Abbruchfunktion: Sicheres Stoppen eines laufenden Scan-Vorgangs über AtomicBool ; Rust
@@ -21,8 +21,8 @@ Backend - Dateiformat & IO (.hashed):
 	[#] ZIP-Containerformat: Speichern und Laden von meta.json, tree.json und hash.sha256 ; Rust
 	[#] Manipulationsschutz: Validierung der tree.json beim Laden über den gespeicherten SHA256-Hash ; Rust
 	[#] Basis-Metadaten: Erfassung von Betriebssystem, Zeitstempel, Hash-Dauer und Dateianzahl ; Rust
-	[O] Baumstruktur-Generierung: Aufbau des DirectoryNode (Anpassung auf relative Pfade fehlt noch) ; Rust
-	[O] Eigenes Error-Handling: Zentrale HashedError-Enum (Ausformulierte Display-Texte fehlen noch) ; Rust
+	[#] Baumstruktur-Generierung: Aufbau des DirectoryNode (Anpassung auf relative Pfade fehlt noch) ; Rust
+	[#] Eigenes Error-Handling: Zentrale HashedError-Enum (Ausformulierte Display-Texte fehlen noch) ; Rust
 	[X] Erweiterte Datei-Metadaten: Speichern von Dateigröße und letztem Änderungsdatum pro Datei ; Rust
 	[X] Versions-Migration: Abwärtskompatibilität für zukünftige Versionen des .hashed-Formats ; Rust
 	[X] Snapshot-Verschlüsselung: Optionaler Passwortschutz (AES-GCM) für sensible Dateibäume ; Rust

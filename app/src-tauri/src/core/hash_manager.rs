@@ -1,8 +1,10 @@
 use crate::core::io::bulk_hash_error::BulkHashError;
+use crate::core::structs::single_file_hash::SingleFileHash;
 use sha2::{Digest, Sha256};
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::Path;
+use std::time::Instant;
 
 const HASH_BUFFER_SIZE: usize = 64 * 1024;
 
@@ -31,8 +33,57 @@ impl HashManager {
         let path_ref = path.as_ref();
         let path_display = path_ref.to_string_lossy().into_owned();
 
-        let mut file = File::open(path_ref)
+        let metadata = fs::metadata(path_ref)
             .map_err(|err| BulkHashError::from_io(err, path_display.clone()))?;
+
+        if !metadata.is_file() {
+            return Err(BulkHashError::NotAFile(path_display));
+        }
+
+        self.hash_regular_file(path_ref, &path_display)
+    }
+
+    pub fn hash_single_file(
+        &mut self,
+        path: impl AsRef<Path>,
+    ) -> Result<SingleFileHash, BulkHashError> {
+        let path_ref = path.as_ref();
+        let path_display = path_ref.to_string_lossy().into_owned();
+        let start_time = Instant::now();
+
+        let metadata = fs::metadata(path_ref)
+            .map_err(|err| BulkHashError::from_io(err, path_display.clone()))?;
+
+        if !metadata.is_file() {
+            return Err(BulkHashError::NotAFile(path_display));
+        }
+
+        let file_size = metadata.len();
+        let hash = self.hash_regular_file(path_ref, &path_display)?;
+        let hash_time = start_time.elapsed();
+
+        let file_name = path_ref
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path_display.clone());
+
+        Ok(SingleFileHash::new(
+            path_display,
+            file_name,
+            hash,
+            self.algorithm,
+            file_size,
+            hash_time,
+        ))
+    }
+
+    fn hash_regular_file(
+        &mut self,
+        path_ref: &Path,
+        path_display: &str,
+    ) -> Result<String, BulkHashError> {
+        let mut file =
+            File::open(path_ref).map_err(|err| BulkHashError::from_io(err, path_display))?;
 
         let hex_string = match self.algorithm {
             HashAlgorithm::Blake3 => {
@@ -80,6 +131,10 @@ impl HashManager {
 
     pub fn get_files_counted(&self) -> usize {
         self.files_counted
+    }
+
+    pub fn get_algorithm(&self) -> HashAlgorithm {
+        self.algorithm
     }
 
     pub fn reset_counter(&mut self) {
