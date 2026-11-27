@@ -1,6 +1,7 @@
 use crate::core::hash_manager::HashAlgorithm;
 use crate::core::hidden_filter::HiddenFileFilter;
 use crate::core::ignore_list::IgnoreList;
+use crate::core::io::migration::CURRENT_FORMAT_VERSION;
 use chrono::{DateTime, Local, SecondsFormat, Utc};
 use std::time::Duration;
 
@@ -20,12 +21,14 @@ pub struct MetaData {
     hidden_filter: Option<HiddenFileFilter>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     total_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    migrated_from: Option<usize>,
 }
 
 impl MetaData {
     pub fn new(files_hashed: usize, hash_time: Duration, date_utc: DateTime<Utc>) -> Self {
         Self {
-            version: 1,
+            version: CURRENT_FORMAT_VERSION,
             files_hashed,
             hash_time,
             date_utc,
@@ -37,6 +40,7 @@ impl MetaData {
             ignore_list: None,
             hidden_filter: None,
             total_size: None,
+            migrated_from: None,
         }
     }
 
@@ -62,6 +66,12 @@ impl MetaData {
         self
     }
 
+    #[must_use]
+    pub const fn with_migrated_from(mut self, original_version: usize) -> Self {
+        self.migrated_from = Some(original_version);
+        self
+    }
+
     pub fn get_algorithm(&self) -> Option<HashAlgorithm> {
         self.algorithm
     }
@@ -78,6 +88,11 @@ impl MetaData {
     #[must_use]
     pub const fn get_total_size(&self) -> Option<u64> {
         self.total_size
+    }
+
+    #[must_use]
+    pub const fn get_migrated_from(&self) -> Option<usize> {
+        self.migrated_from
     }
 
     pub fn get_local_time(&self) -> &str {

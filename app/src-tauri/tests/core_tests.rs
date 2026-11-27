@@ -10,6 +10,10 @@ use bulk_hash_lib::core::{
         directory_node::{DirectoryNode, FileEntry},
         file_manager::FileManager,
         meta_data::MetaData,
+        migration::{
+            CURRENT_FORMAT_VERSION, FORMAT_VERSION_V1, FORMAT_VERSION_V2, FormatMigration,
+            MIN_SUPPORTED_FORMAT_VERSION, MigrationRegistry, SnapshotPayload, VersionCompatibility,
+        },
     },
     scan_manager::{ScanCancelToken, ScanControl, ScanControlState, ScanManager},
     structs::{
@@ -204,7 +208,11 @@ fn save_and_open_roundtrip_without_trailing_slash() {
     );
 
     let loaded = FileManager::open_file(&saved_path).expect("open_file");
-    assert_eq!(loaded.get_meta().get_version(), 1);
+    assert_eq!(loaded.get_meta().get_version(), CURRENT_FORMAT_VERSION);
+    assert_eq!(loaded.get_meta().get_migrated_from(), None);
+    assert!(!loaded.was_migrated());
+    assert_eq!(loaded.get_original_version(), CURRENT_FORMAT_VERSION);
+    assert!(loaded.get_migration().is_none());
     assert_eq!(loaded.get_meta().get_files_hashed(), 1);
     assert_eq!(loaded.get_tree(), &tree);
     assert!(!loaded.get_hash().is_empty());
@@ -3477,7 +3485,16 @@ fn legacy_v1_hashed_archive_without_extended_metadata_opens_cleanly() {
     }
 
     let loaded = FileManager::open_file(&legacy_path).expect("legacy v1 snapshot must open");
-    assert_eq!(loaded.get_meta().get_version(), 1);
+    assert_eq!(loaded.get_meta().get_version(), CURRENT_FORMAT_VERSION);
+    assert_eq!(loaded.get_meta().get_migrated_from(), Some(FORMAT_VERSION_V1));
+    assert!(loaded.was_migrated());
+    assert_eq!(loaded.get_original_version(), FORMAT_VERSION_V1);
+    let report = loaded
+        .get_migration()
+        .expect("v1 archive should produce a MigrationReport");
+    assert_eq!(report.original_version(), FORMAT_VERSION_V1);
+    assert_eq!(report.target_version(), CURRENT_FORMAT_VERSION);
+    assert_eq!(report.steps().len(), 1);
     assert_eq!(loaded.get_meta().get_total_size(), None);
     assert_eq!(loaded.get_meta().get_files_hashed(), 2);
 
@@ -3597,4 +3614,861 @@ fn directory_node_aggregations_and_unreadable_file_metadata() {
             assert!(secret_entry.modified_utc().is_some());
         }
     }
+}
+
+fn write_raw_hashed_archive(path: &Path, entries: &[(&str, &[u8])]) {
+    let file = File::create(path).expect("create raw .hashed archive");
+    let mut zip = ZipWriter::new(file);
+    let opts = SimpleFileOptions::default();
+    for &(name, data) in entries {
+        zip.start_file(name, opts).expect("start zip entry");
+        zip.write_all(data).expect("write zip entry");
+    }
+    zip.finish().expect("finish zip");
+}
+
+fn read_zip_entry_string(path: &Path, entry_name: &str) -> String {
+    use std::io::Read;
+
+    let file = File::open(path).expect("open zip archive");
+    let mut archive = zip::ZipArchive::new(file).expect("parse zip archive");
+    let mut entry = archive.by_name(entry_name).expect("find zip entry");
+    let mut content = String::new();
+    entry
+        .read_to_string(&mut content)
+        .expect("read zip entry as UTF-8");
+    content
+}
+
+#[test]
+fn inspect_version_and_future_version_probing_work_without_latest_schema() {
+    let dir = TempDir::new("version_inspect");
+
+    // 1. Current v2 archive
+    let mut tree = DirectoryNode::new(String::from("/v2_root"));
+    tree.insert_path(
+        &["hello.txt"],
+        FileEntry::from_hash(String::from("abc123"), Some(12), None),
+    );
+    let meta = MetaData::new(1, Duration::from_millis(5), Utc::now())
+        .with_algorithm(HashAlgorithm::Blake3)
+        .with_total_size(12);
+    let v2_path = FileManager::save_file(dir.path(), &tree, &meta).expect("save v2 archive");
+
+    let v2_info = FileManager::inspect_version(&v2_path).expect("inspect v2");
+    assert_eq!(v2_info.version, FORMAT_VERSION_V2);
+    assert_eq!(v2_info.current_version, CURRENT_FORMAT_VERSION);
+    assert!(v2_info.is_supported());
+    assert!(v2_info.is_current());
+    assert!(!v2_info.needs_migration());
+    assert_eq!(v2_info.compatibility, VersionCompatibility::Current);
+    assert!(v2_info.entries.iter().any(|e| e == "meta.json"));
+    assert!(v2_info.entries.iter().any(|e| e == "tree.json"));
+    assert!(v2_info.entries.iter().any(|e| e == "hash.sha256"));
+
+    // 2. Legacy v1 archive
+    let v1_path = dir.path().join("legacy_v1.hashed");
+    let v1_tree = r#"{"name":"/v1","files":{"a.txt":{"Ok":"deadbeef"}},"sub_directories":{}}"#;
+    let v1_hash = HashAlgorithm::Sha256.get_hash_from_bytes(v1_tree.as_bytes());
+    let v1_meta = format!(
+        r#"{{"version":1,"files_hashed":1,"hash_time":{{"secs":0,"nanos":10}},"date_utc":"{}","local_time":"2026-01-01T00:00:00Z","os":"linux"}}"#,
+        Utc::now().to_rfc3339()
+    );
+    write_raw_hashed_archive(
+        &v1_path,
+        &[
+            ("meta.json", v1_meta.as_bytes()),
+            ("tree.json", v1_tree.as_bytes()),
+            ("hash.sha256", v1_hash.as_bytes()),
+        ],
+    );
+
+    let v1_info = FileManager::inspect_version(&v1_path).expect("inspect v1");
+    assert_eq!(v1_info.version, FORMAT_VERSION_V1);
+    assert!(v1_info.is_supported());
+    assert!(!v1_info.is_current());
+    assert!(v1_info.needs_migration());
+    assert_eq!(
+        v1_info.compatibility,
+        VersionCompatibility::NeedsMigration {
+            from_version: FORMAT_VERSION_V1,
+            to_version: CURRENT_FORMAT_VERSION,
+            steps_required: 1,
+        }
+    );
+
+    // 3. Future v99 archive with completely different meta schema & NO tree.json / hash.sha256
+    // (simulating e.g. encrypted or segmented future snapshots).
+    let future_path = dir.path().join("future_v99.hashed");
+    let future_meta = r#"{"version":99,"encrypted":true,"cipher":"aes-256-gcm","segments":42}"#;
+    write_raw_hashed_archive(
+        &future_path,
+        &[
+            ("meta.json", future_meta.as_bytes()),
+            ("tree.enc", b"opaque-encrypted-bytes"),
+        ],
+    );
+
+    let future_info = FileManager::inspect_version(&future_path).expect("inspect future v99");
+    assert_eq!(future_info.version, 99);
+    assert!(!future_info.is_supported());
+    assert!(!future_info.is_current());
+    assert!(!future_info.needs_migration());
+    assert_eq!(
+        future_info.compatibility,
+        VersionCompatibility::Unsupported {
+            found_version: 99,
+            min_supported: MIN_SUPPORTED_FORMAT_VERSION,
+            max_supported: CURRENT_FORMAT_VERSION,
+        }
+    );
+
+    // Opening the future archive MUST report UnsupportedVersion(99), NOT FileIsCorrupted or JsonError!
+    let future_err =
+        FileManager::open_file(&future_path).expect_err("future v99 must fail cleanly");
+    assert!(matches!(future_err, BulkHashError::UnsupportedVersion(99)));
+    assert!(future_err.to_string().contains("99"));
+
+    // 4. Version 0 archive MUST report UnsupportedVersion(0)
+    let v0_path = dir.path().join("v0.hashed");
+    write_raw_hashed_archive(&v0_path, &[("meta.json", br#"{"version":0}"#)]);
+    let v0_info = FileManager::inspect_version(&v0_path).expect("inspect v0");
+    assert!(!v0_info.is_supported());
+    let v0_err = FileManager::open_file(&v0_path).expect_err("v0 must fail with UnsupportedVersion");
+    assert!(matches!(v0_err, BulkHashError::UnsupportedVersion(0)));
+
+    // 5. Corrupted meta.json variations (missing meta.json, missing version, invalid version type)
+    let no_meta_path = dir.path().join("no_meta.hashed");
+    write_raw_hashed_archive(&no_meta_path, &[("tree.json", b"{}")]);
+    assert!(matches!(
+        FileManager::inspect_version(&no_meta_path),
+        Err(BulkHashError::FileIsCorrupted(_))
+    ));
+
+    let bad_ver_type = dir.path().join("bad_ver_type.hashed");
+    write_raw_hashed_archive(&bad_ver_type, &[("meta.json", br#"{"version":"two"}"#)]);
+    assert!(matches!(
+        FileManager::inspect_version(&bad_ver_type),
+        Err(BulkHashError::FileIsCorrupted(_))
+    ));
+
+    let neg_ver = dir.path().join("neg_ver.hashed");
+    write_raw_hashed_archive(&neg_ver, &[("meta.json", br#"{"version":-1}"#)]);
+    assert!(matches!(
+        FileManager::open_file(&neg_ver),
+        Err(BulkHashError::FileIsCorrupted(_))
+    ));
+
+    // 6. v1 archive missing tree.json still reports FileIsCorrupted (not UnsupportedVersion)
+    let incomplete_v1 = dir.path().join("incomplete_v1.hashed");
+    write_raw_hashed_archive(&incomplete_v1, &[("meta.json", v1_meta.as_bytes())]);
+    assert!(matches!(
+        FileManager::open_file(&incomplete_v1),
+        Err(BulkHashError::FileIsCorrupted(_))
+    ));
+}
+
+#[test]
+fn v1_to_v2_in_memory_migration_handles_legacy_transitional_mixed_and_corrupt_archives() {
+    let dir = TempDir::new("v1_to_v2_variants");
+    let ts = DateTime::from_timestamp(1_760_000_000, 0).expect("valid ts");
+
+    // 1. Minimal v1 archive missing `local_time` + preserving algorithm/ignore_list/hidden_filter
+    let minimal_v1 = dir.path().join("minimal_v1.hashed");
+    let ignore_list = IgnoreList::from_patterns(["node_modules/", "*.tmp"]).expect("ignore list");
+    let hidden_filter = HiddenFileFilter::exclude_dotfiles();
+    let v1_meta_json = serde_json::json!({
+        "version": 1,
+        "files_hashed": 1,
+        "hash_time": { "secs": 2, "nanos": 250_000_000 },
+        "date_utc": ts.to_rfc3339(),
+        "os": "linux",
+        "algorithm": "Sha512",
+        "ignore_list": ignore_list,
+        "hidden_filter": hidden_filter,
+    });
+    let v1_meta_bytes = serde_json::to_vec(&v1_meta_json).expect("serialize v1 meta");
+    let v1_tree_bytes = br#"{"name":"/minimal","files":{"doc.txt":{"Ok":"aaaa1111"}},"sub_directories":{}}"#;
+    let v1_hash = HashAlgorithm::Sha256.get_hash_from_bytes(v1_tree_bytes);
+    write_raw_hashed_archive(
+        &minimal_v1,
+        &[
+            ("meta.json", &v1_meta_bytes),
+            ("tree.json", v1_tree_bytes),
+            ("hash.sha256", v1_hash.as_bytes()),
+        ],
+    );
+
+    let loaded_min = FileManager::open_file(&minimal_v1).expect("minimal v1 must migrate");
+    assert!(loaded_min.was_migrated());
+    assert_eq!(loaded_min.get_original_version(), FORMAT_VERSION_V1);
+    assert_eq!(loaded_min.get_meta().get_version(), FORMAT_VERSION_V2);
+    assert_eq!(
+        loaded_min.get_meta().get_migrated_from(),
+        Some(FORMAT_VERSION_V1)
+    );
+    assert!(!loaded_min.get_meta().get_local_time().is_empty());
+    assert_eq!(
+        loaded_min.get_meta().get_algorithm(),
+        Some(HashAlgorithm::Sha512)
+    );
+    assert!(loaded_min.get_meta().get_ignore_list().is_some());
+    assert_eq!(
+        loaded_min.get_meta().get_hidden_filter(),
+        Some(hidden_filter)
+    );
+    assert_eq!(loaded_min.get_meta().get_total_size(), None);
+    let report = loaded_min.get_migration().expect("migration report");
+    assert!(
+        report.steps()[0]
+            .notes
+            .iter()
+            .any(|note| note.contains("local_time"))
+    );
+
+    // 2. Transitional v1 archive (extended FileEntry with sizes, version still 1, no total_size)
+    // -> must preserve all extended metadata AND backfill total_size accurately!
+    let transitional_v1 = dir.path().join("transitional_v1.hashed");
+    let trans_tree = serde_json::json!({
+        "name": "/transitional",
+        "files": {
+            "a.bin": { "hash": "h1", "size": 100, "modified_utc": ts.to_rfc3339() },
+            "err.bin": { "error": "Permission denied", "size": 999 }
+        },
+        "sub_directories": {
+            "sub": {
+                "name": "sub",
+                "files": {
+                    "b.bin": { "hash": "h2", "size": 250, "modified_utc": ts.to_rfc3339() }
+                },
+                "sub_directories": {}
+            }
+        }
+    });
+    let trans_tree_bytes = serde_json::to_vec(&trans_tree).expect("serialize trans tree");
+    let trans_hash = HashAlgorithm::Sha256.get_hash_from_bytes(&trans_tree_bytes);
+    let trans_meta = serde_json::json!({
+        "version": 1,
+        "files_hashed": 2,
+        "hash_time": { "secs": 0, "nanos": 500 },
+        "date_utc": ts.to_rfc3339(),
+        "local_time": "2026-01-01T00:00:00Z",
+        "os": "linux"
+    });
+    let trans_meta_bytes = serde_json::to_vec(&trans_meta).expect("serialize trans meta");
+    write_raw_hashed_archive(
+        &transitional_v1,
+        &[
+            ("meta.json", &trans_meta_bytes),
+            ("tree.json", &trans_tree_bytes),
+            ("hash.sha256", trans_hash.as_bytes()),
+        ],
+    );
+
+    let loaded_trans =
+        FileManager::open_file(&transitional_v1).expect("transitional v1 must migrate");
+    assert!(loaded_trans.was_migrated());
+    assert_eq!(loaded_trans.get_meta().get_version(), FORMAT_VERSION_V2);
+    // Backfilled total_size counts hashed files (100 + 250 = 350), not errored file (999)
+    assert_eq!(loaded_trans.get_meta().get_total_size(), Some(350));
+    assert_eq!(
+        loaded_trans
+            .get_tree()
+            .files
+            .get("a.bin")
+            .and_then(FileEntry::modified_utc),
+        Some(ts)
+    );
+    assert_eq!(
+        loaded_trans
+            .get_tree()
+            .files
+            .get("err.bin")
+            .and_then(FileEntry::size),
+        Some(999)
+    );
+
+    // 3. Mixed v1 archive (one entry has size, another legacy Ok entry lacks size)
+    // -> must NOT fabricate a partial total_size!
+    let mixed_v1 = dir.path().join("mixed_v1.hashed");
+    let mixed_tree = br#"{"name":"/mixed","files":{"sized.bin":{"hash":"h1","size":100},"legacy.bin":{"Ok":"h2"}},"sub_directories":{}}"#;
+    let mixed_hash = HashAlgorithm::Sha256.get_hash_from_bytes(mixed_tree);
+    write_raw_hashed_archive(
+        &mixed_v1,
+        &[
+            ("meta.json", &trans_meta_bytes),
+            ("tree.json", mixed_tree),
+            ("hash.sha256", mixed_hash.as_bytes()),
+        ],
+    );
+
+    let loaded_mixed = FileManager::open_file(&mixed_v1).expect("mixed v1 must migrate");
+    assert_eq!(loaded_mixed.get_meta().get_total_size(), None);
+    assert_eq!(
+        loaded_mixed
+            .get_tree()
+            .files
+            .get("sized.bin")
+            .and_then(FileEntry::size),
+        Some(100)
+    );
+    assert_eq!(
+        loaded_mixed
+            .get_tree()
+            .files
+            .get("legacy.bin")
+            .and_then(FileEntry::hash),
+        Some("h2")
+    );
+
+    // 4. Tampered v1 archive MUST still fail with HashMismatch BEFORE migration
+    let tampered_v1 = dir.path().join("tampered_v1.hashed");
+    write_raw_hashed_archive(
+        &tampered_v1,
+        &[
+            ("meta.json", &trans_meta_bytes),
+            ("tree.json", v1_tree_bytes),
+            (
+                "hash.sha256",
+                b"0000000000000000000000000000000000000000000000000000000000000000",
+            ),
+        ],
+    );
+    assert!(matches!(
+        FileManager::open_file(&tampered_v1),
+        Err(BulkHashError::HashMismatch { .. })
+    ));
+
+    // 5. Corrupt v1 tree entries (empty entry, conflicting Ok+Err, non-string Ok) fail with MigrationFailed
+    let bad_trees: [&[u8]; 3] = [
+        br#"{"name":"/bad","files":{"empty.txt":{}},"sub_directories":{}}"#,
+        br#"{"name":"/bad","files":{"both.txt":{"Ok":"aaa","Err":"bbb"}},"sub_directories":{}}"#,
+        br#"{"name":"/bad","files":{"num.txt":{"Ok":12345}},"sub_directories":{}}"#,
+    ];
+    for (idx, bad_tree) in bad_trees.iter().enumerate() {
+        let bad_path = dir.path().join(format!("corrupt_v1_{idx}.hashed"));
+        let bad_hash = HashAlgorithm::Sha256.get_hash_from_bytes(bad_tree);
+        write_raw_hashed_archive(
+            &bad_path,
+            &[
+                ("meta.json", &trans_meta_bytes),
+                ("tree.json", bad_tree),
+                ("hash.sha256", bad_hash.as_bytes()),
+            ],
+        );
+        let err = FileManager::open_file(&bad_path).expect_err("corrupt v1 tree must fail");
+        assert!(
+            matches!(
+                err,
+                BulkHashError::MigrationFailed {
+                    from_version: FORMAT_VERSION_V1,
+                    to_version: FORMAT_VERSION_V2,
+                    ..
+                }
+            ),
+            "expected MigrationFailed for case {idx}, got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn migrate_file_and_migrate_file_in_place_upgrade_archives_atomically_with_backups() {
+    let dir = TempDir::new("migrate_on_disk");
+    let v1_src = dir.path().join("legacy_snapshot.hashed");
+
+    let v1_tree_json = r#"{
+        "name": "/project",
+        "files": {
+            "readme.md": { "Ok": "1111aaaa" },
+            "locked.dat": { "Err": "Permission denied: /project/locked.dat" }
+        },
+        "sub_directories": {
+            "src": {
+                "name": "src",
+                "files": {
+                    "main.rs": { "Ok": "2222bbbb" }
+                },
+                "sub_directories": {}
+            }
+        }
+    }"#;
+    let v1_tree_hash = HashAlgorithm::Sha256.get_hash_from_bytes(v1_tree_json.as_bytes());
+    let v1_meta_json = format!(
+        r#"{{"version":1,"files_hashed":2,"hash_time":{{"secs":3,"nanos":0}},"date_utc":"{}","local_time":"2026-01-01T12:00:00Z","os":"linux","algorithm":"Blake3"}}"#,
+        Utc::now().to_rfc3339()
+    );
+    write_raw_hashed_archive(
+        &v1_src,
+        &[
+            ("meta.json", v1_meta_json.as_bytes()),
+            ("tree.json", v1_tree_json.as_bytes()),
+            ("hash.sha256", v1_tree_hash.as_bytes()),
+        ],
+    );
+    let original_v1_bytes = fs::read(&v1_src).expect("read original v1 bytes");
+
+    // 1. Out-of-place migration via migrate_file(src, dst)
+    let v2_dst = dir.path().join("upgraded_v2.hashed");
+    let report = FileManager::migrate_file(&v1_src, &v2_dst).expect("migrate_file v1 -> v2");
+    assert!(report.was_migrated());
+    assert_eq!(report.original_version(), FORMAT_VERSION_V1);
+    assert_eq!(report.target_version(), FORMAT_VERSION_V2);
+    assert_eq!(report.steps().len(), 1);
+    assert!(report.backup_path().is_none());
+
+    // Original v1 source must remain completely untouched
+    assert_eq!(
+        fs::read(&v1_src).expect("re-read v1 src"),
+        original_v1_bytes
+    );
+
+    // Upgraded v2 destination must contain canonical v2 meta.json, canonical v2 tree.json,
+    // and matching hash.sha256
+    let dst_meta_raw = read_zip_entry_string(&v2_dst, "meta.json");
+    let dst_meta_val: serde_json::Value =
+        serde_json::from_str(&dst_meta_raw).expect("parse dst meta.json");
+    assert_eq!(dst_meta_val["version"], FORMAT_VERSION_V2);
+    assert_eq!(dst_meta_val["migrated_from"], FORMAT_VERSION_V1);
+
+    let dst_tree_raw = read_zip_entry_string(&v2_dst, "tree.json");
+    assert!(dst_tree_raw.contains(r#""hash":"1111aaaa""#));
+    assert!(dst_tree_raw.contains(r#""error":"Permission denied: /project/locked.dat""#));
+    assert!(!dst_tree_raw.contains(r#""Ok""#));
+    assert!(!dst_tree_raw.contains(r#""Err""#));
+
+    let dst_hash_raw = read_zip_entry_string(&v2_dst, "hash.sha256");
+    assert_eq!(
+        dst_hash_raw.trim(),
+        HashAlgorithm::Sha256.get_hash_from_bytes(dst_tree_raw.as_bytes())
+    );
+
+    // Re-opening the upgraded v2 file must NOT require migration anymore
+    let reopened = FileManager::open_file(&v2_dst).expect("open upgraded v2 file");
+    assert!(!reopened.was_migrated());
+    assert_eq!(reopened.get_original_version(), FORMAT_VERSION_V2);
+    assert_eq!(reopened.get_meta().get_version(), FORMAT_VERSION_V2);
+    assert_eq!(
+        reopened.get_meta().get_migrated_from(),
+        Some(FORMAT_VERSION_V1)
+    );
+    assert_eq!(
+        reopened.get_meta().get_algorithm(),
+        Some(HashAlgorithm::Blake3)
+    );
+    assert_eq!(reopened.get_tree().file_count(), 3);
+    assert_eq!(
+        reopened
+            .get_tree()
+            .sub_directories
+            .get("src")
+            .and_then(|s| s.files.get("main.rs"))
+            .and_then(FileEntry::hash),
+        Some("2222bbbb")
+    );
+
+    // 2. Migrating an already-v2 file to a new destination reports up-to-date
+    let v2_copy = dir.path().join("v2_copy.hashed");
+    let copy_report = FileManager::migrate_file(&v2_dst, &v2_copy).expect("migrate v2 -> v2");
+    assert!(!copy_report.was_migrated());
+    assert!(copy_report.steps().is_empty());
+    assert!(v2_copy.exists());
+
+    // 3. In-place migration WITH backup creates .v1.bak containing exact original bytes
+    let in_place_a = dir.path().join("in_place_a.hashed");
+    fs::write(&in_place_a, &original_v1_bytes).expect("seed in_place_a");
+
+    let in_place_report =
+        FileManager::migrate_file_in_place(&in_place_a, true).expect("migrate in place w/ backup");
+    assert!(in_place_report.was_migrated());
+    assert_eq!(in_place_report.original_version(), FORMAT_VERSION_V1);
+    assert_eq!(in_place_report.target_version(), FORMAT_VERSION_V2);
+    let backup_path = in_place_report
+        .backup_path()
+        .expect("backup path must be returned");
+    assert!(backup_path.exists());
+    assert!(
+        backup_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with(".v1.bak"))
+    );
+    assert_eq!(
+        fs::read(backup_path).expect("read backup"),
+        original_v1_bytes
+    );
+
+    let after_in_place = FileManager::open_file(&in_place_a).expect("open upgraded in_place_a");
+    assert!(!after_in_place.was_migrated());
+    assert_eq!(after_in_place.get_meta().get_version(), FORMAT_VERSION_V2);
+    assert_eq!(
+        after_in_place.get_meta().get_migrated_from(),
+        Some(FORMAT_VERSION_V1)
+    );
+
+    // Second in-place migration on the now-v2 file is an idempotent no-op (no extra backup)
+    let second_report =
+        FileManager::migrate_file_in_place(&in_place_a, true).expect("second in-place is no-op");
+    assert!(!second_report.was_migrated());
+    assert!(second_report.backup_path().is_none());
+
+    // Non-clobbering backup: restore v1 over in_place_a while .v1.bak already exists -> .v1.bak.1
+    fs::write(&in_place_a, &original_v1_bytes).expect("re-seed v1 over in_place_a");
+    let third_report = FileManager::migrate_file_in_place(&in_place_a, true)
+        .expect("migrate in place with existing backup");
+    let second_backup = third_report
+        .backup_path()
+        .expect("second backup must be created");
+    assert_ne!(second_backup, backup_path);
+    assert!(
+        second_backup
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with(".v1.bak.1"))
+    );
+    assert_eq!(
+        fs::read(second_backup).expect("read second backup"),
+        original_v1_bytes
+    );
+
+    // 4. In-place migration WITHOUT backup leaves no .bak files
+    let no_bak_dir = TempDir::new("migrate_no_backup");
+    let in_place_b = no_bak_dir.path().join("snapshot.hashed");
+    fs::write(&in_place_b, &original_v1_bytes).expect("seed in_place_b");
+    let no_bak_report =
+        FileManager::migrate_file_in_place(&in_place_b, false).expect("migrate without backup");
+    assert!(no_bak_report.was_migrated());
+    assert!(no_bak_report.backup_path().is_none());
+    let entries_in_dir: Vec<_> = fs::read_dir(no_bak_dir.path())
+        .expect("read no_bak_dir")
+        .collect();
+    assert_eq!(
+        entries_in_dir.len(),
+        1,
+        "no temporary or backup files should remain"
+    );
+
+    // 5. Validation errors for migrate_file (invalid extension, missing parent, dir destination, tampered source)
+    assert!(matches!(
+        FileManager::migrate_file(&v1_src, dir.path().join("wrong.zip")),
+        Err(BulkHashError::InvalidEnding(_))
+    ));
+    assert!(matches!(
+        FileManager::migrate_file(&v1_src, dir.path().join("missing_dir").join("out.hashed")),
+        Err(BulkHashError::PathNotFound(_))
+    ));
+    let dir_as_dest = dir.path().join("dir_dest.hashed");
+    fs::create_dir_all(&dir_as_dest).expect("create dir_as_dest");
+    assert!(matches!(
+        FileManager::migrate_file(&v1_src, &dir_as_dest),
+        Err(BulkHashError::NotAFile(_))
+    ));
+
+    let tampered_src = dir.path().join("tampered_src.hashed");
+    write_raw_hashed_archive(
+        &tampered_src,
+        &[
+            ("meta.json", v1_meta_json.as_bytes()),
+            ("tree.json", v1_tree_json.as_bytes()),
+            ("hash.sha256", b"deadbeef"),
+        ],
+    );
+    let untouched_dst = dir.path().join("must_not_exist.hashed");
+    assert!(matches!(
+        FileManager::migrate_file(&tampered_src, &untouched_dst),
+        Err(BulkHashError::HashMismatch { .. })
+    ));
+    assert!(
+        !untouched_dst.exists(),
+        "failed migration must never create destination file"
+    );
+}
+
+#[test]
+fn extensible_migration_registry_supports_multihop_future_chains_and_validates_invariants() {
+    struct V2ToV3Migration;
+    impl FormatMigration for V2ToV3Migration {
+        fn source_version(&self) -> usize {
+            2
+        }
+
+        fn target_version(&self) -> usize {
+            3
+        }
+
+        fn description(&self) -> &'static str {
+            "Add v3 encryption envelope metadata"
+        }
+
+        fn migrate(&self, payload: &mut SnapshotPayload) -> Result<Vec<String>, BulkHashError> {
+            let meta = payload
+                .meta
+                .as_object_mut()
+                .ok_or_else(|| BulkHashError::MigrationFailed {
+                    from_version: 2,
+                    to_version: 3,
+                    reason: String::from("meta is not an object"),
+                })?;
+            meta.insert(String::from("encrypted"), serde_json::Value::Bool(false));
+            Ok(vec![String::from("Defaulted encrypted=false")])
+        }
+    }
+
+    struct V3ToV4Migration;
+    impl FormatMigration for V3ToV4Migration {
+        fn source_version(&self) -> usize {
+            3
+        }
+
+        fn target_version(&self) -> usize {
+            4
+        }
+
+        fn description(&self) -> &'static str {
+            "Attach v4 segmented-tree manifest entry"
+        }
+
+        fn migrate(&self, payload: &mut SnapshotPayload) -> Result<Vec<String>, BulkHashError> {
+            let meta = payload
+                .meta
+                .as_object_mut()
+                .ok_or_else(|| BulkHashError::MigrationFailed {
+                    from_version: 3,
+                    to_version: 4,
+                    reason: String::from("meta is not an object"),
+                })?;
+            meta.insert(String::from("segmented"), serde_json::Value::Bool(true));
+            payload
+                .extra_entries
+                .insert(String::from("segments/index.json"), b"{\"chunks\":1}".to_vec());
+            Ok(vec![String::from("Generated segments/index.json")])
+        }
+    }
+
+    struct InvalidBackwardMigration;
+    impl FormatMigration for InvalidBackwardMigration {
+        fn source_version(&self) -> usize {
+            5
+        }
+        fn target_version(&self) -> usize {
+            5
+        }
+        fn description(&self) -> &'static str {
+            "invalid"
+        }
+        fn migrate(&self, _: &mut SnapshotPayload) -> Result<Vec<String>, BulkHashError> {
+            Ok(Vec::new())
+        }
+    }
+
+    // 1. Built-in registry chain must always validate cleanly
+    let builtin = MigrationRegistry::with_builtin_migrations();
+    builtin
+        .validate_chain()
+        .expect("built-in migration chain must be complete");
+    assert_eq!(builtin.min_supported_version(), MIN_SUPPORTED_FORMAT_VERSION);
+    assert_eq!(builtin.target_version(), CURRENT_FORMAT_VERSION);
+
+    // 2. Custom multi-hop chain: v1 -> v2 -> v3 -> v4
+    let mut registry = MigrationRegistry::new(1, 4);
+    registry
+        .register(Box::new(
+            bulk_hash_lib::core::io::migration::V1ToV2Migration,
+        ))
+        .expect("register v1->v2");
+    registry
+        .register(Box::new(V2ToV3Migration))
+        .expect("register v2->v3");
+    registry
+        .register(Box::new(V3ToV4Migration))
+        .expect("register v3->v4");
+    registry
+        .validate_chain()
+        .expect("v1..=v4 chain must validate");
+
+    assert_eq!(
+        registry.check_compatibility(1),
+        VersionCompatibility::NeedsMigration {
+            from_version: 1,
+            to_version: 4,
+            steps_required: 3,
+        }
+    );
+    assert_eq!(registry.check_compatibility(4), VersionCompatibility::Current);
+
+    let mut payload = SnapshotPayload::new(
+        1,
+        serde_json::json!({
+            "version": 1,
+            "files_hashed": 1,
+            "hash_time": { "secs": 0, "nanos": 1 },
+            "date_utc": Utc::now().to_rfc3339(),
+            "local_time": "2026-01-01T00:00:00Z",
+            "os": "linux"
+        }),
+        serde_json::json!({
+            "name": "/chain",
+            "files": { "item.txt": { "Ok": "abcdef" } },
+            "sub_directories": {}
+        }),
+    );
+
+    let report = registry
+        .migrate(&mut payload)
+        .expect("v1 -> v4 multi-hop migration");
+    assert!(report.was_migrated());
+    assert_eq!(report.original_version(), 1);
+    assert_eq!(report.target_version(), 4);
+    assert_eq!(report.steps().len(), 3);
+    assert_eq!(report.steps()[0].from_version, 1);
+    assert_eq!(report.steps()[0].to_version, 2);
+    assert_eq!(report.steps()[1].from_version, 2);
+    assert_eq!(report.steps()[1].to_version, 3);
+    assert_eq!(report.steps()[2].from_version, 3);
+    assert_eq!(report.steps()[2].to_version, 4);
+
+    assert_eq!(payload.version, 4);
+    assert_eq!(payload.meta["version"], 4);
+    // Original provenance must remain 1 across all hops!
+    assert_eq!(payload.meta["migrated_from"], 1);
+    assert_eq!(payload.meta["encrypted"], false);
+    assert_eq!(payload.meta["segmented"], true);
+    assert_eq!(payload.tree["files"]["item.txt"]["hash"], "abcdef");
+    assert!(payload.tree["files"]["item.txt"].get("Ok").is_none());
+    assert_eq!(
+        payload.extra_entries.get("segments/index.json"),
+        Some(&b"{\"chunks\":1}".to_vec())
+    );
+
+    // Migrating a v2 payload that already recorded migrated_from=1 keeps migrated_from=1
+    let mut previously_migrated_v2 = SnapshotPayload::new(
+        2,
+        serde_json::json!({ "version": 2, "migrated_from": 1 }),
+        serde_json::json!({ "name": "/", "files": {}, "sub_directories": {} }),
+    );
+    let hop_report = registry
+        .migrate(&mut previously_migrated_v2)
+        .expect("v2 -> v4");
+    assert_eq!(hop_report.steps().len(), 2);
+    assert_eq!(previously_migrated_v2.meta["migrated_from"], 1);
+    assert_eq!(previously_migrated_v2.meta["version"], 4);
+
+    // 3. Registry guard rails: duplicate, non-advancing, gap in chain, mismatched version stamp
+    assert!(matches!(
+        registry.register(Box::new(V2ToV3Migration)),
+        Err(BulkHashError::MigrationFailed { .. })
+    ));
+
+    assert!(matches!(
+        registry.register(Box::new(InvalidBackwardMigration)),
+        Err(BulkHashError::MigrationFailed { .. })
+    ));
+
+    // Gap in chain (v1 -> v2 present, v2 -> v3 missing, target = 3)
+    let mut broken = MigrationRegistry::new(1, 3);
+    broken
+        .register(Box::new(
+            bulk_hash_lib::core::io::migration::V1ToV2Migration,
+        ))
+        .expect("register v1->v2");
+    assert!(matches!(
+        broken.validate_chain(),
+        Err(BulkHashError::MigrationFailed {
+            from_version: 2,
+            to_version: 3,
+            ..
+        })
+    ));
+
+    // Mismatched payload.version vs meta["version"]
+    let mut mismatch_payload = SnapshotPayload::new(
+        1,
+        serde_json::json!({ "version": 2 }),
+        serde_json::json!({ "name": "/", "files": {}, "sub_directories": {} }),
+    );
+    assert!(matches!(
+        builtin.migrate(&mut mismatch_payload),
+        Err(BulkHashError::MigrationFailed { .. })
+    ));
+
+    // BulkHashError::MigrationFailed serializes cleanly for GUI/IPC
+    let mig_err = BulkHashError::MigrationFailed {
+        from_version: 1,
+        to_version: 2,
+        reason: String::from("corrupt file entry"),
+    };
+    let err_json = serde_json::to_value(&mig_err).expect("serialize MigrationFailed");
+    assert_eq!(err_json["kind"], "MigrationFailed");
+    assert_eq!(
+        err_json["message"],
+        "Failed to migrate snapshot from v1 to v2: corrupt file entry"
+    );
+}
+
+#[test]
+fn deep_v1_tree_migration_and_save_file_version_guard() {
+    let dir = TempDir::new("deep_v1_and_save_guard");
+
+    // 1. Deeply nested v1 tree (40 levels deep) verifies iterative migration
+    let mut deep_val = serde_json::json!({
+        "name": "leaf",
+        "files": { "deep.txt": { "Ok": "cafe0001" } },
+        "sub_directories": {}
+    });
+    for depth in (0..40).rev() {
+        let dir_name = format!("level_{depth}");
+        let mut subdirs = serde_json::Map::new();
+        let child_key = deep_val["name"].as_str().unwrap_or("child").to_string();
+        subdirs.insert(child_key, deep_val);
+        deep_val = serde_json::json!({
+            "name": dir_name,
+            "files": {},
+            "sub_directories": subdirs
+        });
+    }
+
+    let deep_tree_bytes = serde_json::to_vec(&deep_val).expect("serialize deep tree");
+    let deep_hash = HashAlgorithm::Sha256.get_hash_from_bytes(&deep_tree_bytes);
+    let v1_meta = format!(
+        r#"{{"version":1,"files_hashed":1,"hash_time":{{"secs":0,"nanos":1}},"date_utc":"{}","local_time":"2026-01-01T00:00:00Z","os":"linux"}}"#,
+        Utc::now().to_rfc3339()
+    );
+    let deep_path = dir.path().join("deep_v1.hashed");
+    write_raw_hashed_archive(
+        &deep_path,
+        &[
+            ("meta.json", v1_meta.as_bytes()),
+            ("tree.json", &deep_tree_bytes),
+            ("hash.sha256", deep_hash.as_bytes()),
+        ],
+    );
+
+    let loaded_deep = FileManager::open_file(&deep_path).expect("deep v1 tree must migrate");
+    assert!(loaded_deep.was_migrated());
+    assert_eq!(loaded_deep.get_tree().hashed_file_count(), 1);
+    let mut cursor = loaded_deep.get_tree();
+    for depth in 1..40 {
+        cursor = cursor
+            .sub_directories
+            .get(&format!("level_{depth}"))
+            .expect("nested dir must exist");
+    }
+    let leaf = cursor
+        .sub_directories
+        .get("leaf")
+        .expect("leaf dir must exist");
+    assert_eq!(
+        leaf.files.get("deep.txt").and_then(FileEntry::hash),
+        Some("cafe0001")
+    );
+
+    // 2. FileManager::save_file rejects MetaData with non-current version
+    let stale_meta: MetaData = serde_json::from_str(&v1_meta).expect("deserialize v1 MetaData");
+    assert_eq!(stale_meta.get_version(), FORMAT_VERSION_V1);
+    let empty_tree = DirectoryNode::new(String::from("/stale"));
+    let save_err = FileManager::save_file(dir.path(), &empty_tree, &stale_meta)
+        .expect_err("save_file must reject non-current format version");
+    assert!(matches!(
+        save_err,
+        BulkHashError::UnsupportedVersion(FORMAT_VERSION_V1)
+    ));
 }

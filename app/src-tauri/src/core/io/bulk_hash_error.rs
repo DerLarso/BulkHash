@@ -1,3 +1,4 @@
+use crate::core::io::migration::{CURRENT_FORMAT_VERSION, MIN_SUPPORTED_FORMAT_VERSION};
 use serde::ser::SerializeStruct;
 use std::fmt;
 use std::io;
@@ -16,6 +17,11 @@ pub enum BulkHashError {
     },
     UnsupportedAlgorithm(String),
     UnsupportedVersion(usize),
+    MigrationFailed {
+        from_version: usize,
+        to_version: usize,
+        reason: String,
+    },
     InvalidIgnorePattern {
         pattern: String,
         reason: String,
@@ -56,6 +62,7 @@ impl BulkHashError {
             Self::HashMismatch { .. } => "HashMismatch",
             Self::UnsupportedAlgorithm(_) => "UnsupportedAlgorithm",
             Self::UnsupportedVersion(_) => "UnsupportedVersion",
+            Self::MigrationFailed { .. } => "MigrationFailed",
             Self::InvalidIgnorePattern { .. } => "InvalidIgnorePattern",
             Self::FileIsCorrupted(_) => "FileIsCorrupted",
             Self::ScanCancelled => "ScanCancelled",
@@ -88,7 +95,20 @@ impl fmt::Display for BulkHashError {
                 write!(f, "Unsupported hash algorithm: {algorithm}")
             }
             Self::UnsupportedVersion(version) => {
-                write!(f, "Unsupported version: {version}")
+                write!(
+                    f,
+                    "Unsupported snapshot format version: {version} (supported: v{MIN_SUPPORTED_FORMAT_VERSION}..=v{CURRENT_FORMAT_VERSION})"
+                )
+            }
+            Self::MigrationFailed {
+                from_version,
+                to_version,
+                reason,
+            } => {
+                write!(
+                    f,
+                    "Failed to migrate snapshot from v{from_version} to v{to_version}: {reason}"
+                )
             }
             Self::InvalidIgnorePattern { pattern, reason } => {
                 write!(f, "Invalid ignore pattern '{pattern}': {reason}")
