@@ -6,13 +6,18 @@ use bulk_hash_lib::core::{
     },
     ignore_list::IgnoreList,
     io::{
-        bulk_hash_error::BulkHashError, directory_node::DirectoryNode, file_manager::FileManager,
+        bulk_hash_error::BulkHashError,
+        directory_node::{DirectoryNode, FileEntry},
+        file_manager::FileManager,
         meta_data::MetaData,
     },
     scan_manager::{ScanCancelToken, ScanControl, ScanControlState, ScanManager},
-    structs::file_info::FileInfo,
+    structs::{
+        file_info::FileInfo,
+        file_metadata::{FileMetadata, system_time_to_utc},
+    },
 };
-use chrono::Utc;
+use chrono::{DateTime, Timelike, Utc};
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::Write;
@@ -167,7 +172,7 @@ fn directory_node_uses_relative_paths_and_handles_colons_in_filenames() {
     let tree = DirectoryNode::build_tree("/tmp/root", &files);
     assert_eq!(tree.name, "/tmp/root");
     assert!(tree.files.contains_key("top.txt"));
-    assert!(matches!(tree.files.get("top.txt"), Some(Err(_))));
+    assert!(tree.files.get("top.txt").is_some_and(FileEntry::is_err));
 
     let sub = tree
         .sub_directories
@@ -175,7 +180,7 @@ fn directory_node_uses_relative_paths_and_handles_colons_in_filenames() {
         .expect("sub directory must exist directly under root");
     assert_eq!(
         sub.files.get("file:with:colons.txt"),
-        Some(&Ok(String::from("abc123")))
+        Some(&FileEntry::from_result(Ok(String::from("abc123"))))
     );
 }
 
@@ -358,10 +363,15 @@ fn single_file_hashing_returns_metadata_and_verifies_hash() {
     );
     let saved = FileManager::save_file(dir.path(), &tree, &meta).expect("save single-file .hashed");
     let loaded = FileManager::open_file(&saved).expect("open single-file .hashed");
-    assert_eq!(
-        loaded.get_tree().files.get("archive.bin"),
-        Some(&Ok(result.get_hash().to_string()))
-    );
+    let loaded_entry = loaded
+        .get_tree()
+        .files
+        .get("archive.bin")
+        .expect("archive.bin entry must exist");
+    assert_eq!(loaded_entry.hash(), Some(result.get_hash()));
+    assert_eq!(loaded_entry.size(), Some(payload.len() as u64));
+    assert_eq!(loaded_entry.modified_utc(), result.get_modified_utc());
+    assert!(loaded_entry.modified_utc().is_some());
 }
 
 #[test]
@@ -553,12 +563,21 @@ fn hash_algorithm_parsing_metadata_and_snapshot_roundtrip() {
     let saved = FileManager::save_file(dir.path(), &tree, &meta).expect("save snapshot");
     let loaded = FileManager::open_file(&saved).expect("open snapshot");
     assert_eq!(loaded.get_meta().get_algorithm(), Some(HashAlgorithm::XxHash128));
+    let data_entry = loaded
+        .get_tree()
+        .files
+        .get("data.bin")
+        .expect("data.bin entry must exist");
     assert_eq!(
-        loaded.get_tree().files.get("data.bin"),
-        Some(&Ok(
-            HashAlgorithm::XxHash128.get_hash_from_bytes(b"fast xxhash snapshot test")
-        ))
+        data_entry.hash(),
+        Some(
+            HashAlgorithm::XxHash128
+                .get_hash_from_bytes(b"fast xxhash snapshot test")
+                .as_str()
+        )
     );
+    assert_eq!(data_entry.size(), Some(b"fast xxhash snapshot test".len() as u64));
+    assert!(data_entry.modified_utc().is_some());
 }
 
 #[test]
@@ -3017,4 +3036,565 @@ fn scan_manager_hidden_filter_combined_with_ignore_list_single_file_batch_and_sn
     assert_eq!(meta_inactive.get_hidden_filter(), None);
     let meta_json = serde_json::to_value(&meta_inactive).expect("serialize inactive meta");
     assert!(meta_json.get("hidden_filter").is_none());
+}
+
+#[test]
+fn file_metadata_and_system_time_conversion_handle_epoch_subseconds_and_pre_1970() {
+    let empty = FileMetadata::empty();
+    assert!(empty.is_empty());
+    assert_eq!(empty, FileMetadata::default());
+    assert_eq!(empty.size(), None);
+    assert_eq!(empty.modified_utc(), None);
+    let empty_json = serde_json::to_value(empty).expect("serialize empty FileMetadata");
+    assert_eq!(empty_json, serde_json::json!({}));
+
+    let ts_ns = DateTime::from_timestamp(1_732_745_043, 123_456_789).expect("valid timestamp");
+    let zero_sized = FileMetadata::empty().with_size(0).with_modified_utc(ts_ns);
+    assert!(!zero_sized.is_empty());
+    assert_eq!(zero_sized.size(), Some(0));
+    assert_eq!(zero_sized.modified_utc(), Some(ts_ns));
+    let zero_json = serde_json::to_value(zero_sized).expect("serialize zero-sized FileMetadata");
+    assert_eq!(zero_json["size"], 0);
+    assert!(zero_json["modified_utc"].is_string());
+    let roundtripped: FileMetadata =
+        serde_json::from_value(zero_json).expect("deserialize FileMetadata");
+    assert_eq!(roundtripped, zero_sized);
+    assert_eq!(
+        roundtripped.modified_utc().map(|dt| dt.nanosecond()),
+        Some(123_456_789)
+    );
+
+    // UNIX_EPOCH exact conversion
+    assert_eq!(
+        system_time_to_utc(UNIX_EPOCH),
+        DateTime::from_timestamp(0, 0)
+    );
+
+    // Post-epoch with subsecond nanoseconds
+    let post = UNIX_EPOCH + Duration::new(1_700_000_000, 987_654_321);
+    assert_eq!(
+        system_time_to_utc(post),
+        DateTime::from_timestamp(1_700_000_000, 987_654_321)
+    );
+
+    // Pre-1970 whole seconds: 1969-12-31T23:59:58Z
+    if let Some(pre_whole) = UNIX_EPOCH.checked_sub(Duration::from_secs(2)) {
+        assert_eq!(
+            system_time_to_utc(pre_whole),
+            DateTime::from_timestamp(-2, 0)
+        );
+    }
+
+    // Pre-1970 sub-second (< 1s before epoch): 1969-12-31T23:59:59.750000000Z
+    if let Some(pre_frac) = UNIX_EPOCH.checked_sub(Duration::from_millis(250)) {
+        assert_eq!(
+            system_time_to_utc(pre_frac),
+            DateTime::from_timestamp(-1, 750_000_000)
+        );
+    }
+
+    // Pre-1970 whole + sub-second (2.25s before epoch): 1969-12-31T23:59:57.750000000Z
+    if let Some(pre_mixed) = UNIX_EPOCH.checked_sub(Duration::new(2, 250_000_000)) {
+        assert_eq!(
+            system_time_to_utc(pre_mixed),
+            DateTime::from_timestamp(-3, 750_000_000)
+        );
+    }
+}
+
+#[test]
+fn file_entry_serde_supports_extended_format_legacy_v1_and_rejects_invalid_json() {
+    let ts = DateTime::from_timestamp(1_764_280_000, 500_000_123).expect("valid timestamp");
+
+    // 1. Extended hash entry with size + modified_utc
+    let ok_entry = FileEntry::from_hash(String::from("deadbeef"), Some(1024), Some(ts));
+    assert!(ok_entry.is_ok());
+    assert!(!ok_entry.is_err());
+    assert_eq!(ok_entry.hash(), Some("deadbeef"));
+    assert_eq!(ok_entry.error(), None);
+    assert_eq!(ok_entry.size(), Some(1024));
+    assert_eq!(ok_entry.modified_utc(), Some(ts));
+    assert_eq!(ok_entry.metadata(), FileMetadata::new(Some(1024), Some(ts)));
+
+    let ok_json = serde_json::to_value(&ok_entry).expect("serialize ok FileEntry");
+    assert_eq!(ok_json["hash"], "deadbeef");
+    assert_eq!(ok_json["size"], 1024);
+    assert!(ok_json["modified_utc"].is_string());
+    assert!(ok_json.get("error").is_none());
+    assert!(ok_json.get("Ok").is_none());
+    let ok_back: FileEntry = serde_json::from_value(ok_json).expect("deserialize ok FileEntry");
+    assert_eq!(ok_back, ok_entry);
+
+    // 2. Zero-byte file preserves explicit size=0 and omits absent modified_utc
+    let zero_entry = FileEntry::from_hash(String::from("emptyhash"), Some(0), None);
+    let zero_json = serde_json::to_value(&zero_entry).expect("serialize zero FileEntry");
+    assert_eq!(zero_json, serde_json::json!({"hash": "emptyhash", "size": 0}));
+    let zero_back: FileEntry = serde_json::from_value(zero_json).expect("deserialize zero entry");
+    assert_eq!(zero_back, zero_entry);
+
+    // 3. Error entry with preserved metadata
+    let err_entry = FileEntry::from_error(
+        String::from("Permission denied: /secret"),
+        Some(512),
+        Some(ts),
+    );
+    assert!(err_entry.is_err());
+    assert_eq!(err_entry.hash(), None);
+    assert_eq!(err_entry.error(), Some("Permission denied: /secret"));
+    let err_json = serde_json::to_value(&err_entry).expect("serialize err FileEntry");
+    assert_eq!(err_json["error"], "Permission denied: /secret");
+    assert_eq!(err_json["size"], 512);
+    assert!(err_json.get("hash").is_none());
+    let err_back: FileEntry = serde_json::from_value(err_json).expect("deserialize err FileEntry");
+    assert_eq!(err_back, err_entry);
+
+    // 4. Legacy v1 Result<String, String> JSON format ("Ok" / "Err")
+    let legacy_ok: FileEntry =
+        serde_json::from_str(r#"{"Ok":"cafebabe"}"#).expect("deserialize legacy Ok");
+    assert_eq!(
+        legacy_ok,
+        FileEntry::from_result(Ok(String::from("cafebabe")))
+    );
+    assert_eq!(legacy_ok.size(), None);
+    assert_eq!(legacy_ok.modified_utc(), None);
+
+    let legacy_err: FileEntry =
+        serde_json::from_str(r#"{"Err":"File not found: /gone"}"#).expect("deserialize legacy Err");
+    assert_eq!(
+        legacy_err,
+        FileEntry::from_result(Err(String::from("File not found: /gone")))
+    );
+
+    // 5. Explicit nulls and forward-compatible unknown fields
+    let with_nulls: FileEntry = serde_json::from_str(
+        r#"{"hash":"abc","size":null,"modified_utc":null,"future_ext":{"k":[1,2,3]}}"#,
+    )
+    .expect("deserialize entry with nulls and unknown fields");
+    assert_eq!(with_nulls, FileEntry::from_result(Ok(String::from("abc"))));
+
+    // 6. Invalid JSON payloads must be rejected
+    let invalid_cases = [
+        r#"{}"#,
+        r#"{"size":100}"#,
+        r#"{"hash":"abc","error":"boom"}"#,
+        r#"{"Ok":"abc","Err":"boom"}"#,
+        r#"{"hash":"abc","Ok":"abc"}"#,
+        r#"{"error":"e1","Err":"e2"}"#,
+        r#"{"hash":"abc","size":-5}"#,
+        r#"{"hash":"abc","modified_utc":"not-a-timestamp"}"#,
+        r#"{"hash":null}"#,
+    ];
+    for case in invalid_cases {
+        assert!(
+            serde_json::from_str::<FileEntry>(case).is_err(),
+            "expected invalid FileEntry JSON to fail: {case}"
+        );
+    }
+}
+
+#[test]
+fn extended_file_metadata_captured_across_scans_and_persisted_in_hashed_archive() {
+    let dir = TempDir::new("extended_meta_scan");
+    let sub = dir.path().join("sub");
+    let deep = sub.join("deep");
+    fs::create_dir_all(&deep).expect("create nested dirs");
+
+    let empty_path = dir.path().join("empty.bin");
+    let notes_path = sub.join("notes.txt");
+    let blob_path = deep.join("blob.bin");
+
+    let notes_bytes = b"Extended metadata test notes!";
+    let blob_bytes: Vec<u8> = (0..(150 * 1024))
+        .map(|i| ((i * 29 + 11) % 256) as u8)
+        .collect();
+
+    let empty_mtime = UNIX_EPOCH + Duration::from_secs(1_700_000_100);
+    let notes_mtime = UNIX_EPOCH + Duration::from_secs(1_710_000_200);
+    let blob_mtime = UNIX_EPOCH + Duration::from_secs(1_720_000_300);
+
+    {
+        let f = File::create(&empty_path).expect("create empty.bin");
+        f.set_modified(empty_mtime).expect("set empty.bin mtime");
+    }
+    {
+        let mut f = File::create(&notes_path).expect("create notes.txt");
+        f.write_all(notes_bytes).expect("write notes.txt");
+        f.flush().expect("flush notes.txt");
+        f.set_modified(notes_mtime).expect("set notes.txt mtime");
+    }
+    {
+        let mut f = File::create(&blob_path).expect("create blob.bin");
+        f.write_all(&blob_bytes).expect("write blob.bin");
+        f.flush().expect("flush blob.bin");
+        f.set_modified(blob_mtime).expect("set blob.bin mtime");
+    }
+
+    let expected_empty_utc = system_time_to_utc(
+        fs::metadata(&empty_path)
+            .expect("empty meta")
+            .modified()
+            .expect("empty mtime"),
+    );
+    let expected_notes_utc = system_time_to_utc(
+        fs::metadata(&notes_path)
+            .expect("notes meta")
+            .modified()
+            .expect("notes mtime"),
+    );
+    let expected_blob_utc = system_time_to_utc(
+        fs::metadata(&blob_path)
+            .expect("blob meta")
+            .modified()
+            .expect("blob mtime"),
+    );
+    assert_eq!(expected_empty_utc, DateTime::from_timestamp(1_700_000_100, 0));
+    assert_eq!(expected_notes_utc, DateTime::from_timestamp(1_710_000_200, 0));
+    assert_eq!(expected_blob_utc, DateTime::from_timestamp(1_720_000_300, 0));
+
+    let expected_total_size = (notes_bytes.len() + blob_bytes.len()) as u64;
+    let root_str = dir.path().to_string_lossy().into_owned();
+
+    // 1. Directory scan (single-threaded vs multithreaded)
+    let mut single_scan = ScanManager::new(HashAlgorithm::Blake3).with_thread_count(1);
+    single_scan
+        .start_hash(root_str.clone())
+        .expect("single-threaded scan");
+
+    let mut parallel_scan = ScanManager::new(HashAlgorithm::Blake3).with_thread_count(4);
+    parallel_scan
+        .start_hash(root_str.clone())
+        .expect("parallel scan");
+
+    assert_eq!(single_scan.get_total_size(), expected_total_size);
+    assert_eq!(parallel_scan.get_total_size(), expected_total_size);
+    assert_eq!(
+        parallel_scan.get_hash_manager().get_bytes_hashed(),
+        expected_total_size
+    );
+
+    let single_tree = DirectoryNode::build_tree(single_scan.get_path(), single_scan.get_list());
+    let parallel_tree =
+        DirectoryNode::build_tree(parallel_scan.get_path(), parallel_scan.get_list());
+    assert_eq!(single_tree, parallel_tree);
+    assert_eq!(parallel_tree.total_size(), expected_total_size);
+    assert_eq!(parallel_tree.hashed_size(), expected_total_size);
+    assert_eq!(parallel_tree.file_count(), 3);
+    assert_eq!(parallel_tree.hashed_file_count(), 3);
+    assert_eq!(parallel_tree.error_count(), 0);
+
+    let empty_entry = parallel_tree
+        .files
+        .get("empty.bin")
+        .expect("empty.bin in tree");
+    assert_eq!(
+        empty_entry.hash(),
+        Some(HashAlgorithm::Blake3.get_hash_from_bytes(b"").as_str())
+    );
+    assert_eq!(empty_entry.size(), Some(0));
+    assert_eq!(empty_entry.modified_utc(), expected_empty_utc);
+
+    let sub_node = parallel_tree
+        .sub_directories
+        .get("sub")
+        .expect("sub dir in tree");
+    assert_eq!(sub_node.total_size(), expected_total_size);
+    let notes_entry = sub_node.files.get("notes.txt").expect("notes.txt in sub");
+    assert_eq!(notes_entry.size(), Some(notes_bytes.len() as u64));
+    assert_eq!(notes_entry.modified_utc(), expected_notes_utc);
+
+    let deep_node = sub_node
+        .sub_directories
+        .get("deep")
+        .expect("deep dir in sub");
+    assert_eq!(deep_node.total_size(), blob_bytes.len() as u64);
+    let blob_entry = deep_node.files.get("blob.bin").expect("blob.bin in deep");
+    assert_eq!(blob_entry.size(), Some(blob_bytes.len() as u64));
+    assert_eq!(blob_entry.modified_utc(), expected_blob_utc);
+
+    // 2. Snapshot (.hashed) save & open roundtrip preserves per-file metadata and MetaData::total_size
+    let out_dir = TempDir::new("extended_meta_out");
+    let meta = MetaData::new(
+        parallel_scan.get_hash_manager().get_files_counted(),
+        parallel_scan.get_hash_time(),
+        Utc::now(),
+    )
+    .with_algorithm(parallel_scan.get_algorithm())
+    .with_total_size(parallel_scan.get_total_size());
+
+    let saved_path =
+        FileManager::save_file(out_dir.path(), &parallel_tree, &meta).expect("save snapshot");
+    let loaded = FileManager::open_file(&saved_path).expect("open snapshot");
+    assert_eq!(loaded.get_meta().get_total_size(), Some(expected_total_size));
+    assert_eq!(loaded.get_tree(), &parallel_tree);
+    assert_eq!(
+        loaded.get_tree().files.get("empty.bin").and_then(FileEntry::size),
+        Some(0)
+    );
+    assert_eq!(
+        loaded
+            .get_tree()
+            .files
+            .get("empty.bin")
+            .and_then(FileEntry::modified_utc),
+        expected_empty_utc
+    );
+
+    // 3. Single-file start_hash captures size + modified_utc
+    parallel_scan
+        .start_hash(notes_path.to_string_lossy().into_owned())
+        .expect("single-file start_hash");
+    assert_eq!(parallel_scan.get_list().len(), 1);
+    assert_eq!(parallel_scan.get_total_size(), notes_bytes.len() as u64);
+    assert_eq!(
+        parallel_scan.get_list()[0].get_size(),
+        Some(notes_bytes.len() as u64)
+    );
+    assert_eq!(
+        parallel_scan.get_list()[0].get_modified_utc(),
+        expected_notes_utc
+    );
+
+    // 4. ScanManager::hash_single_file captures modified_utc in SingleFileHash and file_list
+    let single_res = parallel_scan
+        .hash_single_file(&blob_path)
+        .expect("hash_single_file");
+    assert_eq!(single_res.get_file_size(), blob_bytes.len() as u64);
+    assert_eq!(single_res.get_modified_utc(), expected_blob_utc);
+    assert_eq!(
+        single_res.get_metadata(),
+        FileMetadata::new(Some(blob_bytes.len() as u64), expected_blob_utc)
+    );
+    let single_json = serde_json::to_value(&single_res).expect("serialize SingleFileHash");
+    assert!(single_json["modified_utc"].is_string());
+    assert_eq!(
+        parallel_scan.get_list()[0].get_size(),
+        Some(blob_bytes.len() as u64)
+    );
+    assert_eq!(
+        parallel_scan.get_list()[0].get_modified_utc(),
+        expected_blob_utc
+    );
+
+    // 5. Batch hash_files captures metadata for valid files and None for missing/dir entries
+    let missing_path = dir.path().join("missing.dat");
+    let batch = vec![
+        empty_path.clone(),
+        notes_path.clone(),
+        missing_path,
+        sub.clone(),
+    ];
+    parallel_scan.hash_files(&batch).expect("batch hash_files");
+    assert_eq!(parallel_scan.get_list().len(), 4);
+    assert_eq!(parallel_scan.get_total_size(), notes_bytes.len() as u64);
+    assert_eq!(parallel_scan.get_list()[0].get_size(), Some(0));
+    assert_eq!(
+        parallel_scan.get_list()[0].get_modified_utc(),
+        expected_empty_utc
+    );
+    assert_eq!(
+        parallel_scan.get_list()[1].get_size(),
+        Some(notes_bytes.len() as u64)
+    );
+    assert_eq!(
+        parallel_scan.get_list()[1].get_modified_utc(),
+        expected_notes_utc
+    );
+    assert_eq!(parallel_scan.get_list()[2].get_size(), None);
+    assert_eq!(parallel_scan.get_list()[2].get_modified_utc(), None);
+    assert_eq!(parallel_scan.get_list()[3].get_size(), None);
+    assert_eq!(parallel_scan.get_list()[3].get_modified_utc(), None);
+
+    // 6. Modifying file mtime and size is reflected on rescan (basis for diff & bitrot checks)
+    let updated_mtime = UNIX_EPOCH + Duration::from_secs(1_730_000_999);
+    {
+        let mut f = File::create(&notes_path).expect("overwrite notes.txt");
+        f.write_all(b"updated content with different length")
+            .expect("write updated notes");
+        f.flush().expect("flush updated notes");
+        f.set_modified(updated_mtime).expect("set updated mtime");
+    }
+    parallel_scan
+        .start_hash(root_str)
+        .expect("rescan after modification");
+    let updated_tree =
+        DirectoryNode::build_tree(parallel_scan.get_path(), parallel_scan.get_list());
+    let updated_notes = updated_tree
+        .sub_directories
+        .get("sub")
+        .and_then(|s| s.files.get("notes.txt"))
+        .expect("updated notes.txt");
+    assert_eq!(
+        updated_notes.size(),
+        Some(b"updated content with different length".len() as u64)
+    );
+    assert_eq!(
+        updated_notes.modified_utc(),
+        DateTime::from_timestamp(1_730_000_999, 0)
+    );
+    assert_ne!(updated_notes.hash(), notes_entry.hash());
+}
+
+#[test]
+fn legacy_v1_hashed_archive_without_extended_metadata_opens_cleanly() {
+    let dir = TempDir::new("legacy_v1_archive");
+    let legacy_path = dir.path().join("legacy_snapshot.hashed");
+
+    let legacy_tree_json = r#"{
+        "name": "/legacy/root",
+        "files": {
+            "old_ok.txt": { "Ok": "deadbeef" },
+            "old_err.txt": { "Err": "Permission denied: /legacy/root/old_err.txt" }
+        },
+        "sub_directories": {
+            "nested": {
+                "name": "nested",
+                "files": {
+                    "child.bin": { "Ok": "cafebabe" }
+                },
+                "sub_directories": {}
+            }
+        }
+    }"#;
+    let tree_hash = HashAlgorithm::Sha256.get_hash_from_bytes(legacy_tree_json.as_bytes());
+    let legacy_meta_json = format!(
+        r#"{{"version":1,"files_hashed":2,"hash_time":{{"secs":1,"nanos":500}},"date_utc":"{}","local_time":"2026-01-01T00:00:00Z","os":"linux"}}"#,
+        Utc::now().to_rfc3339()
+    );
+
+    {
+        let f = File::create(&legacy_path).expect("create legacy archive");
+        let mut zip = ZipWriter::new(f);
+        let opts = SimpleFileOptions::default();
+        zip.start_file("meta.json", opts).expect("start meta");
+        zip.write_all(legacy_meta_json.as_bytes())
+            .expect("write meta");
+        zip.start_file("tree.json", opts).expect("start tree");
+        zip.write_all(legacy_tree_json.as_bytes())
+            .expect("write tree");
+        zip.start_file("hash.sha256", opts).expect("start hash");
+        zip.write_all(tree_hash.as_bytes()).expect("write hash");
+        zip.finish().expect("finish zip");
+    }
+
+    let loaded = FileManager::open_file(&legacy_path).expect("legacy v1 snapshot must open");
+    assert_eq!(loaded.get_meta().get_version(), 1);
+    assert_eq!(loaded.get_meta().get_total_size(), None);
+    assert_eq!(loaded.get_meta().get_files_hashed(), 2);
+
+    let tree = loaded.get_tree();
+    assert_eq!(tree.name, "/legacy/root");
+    assert_eq!(tree.file_count(), 3);
+    assert_eq!(tree.hashed_file_count(), 2);
+    assert_eq!(tree.error_count(), 1);
+    assert_eq!(tree.total_size(), 0);
+    assert_eq!(tree.hashed_size(), 0);
+
+    let old_ok = tree.files.get("old_ok.txt").expect("old_ok.txt");
+    assert_eq!(old_ok.hash(), Some("deadbeef"));
+    assert_eq!(old_ok.size(), None);
+    assert_eq!(old_ok.modified_utc(), None);
+
+    let old_err = tree.files.get("old_err.txt").expect("old_err.txt");
+    assert_eq!(
+        old_err.error(),
+        Some("Permission denied: /legacy/root/old_err.txt")
+    );
+    assert_eq!(old_err.size(), None);
+    assert_eq!(old_err.modified_utc(), None);
+
+    let child = tree
+        .sub_directories
+        .get("nested")
+        .and_then(|n| n.files.get("child.bin"))
+        .expect("nested/child.bin");
+    assert_eq!(child.hash(), Some("cafebabe"));
+    assert_eq!(child.size(), None);
+    assert_eq!(child.modified_utc(), None);
+}
+
+#[test]
+fn directory_node_aggregations_and_unreadable_file_metadata() {
+    let ts = DateTime::from_timestamp(1_750_000_000, 0).expect("valid ts");
+    let mut tree = DirectoryNode::new(String::from("/synthetic"));
+    tree.insert_path(
+        &["a.bin"],
+        FileEntry::from_hash(String::from("h1"), Some(100), Some(ts)),
+    );
+    tree.insert_path(
+        &["sub", "b.bin"],
+        FileEntry::from_hash(String::from("h2"), Some(250), Some(ts)),
+    );
+    tree.insert_path(
+        &["sub", "locked.bin"],
+        FileEntry::from_error(String::from("Permission denied"), Some(500), Some(ts)),
+    );
+    tree.insert_path(
+        &["sub", "missing.bin"],
+        FileEntry::from_error(String::from("File not found"), None, None),
+    );
+
+    assert_eq!(tree.file_count(), 4);
+    assert_eq!(tree.hashed_file_count(), 2);
+    assert_eq!(tree.error_count(), 2);
+    assert_eq!(tree.total_size(), 850);
+    assert_eq!(tree.hashed_size(), 350);
+
+    // Saturating addition prevents arithmetic overflow on extreme sizes
+    let mut huge = DirectoryNode::new(String::from("/huge"));
+    huge.insert_path(
+        &["one.bin"],
+        FileEntry::from_hash(String::from("h1"), Some(u64::MAX), None),
+    );
+    huge.insert_path(
+        &["two.bin"],
+        FileEntry::from_hash(String::from("h2"), Some(42), None),
+    );
+    assert_eq!(huge.total_size(), u64::MAX);
+    assert_eq!(huge.hashed_size(), u64::MAX);
+
+    // On Unix (non-root), scanning a chmod 000 file records its metadata alongside PermissionDenied
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new("unreadable_meta");
+        let ok_file = dir.path().join("readable.txt");
+        let secret_file = dir.path().join("secret.txt");
+        fs::write(&ok_file, b"hello").expect("write readable.txt");
+        fs::write(&secret_file, b"top secret payload").expect("write secret.txt");
+
+        fs::set_permissions(&secret_file, fs::Permissions::from_mode(0o000))
+            .expect("chmod 000 secret.txt");
+
+        let is_unreadable = File::open(&secret_file).is_err();
+
+        let mut scanner = ScanManager::new(HashAlgorithm::Blake3);
+        let scan_res = scanner.start_hash(dir.path().to_string_lossy().into_owned());
+
+        // Restore permissions immediately so TempDir cleanup always succeeds
+        let _ = fs::set_permissions(&secret_file, fs::Permissions::from_mode(0o644));
+
+        scan_res.expect("scan should isolate per-file permission error");
+
+        if is_unreadable {
+            let scanned_tree = DirectoryNode::build_tree(scanner.get_path(), scanner.get_list());
+            assert_eq!(scanned_tree.file_count(), 2);
+            assert_eq!(scanned_tree.hashed_file_count(), 1);
+            assert_eq!(scanned_tree.error_count(), 1);
+            assert_eq!(scanned_tree.hashed_size(), 5);
+            assert_eq!(scanned_tree.total_size(), 5 + b"top secret payload".len() as u64);
+            assert_eq!(scanner.get_total_size(), 5);
+
+            let secret_entry = scanned_tree
+                .files
+                .get("secret.txt")
+                .expect("secret.txt entry");
+            assert!(secret_entry.is_err());
+            assert_eq!(
+                secret_entry.size(),
+                Some(b"top secret payload".len() as u64)
+            );
+            assert!(secret_entry.modified_utc().is_some());
+        }
+    }
 }

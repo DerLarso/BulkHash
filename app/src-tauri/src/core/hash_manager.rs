@@ -1,6 +1,8 @@
 use crate::core::io::bulk_hash_error::BulkHashError;
 use crate::core::scan_control::ScanControl;
-use crate::core::structs::{file_info::FileInfo, single_file_hash::SingleFileHash};
+use crate::core::structs::{
+    file_info::FileInfo, file_metadata::FileMetadata, single_file_hash::SingleFileHash,
+};
 use md5::Md5;
 use rayon::{ThreadPoolBuilder, prelude::*};
 use sha2::{Digest, Sha256, Sha512};
@@ -53,6 +55,7 @@ impl ExecutionControl<'_> {
 
 pub struct HashManager {
     files_counted: usize,
+    bytes_hashed: u64,
     algorithm: HashAlgorithm,
     buffer: Vec<u8>,
 }
@@ -75,6 +78,7 @@ impl HashManager {
     pub fn new(algorithm: HashAlgorithm) -> Self {
         Self {
             files_counted: 0,
+            bytes_hashed: 0,
             algorithm,
             buffer: vec![0u8; HASH_BUFFER_SIZE],
         }
@@ -100,6 +104,35 @@ impl HashManager {
         self.get_hash_code_internal(path.as_ref(), ExecutionControl::Full(control))
     }
 
+    pub fn hash_file_info_controlled(
+        &mut self,
+        path: impl AsRef<Path>,
+        control: &ScanControl,
+    ) -> Result<FileInfo, BulkHashError> {
+        let path_ref = path.as_ref();
+        let path_display = path_ref.to_string_lossy().into_owned();
+        let exec_control = ExecutionControl::Full(control);
+
+        let info = hash_file_info_with_buffer(
+            self.algorithm,
+            &mut self.buffer,
+            path_ref,
+            path_display,
+            exec_control,
+        )?;
+        if exec_control.is_cancelled() {
+            return Err(BulkHashError::ScanCancelled);
+        }
+
+        if info.get_result().is_ok() {
+            self.files_counted = self.files_counted.saturating_add(1);
+            if let Some(size) = info.get_size() {
+                self.bytes_hashed = self.bytes_hashed.saturating_add(size);
+            }
+        }
+        Ok(info)
+    }
+
     fn get_hash_code_internal(
         &mut self,
         path_ref: &Path,
@@ -108,7 +141,7 @@ impl HashManager {
         control.checkpoint()?;
 
         let path_display = path_ref.to_string_lossy().into_owned();
-        let hash = hash_file_with_buffer(
+        let (hash, file_meta) = hash_file_with_buffer(
             self.algorithm,
             &mut self.buffer,
             path_ref,
@@ -119,6 +152,9 @@ impl HashManager {
             return Err(BulkHashError::ScanCancelled);
         }
         self.files_counted = self.files_counted.saturating_add(1);
+        if let Some(size) = file_meta.size() {
+            self.bytes_hashed = self.bytes_hashed.saturating_add(size);
+        }
         Ok(hash)
     }
 
@@ -165,18 +201,20 @@ impl HashManager {
             return Err(BulkHashError::NotAFile(path_display));
         }
 
-        let file_size = metadata.len();
-        let hash = hash_regular_file_with_buffer(
+        let (hash, file_meta) = hash_regular_file_with_buffer(
             self.algorithm,
             &mut self.buffer,
             path_ref,
             &path_display,
+            &metadata,
             control,
         )?;
         if control.is_cancelled() {
             return Err(BulkHashError::ScanCancelled);
         }
+        let file_size = file_meta.size().unwrap_or(metadata.len());
         self.files_counted = self.files_counted.saturating_add(1);
+        self.bytes_hashed = self.bytes_hashed.saturating_add(file_size);
         let hash_time = match (control, timer) {
             (ExecutionControl::Full(ctrl), Some(t)) => t.finish(ctrl).0,
             _ => start_time.elapsed(),
@@ -187,14 +225,19 @@ impl HashManager {
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| path_display.clone());
 
-        Ok(SingleFileHash::new(
+        let mut single = SingleFileHash::new(
             path_display,
             file_name,
             hash,
             self.algorithm,
             file_size,
             hash_time,
-        ))
+        );
+        if let Some(modified_utc) = file_meta.modified_utc() {
+            single = single.with_modified_utc(modified_utc);
+        }
+
+        Ok(single)
     }
 
     pub fn hash_files<P>(&mut self, paths: &[P]) -> Vec<FileInfo>
@@ -341,17 +384,14 @@ impl HashManager {
 
             let path_ref = path.as_ref();
             let path_display = path_ref.to_string_lossy().into_owned();
-            let result = hash_file_with_buffer(
+            let info = hash_file_info_with_buffer(
                 self.algorithm,
                 &mut self.buffer,
                 path_ref,
-                &path_display,
+                path_display,
                 control,
-            );
-            if matches!(result, Err(BulkHashError::ScanCancelled)) {
-                return Err(BulkHashError::ScanCancelled);
-            }
-            results.push(FileInfo::new(path_display, result));
+            )?;
+            results.push(info);
         }
 
         if control.is_cancelled() {
@@ -363,18 +403,32 @@ impl HashManager {
     }
 
     fn record_hashed_results(&mut self, results: &[FileInfo]) {
-        let succeeded = results
-            .iter()
-            .filter(|info| info.get_result().is_ok())
-            .count();
+        let mut succeeded = 0usize;
+        let mut bytes = 0u64;
+        for info in results {
+            if info.get_result().is_ok() {
+                succeeded = succeeded.saturating_add(1);
+                if let Some(size) = info.get_size() {
+                    bytes = bytes.saturating_add(size);
+                }
+            }
+        }
         self.files_counted = self.files_counted.saturating_add(succeeded);
+        self.bytes_hashed = self.bytes_hashed.saturating_add(bytes);
     }
 
-    pub fn get_files_counted(&self) -> usize {
+    #[must_use]
+    pub const fn get_files_counted(&self) -> usize {
         self.files_counted
     }
 
-    pub fn get_algorithm(&self) -> HashAlgorithm {
+    #[must_use]
+    pub const fn get_bytes_hashed(&self) -> u64 {
+        self.bytes_hashed
+    }
+
+    #[must_use]
+    pub const fn get_algorithm(&self) -> HashAlgorithm {
         self.algorithm
     }
 
@@ -384,6 +438,7 @@ impl HashManager {
 
     pub fn reset_counter(&mut self) {
         self.files_counted = 0;
+        self.bytes_hashed = 0;
     }
 }
 
@@ -398,14 +453,14 @@ where
             |buffer, path| {
                 let path_ref = path.as_ref();
                 let path_display = path_ref.to_string_lossy().into_owned();
-                let result = hash_file_with_buffer(
+                hash_file_info_with_buffer(
                     algorithm,
                     buffer,
                     path_ref,
-                    &path_display,
+                    path_display.clone(),
                     ExecutionControl::None,
-                );
-                FileInfo::new(path_display, result)
+                )
+                .unwrap_or_else(|err| FileInfo::new(path_display, Err(err)))
             },
         )
         .collect()
@@ -428,16 +483,52 @@ where
 
                 let path_ref = path.as_ref();
                 let path_display = path_ref.to_string_lossy().into_owned();
-                let result =
-                    hash_file_with_buffer(algorithm, buffer, path_ref, &path_display, control);
-                if matches!(result, Err(BulkHashError::ScanCancelled)) {
-                    return Err(BulkHashError::ScanCancelled);
-                }
-
-                Ok(FileInfo::new(path_display, result))
+                hash_file_info_with_buffer(algorithm, buffer, path_ref, path_display, control)
             },
         )
         .collect()
+}
+
+fn hash_file_info_with_buffer(
+    algorithm: HashAlgorithm,
+    buffer: &mut [u8],
+    path_ref: &Path,
+    path_display: String,
+    control: ExecutionControl<'_>,
+) -> Result<FileInfo, BulkHashError> {
+    control.checkpoint()?;
+
+    let initial_metadata = match fs::metadata(path_ref) {
+        Ok(meta) => meta,
+        Err(err) => {
+            return Ok(FileInfo::new(
+                path_display.clone(),
+                Err(BulkHashError::from_io(err, path_display)),
+            ));
+        }
+    };
+
+    if !initial_metadata.is_file() {
+        return Ok(FileInfo::new(
+            path_display.clone(),
+            Err(BulkHashError::NotAFile(path_display)),
+        ));
+    }
+
+    let fallback_meta = FileMetadata::from_fs_metadata(&initial_metadata);
+
+    match hash_regular_file_with_buffer(
+        algorithm,
+        buffer,
+        path_ref,
+        &path_display,
+        &initial_metadata,
+        control,
+    ) {
+        Ok((hash, file_meta)) => Ok(FileInfo::with_metadata(path_display, Ok(hash), file_meta)),
+        Err(BulkHashError::ScanCancelled) => Err(BulkHashError::ScanCancelled),
+        Err(err) => Ok(FileInfo::with_metadata(path_display, Err(err), fallback_meta)),
+    }
 }
 
 fn hash_file_with_buffer(
@@ -446,7 +537,7 @@ fn hash_file_with_buffer(
     path_ref: &Path,
     path_display: &str,
     control: ExecutionControl<'_>,
-) -> Result<String, BulkHashError> {
+) -> Result<(String, FileMetadata), BulkHashError> {
     control.checkpoint()?;
 
     let metadata = fs::metadata(path_ref)
@@ -456,7 +547,7 @@ fn hash_file_with_buffer(
         return Err(BulkHashError::NotAFile(path_display.to_owned()));
     }
 
-    hash_regular_file_with_buffer(algorithm, buffer, path_ref, path_display, control)
+    hash_regular_file_with_buffer(algorithm, buffer, path_ref, path_display, &metadata, control)
 }
 
 fn hash_regular_file_with_buffer(
@@ -464,11 +555,21 @@ fn hash_regular_file_with_buffer(
     buffer: &mut [u8],
     path_ref: &Path,
     path_display: &str,
+    fallback_metadata: &fs::Metadata,
     control: ExecutionControl<'_>,
-) -> Result<String, BulkHashError> {
+) -> Result<(String, FileMetadata), BulkHashError> {
     control.checkpoint()?;
 
     let mut file = File::open(path_ref).map_err(|err| BulkHashError::from_io(err, path_display))?;
+    let file_metadata = match file.metadata() {
+        Ok(open_meta) => {
+            if !open_meta.is_file() {
+                return Err(BulkHashError::NotAFile(path_display.to_owned()));
+            }
+            FileMetadata::from_fs_metadata(&open_meta)
+        }
+        Err(_) => FileMetadata::from_fs_metadata(fallback_metadata),
+    };
 
     let hex_string = match algorithm {
         HashAlgorithm::Blake3 => {
@@ -522,7 +623,7 @@ fn hash_regular_file_with_buffer(
         }
     };
 
-    Ok(hex_string)
+    Ok((hex_string, file_metadata))
 }
 
 fn stream_file_into(

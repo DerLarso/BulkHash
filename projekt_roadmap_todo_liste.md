@@ -23,7 +23,7 @@ Backend - Dateiformat & IO (.hashed):
 	[#] Basis-Metadaten: Erfassung von Betriebssystem, Zeitstempel, Hash-Dauer und Dateianzahl ; Rust
 	[#] Baumstruktur-Generierung: Aufbau des DirectoryNode (Anpassung auf relative Pfade fehlt noch) ; Rust
 	[#] Eigenes Error-Handling: Zentrale HashedError-Enum (Ausformulierte Display-Texte fehlen noch) ; Rust
-	[X] Erweiterte Datei-Metadaten: Speichern von Dateigröße und letztem Änderungsdatum pro Datei ; Rust
+	[#] Erweiterte Datei-Metadaten: Speichern von Dateigröße und letztem Änderungsdatum pro Datei ; Rust
 	[X] Versions-Migration: Abwärtskompatibilität für zukünftige Versionen des .hashed-Formats ; Rust
 	[X] Snapshot-Verschlüsselung: Optionaler Passwortschutz (AES-GCM) für sensible Dateibäume ; Rust
 	[X] Snapshot-Komprimierungsgrad: Einstellbare ZIP-Kompressionsstärke (Schnell vs. Kleine Datei) ; Rust

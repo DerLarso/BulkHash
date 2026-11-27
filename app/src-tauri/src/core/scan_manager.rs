@@ -292,12 +292,8 @@ impl ScanManager {
                 if file_ignored {
                     self.ignored_count = self.ignored_count.saturating_add(1);
                 } else {
-                    match self.compute_hash(root_path) {
-                        Err(BulkHashError::ScanCancelled) => {
-                            return Err(BulkHashError::ScanCancelled);
-                        }
-                        result => self.file_list.push(FileInfo::new(path, result)),
-                    }
+                    let info = self.compute_file_info(root_path)?;
+                    self.file_list.push(info);
                 }
             }
         } else if root_metadata.is_dir() {
@@ -419,9 +415,10 @@ impl ScanManager {
         let (_active_time, paused_time) = timer.finish(&self.control);
         self.hash_time = result.get_hash_time();
         self.paused_time = paused_time;
-        self.file_list.push(FileInfo::new(
+        self.file_list.push(FileInfo::with_metadata(
             result.get_path().to_string(),
             Ok(result.get_hash().to_string()),
+            result.get_metadata(),
         ));
 
         Ok(result)
@@ -686,12 +683,17 @@ impl ScanManager {
         &self.file_list
     }
 
-    fn compute_hash(&mut self, path: &Path) -> Result<String, BulkHashError> {
-        self.hasher.get_hash_code_controlled(path, &self.control)
+    fn compute_file_info(&mut self, path: &Path) -> Result<FileInfo, BulkHashError> {
+        self.hasher.hash_file_info_controlled(path, &self.control)
     }
 
     pub fn get_hash_manager(&self) -> &HashManager {
         &self.hasher
+    }
+
+    #[must_use]
+    pub const fn get_total_size(&self) -> u64 {
+        self.hasher.get_bytes_hashed()
     }
 
     pub fn get_algorithm(&self) -> HashAlgorithm {

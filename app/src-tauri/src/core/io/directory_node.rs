@@ -1,17 +1,273 @@
+use chrono::{DateTime, Utc};
+use serde::{
+    Deserialize, Deserializer, Serialize, Serializer,
+    de::{self, MapAccess, Visitor},
+    ser::SerializeStruct,
+};
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::{Component, Path};
 
 use crate::core::structs::file_info::FileInfo;
+pub use crate::core::structs::file_metadata::FileMetadata;
+
+/// Per-file entry stored inside a [`DirectoryNode`], combining the hash result
+/// (or error message) with extended file metadata such as size and last
+/// modification timestamp.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileEntry {
+    pub result: Result<String, String>,
+    pub size: Option<u64>,
+    pub modified_utc: Option<DateTime<Utc>>,
+}
+
+impl FileEntry {
+    #[must_use]
+    pub const fn new(
+        result: Result<String, String>,
+        size: Option<u64>,
+        modified_utc: Option<DateTime<Utc>>,
+    ) -> Self {
+        Self {
+            result,
+            size,
+            modified_utc,
+        }
+    }
+
+    #[must_use]
+    pub const fn from_result(result: Result<String, String>) -> Self {
+        Self {
+            result,
+            size: None,
+            modified_utc: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn from_hash(
+        hash: String,
+        size: Option<u64>,
+        modified_utc: Option<DateTime<Utc>>,
+    ) -> Self {
+        Self {
+            result: Ok(hash),
+            size,
+            modified_utc,
+        }
+    }
+
+    #[must_use]
+    pub const fn from_error(
+        error: String,
+        size: Option<u64>,
+        modified_utc: Option<DateTime<Utc>>,
+    ) -> Self {
+        Self {
+            result: Err(error),
+            size,
+            modified_utc,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_metadata(result: Result<String, String>, metadata: FileMetadata) -> Self {
+        Self {
+            result,
+            size: metadata.size(),
+            modified_utc: metadata.modified_utc(),
+        }
+    }
+
+    #[must_use]
+    pub fn from_file_info(file: &FileInfo) -> Self {
+        let result = match file.get_result() {
+            Ok(hash) => Ok(hash.clone()),
+            Err(err) => Err(err.to_string()),
+        };
+        Self::with_metadata(result, file.get_metadata())
+    }
+
+    #[must_use]
+    pub fn hash(&self) -> Option<&str> {
+        self.result.as_deref().ok()
+    }
+
+    #[must_use]
+    pub fn error(&self) -> Option<&str> {
+        self.result.as_ref().err().map(String::as_str)
+    }
+
+    #[must_use]
+    pub const fn is_ok(&self) -> bool {
+        self.result.is_ok()
+    }
+
+    #[must_use]
+    pub const fn is_err(&self) -> bool {
+        self.result.is_err()
+    }
+
+    #[must_use]
+    pub const fn size(&self) -> Option<u64> {
+        self.size
+    }
+
+    #[must_use]
+    pub const fn modified_utc(&self) -> Option<DateTime<Utc>> {
+        self.modified_utc
+    }
+
+    #[must_use]
+    pub const fn metadata(&self) -> FileMetadata {
+        FileMetadata::new(self.size, self.modified_utc)
+    }
+}
+
+impl From<Result<String, String>> for FileEntry {
+    fn from(result: Result<String, String>) -> Self {
+        Self::from_result(result)
+    }
+}
+
+impl From<&FileInfo> for FileEntry {
+    fn from(file: &FileInfo) -> Self {
+        Self::from_file_info(file)
+    }
+}
+
+impl Serialize for FileEntry {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let field_count =
+            1 + usize::from(self.size.is_some()) + usize::from(self.modified_utc.is_some());
+        let mut state = serializer.serialize_struct("FileEntry", field_count)?;
+        match &self.result {
+            Ok(hash) => state.serialize_field("hash", hash)?,
+            Err(error) => state.serialize_field("error", error)?,
+        }
+        if let Some(size) = self.size {
+            state.serialize_field("size", &size)?;
+        }
+        if let Some(modified_utc) = self.modified_utc {
+            state.serialize_field("modified_utc", &modified_utc)?;
+        }
+        state.end()
+    }
+}
+
+#[derive(Deserialize)]
+enum FileEntryField {
+    #[serde(rename = "hash")]
+    Hash,
+    #[serde(rename = "error")]
+    Error,
+    #[serde(rename = "Ok")]
+    LegacyOk,
+    #[serde(rename = "Err")]
+    LegacyErr,
+    #[serde(rename = "size")]
+    Size,
+    #[serde(rename = "modified_utc")]
+    ModifiedUtc,
+    #[serde(other)]
+    Ignore,
+}
+
+struct FileEntryVisitor;
+
+impl<'de> Visitor<'de> for FileEntryVisitor {
+    type Value = FileEntry;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a file entry object with 'hash'/'error' (or legacy 'Ok'/'Err')")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut hash: Option<String> = None;
+        let mut error: Option<String> = None;
+        let mut size: Option<Option<u64>> = None;
+        let mut modified_utc: Option<Option<DateTime<Utc>>> = None;
+
+        while let Some(field) = map.next_key::<FileEntryField>()? {
+            match field {
+                FileEntryField::Hash | FileEntryField::LegacyOk => {
+                    if hash.is_some() {
+                        return Err(de::Error::duplicate_field("hash"));
+                    }
+                    hash = Some(map.next_value()?);
+                }
+                FileEntryField::Error | FileEntryField::LegacyErr => {
+                    if error.is_some() {
+                        return Err(de::Error::duplicate_field("error"));
+                    }
+                    error = Some(map.next_value()?);
+                }
+                FileEntryField::Size => {
+                    if size.is_some() {
+                        return Err(de::Error::duplicate_field("size"));
+                    }
+                    size = Some(map.next_value()?);
+                }
+                FileEntryField::ModifiedUtc => {
+                    if modified_utc.is_some() {
+                        return Err(de::Error::duplicate_field("modified_utc"));
+                    }
+                    modified_utc = Some(map.next_value()?);
+                }
+                FileEntryField::Ignore => {
+                    let _ = map.next_value::<de::IgnoredAny>()?;
+                }
+            }
+        }
+
+        let result = match (hash, error) {
+            (Some(h), None) => Ok(h),
+            (None, Some(e)) => Err(e),
+            (Some(_), Some(_)) => {
+                return Err(de::Error::custom(
+                    "file entry cannot specify both 'hash' and 'error'",
+                ));
+            }
+            (None, None) => {
+                return Err(de::Error::custom(
+                    "file entry must specify either 'hash' or 'error'",
+                ));
+            }
+        };
+
+        Ok(FileEntry {
+            result,
+            size: size.flatten(),
+            modified_utc: modified_utc.flatten(),
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for FileEntry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(FileEntryVisitor)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DirectoryNode {
     pub name: String,
-    pub files: BTreeMap<String, Result<String, String>>,
+    pub files: BTreeMap<String, FileEntry>,
     pub sub_directories: BTreeMap<String, DirectoryNode>,
 }
 
 impl DirectoryNode {
-    pub fn new(name: String) -> Self {
+    #[must_use]
+    pub const fn new(name: String) -> Self {
         Self {
             name,
             files: BTreeMap::new(),
@@ -19,7 +275,7 @@ impl DirectoryNode {
         }
     }
 
-    pub fn insert_path(&mut self, path_parts: &[&str], result: Result<String, String>) {
+    pub fn insert_path(&mut self, path_parts: &[&str], entry: impl Into<FileEntry>) {
         let Some((&file_name, dirs)) = path_parts.split_last() else {
             return;
         };
@@ -32,9 +288,10 @@ impl DirectoryNode {
                 .or_insert_with(|| Self::new(folder.to_string()));
         }
 
-        current.files.insert(file_name.to_string(), result);
+        current.files.insert(file_name.to_string(), entry.into());
     }
 
+    #[must_use]
     pub fn build_tree(start_path: &str, file_list: &[FileInfo]) -> Self {
         let mut root = Self::new(start_path.to_string());
         let base_path = Path::new(start_path);
@@ -61,15 +318,82 @@ impl DirectoryNode {
             };
 
             let path_parts: Vec<&str> = owned_parts.iter().map(String::as_str).collect();
-
-            let result = match file.get_result() {
-                Ok(hash) => Ok(hash.clone()),
-                Err(err) => Err(err.to_string()),
-            };
-
-            root.insert_path(&path_parts, result);
+            root.insert_path(&path_parts, FileEntry::from_file_info(file));
         }
 
         root
+    }
+
+    /// Returns the total known file size in bytes across this directory and all subdirectories.
+    #[must_use]
+    pub fn total_size(&self) -> u64 {
+        let mut total = 0u64;
+        let mut stack = vec![self];
+        while let Some(node) = stack.pop() {
+            for entry in node.files.values() {
+                if let Some(size) = entry.size {
+                    total = total.saturating_add(size);
+                }
+            }
+            stack.extend(node.sub_directories.values());
+        }
+        total
+    }
+
+    /// Returns the total known file size in bytes across all successfully hashed files
+    /// in this directory and all subdirectories.
+    #[must_use]
+    pub fn hashed_size(&self) -> u64 {
+        let mut total = 0u64;
+        let mut stack = vec![self];
+        while let Some(node) = stack.pop() {
+            for entry in node.files.values() {
+                if entry.is_ok()
+                    && let Some(size) = entry.size
+                {
+                    total = total.saturating_add(size);
+                }
+            }
+            stack.extend(node.sub_directories.values());
+        }
+        total
+    }
+
+    /// Returns the total number of file entries (both hashed and errored) in this subtree.
+    #[must_use]
+    pub fn file_count(&self) -> usize {
+        let mut count = 0usize;
+        let mut stack = vec![self];
+        while let Some(node) = stack.pop() {
+            count = count.saturating_add(node.files.len());
+            stack.extend(node.sub_directories.values());
+        }
+        count
+    }
+
+    /// Returns the number of successfully hashed file entries in this subtree.
+    #[must_use]
+    pub fn hashed_file_count(&self) -> usize {
+        let mut count = 0usize;
+        let mut stack = vec![self];
+        while let Some(node) = stack.pop() {
+            let ok_count = node.files.values().filter(|entry| entry.is_ok()).count();
+            count = count.saturating_add(ok_count);
+            stack.extend(node.sub_directories.values());
+        }
+        count
+    }
+
+    /// Returns the number of errored file entries in this subtree.
+    #[must_use]
+    pub fn error_count(&self) -> usize {
+        let mut count = 0usize;
+        let mut stack = vec![self];
+        while let Some(node) = stack.pop() {
+            let err_count = node.files.values().filter(|entry| entry.is_err()).count();
+            count = count.saturating_add(err_count);
+            stack.extend(node.sub_directories.values());
+        }
+        count
     }
 }

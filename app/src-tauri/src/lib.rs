@@ -58,7 +58,8 @@ fn handle_success(s: &ScanManager) {
         s.get_hash_time(),
         Utc::now(),
     )
-    .with_algorithm(s.get_algorithm());
+    .with_algorithm(s.get_algorithm())
+    .with_total_size(s.get_total_size());
 
     match FileManager::save_file("/home/lars/Downloads", &tree, &meta) {
         Ok(saved_path) => {

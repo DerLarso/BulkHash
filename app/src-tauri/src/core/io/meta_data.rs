@@ -18,6 +18,8 @@ pub struct MetaData {
     ignore_list: Option<IgnoreList>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     hidden_filter: Option<HiddenFileFilter>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    total_size: Option<u64>,
 }
 
 impl MetaData {
@@ -34,6 +36,7 @@ impl MetaData {
             algorithm: None,
             ignore_list: None,
             hidden_filter: None,
+            total_size: None,
         }
     }
 
@@ -53,6 +56,12 @@ impl MetaData {
         self
     }
 
+    #[must_use]
+    pub const fn with_total_size(mut self, total_size: u64) -> Self {
+        self.total_size = Some(total_size);
+        self
+    }
+
     pub fn get_algorithm(&self) -> Option<HashAlgorithm> {
         self.algorithm
     }
@@ -64,6 +73,11 @@ impl MetaData {
     #[must_use]
     pub const fn get_hidden_filter(&self) -> Option<HiddenFileFilter> {
         self.hidden_filter
+    }
+
+    #[must_use]
+    pub const fn get_total_size(&self) -> Option<u64> {
+        self.total_size
     }
 
     pub fn get_local_time(&self) -> &str {
