@@ -4,14 +4,17 @@ use bulk_hash_lib::core::{
         bulk_hash_error::BulkHashError, directory_node::DirectoryNode, file_manager::FileManager,
         meta_data::MetaData,
     },
-    scan_manager::ScanManager,
+    scan_manager::{ScanCancelToken, ScanManager},
     structs::file_info::FileInfo,
 };
 use chrono::Utc;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Barrier};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use zip::{ZipWriter, write::SimpleFileOptions};
 
 struct TempDir {
@@ -807,4 +810,408 @@ fn hash_files_in_parallel_preserves_order_and_isolates_errors() {
         .expect("empty directory scan should succeed");
     assert!(scanner.get_list().is_empty());
     assert_eq!(scanner.get_hash_manager().get_files_counted(), 0);
+}
+
+#[test]
+fn scan_cancelled_error_and_cancel_token_interop() {
+    let err = BulkHashError::ScanCancelled;
+    assert!(err.is_cancelled());
+    assert!(!BulkHashError::PathNotFound(String::from("/missing")).is_cancelled());
+    assert_eq!(err.kind(), "ScanCancelled");
+    assert_eq!(err.to_string(), "Scan was cancelled");
+
+    let json = serde_json::to_value(&err).expect("serialize ScanCancelled");
+    assert_eq!(json["kind"], "ScanCancelled");
+    assert_eq!(json["message"], "Scan was cancelled");
+
+    // ScanCancelToken clone and reset semantics
+    let token = ScanCancelToken::new();
+    let cloned = token.clone();
+    assert!(!token.is_cancelled());
+    assert!(!cloned.is_cancelled());
+
+    cloned.cancel();
+    assert!(token.is_cancelled());
+    assert!(cloned.is_cancelled());
+
+    token.reset();
+    assert!(!token.is_cancelled());
+    assert!(!cloned.is_cancelled());
+
+    // Direct Arc<AtomicBool> interop with ScanManager
+    let raw_flag = Arc::new(AtomicBool::new(false));
+    let mut scanner =
+        ScanManager::new(HashAlgorithm::Blake3).with_cancel_token(Arc::clone(&raw_flag));
+    assert!(!scanner.is_cancelled());
+
+    raw_flag.store(true, Ordering::Release);
+    assert!(scanner.is_cancelled());
+    assert!(scanner.get_cancel_token().is_cancelled());
+    assert!(scanner.get_cancel_flag().load(Ordering::Acquire));
+
+    scanner.reset_cancel();
+    assert!(!raw_flag.load(Ordering::Acquire));
+
+    let replacement = ScanCancelToken::new();
+    scanner.set_cancel_token(replacement.clone());
+    scanner.cancel();
+    assert!(replacement.is_cancelled());
+    assert!(!raw_flag.load(Ordering::Acquire));
+}
+
+#[test]
+fn pre_cancelled_scan_manager_aborts_all_entry_points_and_recovers_after_reset() {
+    let dir = TempDir::new("pre_cancel_scan");
+    let sub = dir.path().join("sub");
+    fs::create_dir_all(&sub).expect("create sub dir");
+
+    let f1 = dir.path().join("a.txt");
+    let f2 = sub.join("b.txt");
+    let f3 = sub.join("c.txt");
+    fs::write(&f1, b"alpha-cancel").expect("write a.txt");
+    fs::write(&f2, b"beta-cancel").expect("write b.txt");
+    fs::write(&f3, b"gamma-cancel").expect("write c.txt");
+
+    let dir_str = dir.path().to_string_lossy().into_owned();
+    let files = vec![f1.clone(), f2.clone(), f3.clone()];
+
+    let mut scanner = ScanManager::new(HashAlgorithm::Blake3);
+    let token = scanner.get_cancel_token();
+
+    // Baseline scan succeeds
+    scanner
+        .start_hash(dir_str.clone())
+        .expect("initial scan should succeed");
+    assert_eq!(scanner.get_list().len(), 3);
+    assert_eq!(scanner.get_hash_manager().get_files_counted(), 3);
+
+    // Cancel via shared token before starting new operations
+    token.cancel();
+
+    let dir_err = scanner
+        .start_hash(dir_str.clone())
+        .expect_err("cancelled directory scan must fail");
+    assert!(dir_err.is_cancelled());
+    assert!(scanner.get_list().is_empty());
+    assert_eq!(scanner.get_hash_manager().get_files_counted(), 0);
+    assert_eq!(scanner.get_hash_time(), Duration::ZERO);
+
+    // Even a missing path aborts immediately with ScanCancelled before touching disk
+    let missing_err = scanner
+        .start_hash(String::from("/definitely/nonexistent/path/for_cancel_test"))
+        .expect_err("cancelled scan on missing path must return ScanCancelled");
+    assert!(missing_err.is_cancelled());
+
+    let single_start_err = scanner
+        .start_hash(f1.to_string_lossy().into_owned())
+        .expect_err("cancelled single-file start_hash must fail");
+    assert!(single_start_err.is_cancelled());
+    assert!(scanner.get_list().is_empty());
+
+    let batch_err = scanner
+        .hash_files(&files)
+        .expect_err("cancelled hash_files must fail");
+    assert!(batch_err.is_cancelled());
+    assert!(scanner.get_list().is_empty());
+    assert_eq!(scanner.get_hash_manager().get_files_counted(), 0);
+
+    let single_err = scanner
+        .hash_single_file(&f1)
+        .expect_err("cancelled hash_single_file must fail");
+    assert!(single_err.is_cancelled());
+    assert!(scanner.get_list().is_empty());
+    assert_eq!(scanner.get_hash_manager().get_files_counted(), 0);
+
+    // Resetting the cancel flag re-arms the scanner cleanly
+    scanner.reset_cancel();
+
+    scanner
+        .start_hash(dir_str)
+        .expect("scan after reset_cancel must succeed");
+    assert_eq!(scanner.get_list().len(), 3);
+    assert_eq!(scanner.get_hash_manager().get_files_counted(), 3);
+
+    scanner
+        .hash_files(&files)
+        .expect("hash_files after reset_cancel must succeed");
+    assert_eq!(scanner.get_list().len(), 3);
+    assert_eq!(scanner.get_hash_manager().get_files_counted(), 3);
+
+    let single_res = scanner
+        .hash_single_file(&f1)
+        .expect("hash_single_file after reset_cancel must succeed");
+    assert_eq!(
+        single_res.get_hash(),
+        HashAlgorithm::Blake3.get_hash_from_bytes(b"alpha-cancel")
+    );
+}
+
+#[test]
+fn hash_manager_cancellable_methods_respect_flag_and_preserve_order() {
+    let dir = TempDir::new("hash_manager_cancel");
+    let subdir = dir.path().join("folder");
+    fs::create_dir_all(&subdir).expect("create subdir");
+
+    let f1 = dir.path().join("01_one.txt");
+    let f2 = dir.path().join("02_two.bin");
+    let missing = dir.path().join("03_missing.txt");
+    let f3 = dir.path().join("04_three.txt");
+
+    let chunked_payload: Vec<u8> = (0..(140 * 1024))
+        .map(|i| ((i * 29 + 3) % 256) as u8)
+        .collect();
+    fs::write(&f1, b"first-item").expect("write f1");
+    fs::write(&f2, &chunked_payload).expect("write f2");
+    fs::write(&f3, b"third-item").expect("write f3");
+
+    let inputs = vec![f1.clone(), f2.clone(), missing.clone(), subdir.clone(), f3.clone()];
+
+    // Pre-cancelled flag aborts all HashManager cancellable entry points
+    let cancelled_flag = AtomicBool::new(true);
+    let mut mgr = HashManager::new(HashAlgorithm::Sha256);
+
+    assert!(
+        mgr.get_hash_code_cancellable(&f1, &cancelled_flag)
+            .expect_err("expected ScanCancelled")
+            .is_cancelled()
+    );
+    assert!(
+        mgr.hash_single_file_cancellable(&f1, &cancelled_flag)
+            .expect_err("expected ScanCancelled")
+            .is_cancelled()
+    );
+    let empty_paths: Vec<PathBuf> = Vec::new();
+    assert!(
+        mgr.hash_files_cancellable(&empty_paths, &cancelled_flag)
+            .expect_err("expected ScanCancelled for empty slice")
+            .is_cancelled()
+    );
+    assert!(
+        mgr.hash_files_cancellable(&inputs[..1], &cancelled_flag)
+            .expect_err("expected ScanCancelled for single-file slice")
+            .is_cancelled()
+    );
+    assert!(
+        mgr.hash_files_cancellable(&inputs, &cancelled_flag)
+            .expect_err("expected ScanCancelled for multi-file slice")
+            .is_cancelled()
+    );
+    assert!(
+        mgr.hash_files_with_threads_cancellable(&inputs, Some(1), &cancelled_flag)
+            .expect_err("expected ScanCancelled for 1 thread")
+            .is_cancelled()
+    );
+    assert!(
+        mgr.hash_files_with_threads_cancellable(&inputs, Some(4), &cancelled_flag)
+            .expect_err("expected ScanCancelled for 4 threads")
+            .is_cancelled()
+    );
+    assert_eq!(mgr.get_files_counted(), 0);
+
+    // Uncancelled flag produces exact hashes, preserves 1:1 order, and isolates per-file errors
+    let active_flag = AtomicBool::new(false);
+
+    let single_code = mgr
+        .get_hash_code_cancellable(&f1, &active_flag)
+        .expect("uncancelled get_hash_code_cancellable");
+    assert_eq!(
+        single_code,
+        HashAlgorithm::Sha256.get_hash_from_bytes(b"first-item")
+    );
+    assert_eq!(mgr.get_files_counted(), 1);
+
+    let single_meta = mgr
+        .hash_single_file_cancellable(&f2, &active_flag)
+        .expect("uncancelled hash_single_file_cancellable");
+    assert_eq!(
+        single_meta.get_hash(),
+        HashAlgorithm::Sha256.get_hash_from_bytes(&chunked_payload)
+    );
+    assert_eq!(mgr.get_files_counted(), 2);
+
+    mgr.reset_counter();
+    let results = mgr
+        .hash_files_with_threads_cancellable(&inputs, Some(3), &active_flag)
+        .expect("uncancelled parallel hash_files_with_threads_cancellable");
+    assert_eq!(results.len(), inputs.len());
+    assert_eq!(mgr.get_files_counted(), 3);
+
+    for (entry, expected_path) in results.iter().zip(&inputs) {
+        assert_eq!(entry.get_path(), expected_path.to_string_lossy());
+    }
+    assert_eq!(
+        results[0].get_result().as_deref().ok(),
+        Some(HashAlgorithm::Sha256.get_hash_from_bytes(b"first-item").as_str())
+    );
+    assert_eq!(
+        results[1].get_result().as_deref().ok(),
+        Some(
+            HashAlgorithm::Sha256
+                .get_hash_from_bytes(&chunked_payload)
+                .as_str()
+        )
+    );
+    assert!(matches!(
+        results[2].get_result(),
+        Err(BulkHashError::FileNotFound(_))
+    ));
+    assert!(matches!(
+        results[3].get_result(),
+        Err(BulkHashError::NotAFile(_))
+    ));
+    assert_eq!(
+        results[4].get_result().as_deref().ok(),
+        Some(HashAlgorithm::Sha256.get_hash_from_bytes(b"third-item").as_str())
+    );
+}
+
+#[test]
+fn live_concurrent_cancellation_stops_multithreaded_and_single_file_scans_promptly() {
+    let dir = TempDir::new("live_cancel_scan");
+    let mut large_files = Vec::new();
+
+    // Create 4 x 1 GiB sparse files (0 disk blocks on sparse-capable filesystems) so SHA-512
+    // takes several seconds if left running, while cancellation aborts within milliseconds.
+    let sparse_len = 1024 * 1024 * 1024_u64;
+    for idx in 0..4usize {
+        let path = dir.path().join(format!("sparse_{idx}.bin"));
+        let file = File::create(&path).expect("create sparse file");
+        file.set_len(sparse_len).expect("set sparse file length");
+        large_files.push(path);
+    }
+
+    // 1. Live cancellation of a multithreaded directory scan via start_hash
+    {
+        let mut scanner = ScanManager::new(HashAlgorithm::Sha512).with_thread_count(2);
+        let token = scanner.get_cancel_token();
+        let barrier = Arc::new(Barrier::new(2));
+        let worker_barrier = Arc::clone(&barrier);
+        let dir_str = dir.path().to_string_lossy().into_owned();
+
+        let handle = thread::spawn(move || {
+            worker_barrier.wait();
+            let result = scanner.start_hash(dir_str);
+            (scanner, result)
+        });
+
+        barrier.wait();
+        thread::sleep(Duration::from_millis(20));
+        let cancelled_at = Instant::now();
+        token.cancel();
+
+        let (scanner, result) = handle.join().expect("worker thread must not panic");
+        let shutdown_elapsed = cancelled_at.elapsed();
+
+        assert!(
+            result.expect_err("parallel directory scan must be cancelled").is_cancelled()
+        );
+        assert!(
+            shutdown_elapsed < Duration::from_secs(2),
+            "parallel directory scan took too long to stop after cancel: {shutdown_elapsed:?}"
+        );
+        assert!(scanner.get_list().is_empty());
+        assert_eq!(scanner.get_hash_manager().get_files_counted(), 0);
+    }
+
+    // 2. Live mid-file cancellation of start_hash on a single large file
+    {
+        let mut scanner = ScanManager::new(HashAlgorithm::Sha512);
+        let token = scanner.get_cancel_token();
+        let barrier = Arc::new(Barrier::new(2));
+        let worker_barrier = Arc::clone(&barrier);
+        let file_str = large_files[0].to_string_lossy().into_owned();
+
+        let handle = thread::spawn(move || {
+            worker_barrier.wait();
+            let result = scanner.start_hash(file_str);
+            (scanner, result)
+        });
+
+        barrier.wait();
+        thread::sleep(Duration::from_millis(20));
+        let cancelled_at = Instant::now();
+        token.cancel();
+
+        let (scanner, result) = handle.join().expect("worker thread must not panic");
+        let shutdown_elapsed = cancelled_at.elapsed();
+
+        assert!(
+            result.expect_err("single-file start_hash must be cancelled").is_cancelled()
+        );
+        assert!(
+            shutdown_elapsed < Duration::from_secs(2),
+            "single-file start_hash took too long to stop after cancel: {shutdown_elapsed:?}"
+        );
+        assert!(scanner.get_list().is_empty());
+        assert_eq!(scanner.get_hash_manager().get_files_counted(), 0);
+    }
+
+    // 3. Live mid-file cancellation of hash_single_file
+    {
+        let mut scanner = ScanManager::new(HashAlgorithm::Sha512);
+        let token = scanner.get_cancel_token();
+        let barrier = Arc::new(Barrier::new(2));
+        let worker_barrier = Arc::clone(&barrier);
+        let file_path = large_files[0].clone();
+
+        let handle = thread::spawn(move || {
+            worker_barrier.wait();
+            let result = scanner.hash_single_file(&file_path);
+            (scanner, result)
+        });
+
+        barrier.wait();
+        thread::sleep(Duration::from_millis(20));
+        let cancelled_at = Instant::now();
+        token.cancel();
+
+        let (scanner, result) = handle.join().expect("worker thread must not panic");
+        let shutdown_elapsed = cancelled_at.elapsed();
+
+        assert!(
+            result.expect_err("hash_single_file must be cancelled").is_cancelled()
+        );
+        assert!(
+            shutdown_elapsed < Duration::from_secs(2),
+            "hash_single_file took too long to stop after cancel: {shutdown_elapsed:?}"
+        );
+        assert!(scanner.get_list().is_empty());
+        assert_eq!(scanner.get_hash_manager().get_files_counted(), 0);
+    }
+
+    // 4. Live cancellation of ScanManager::hash_files (both sequential and parallel)
+    for thread_count in [1usize, 2usize] {
+        let mut scanner = ScanManager::new(HashAlgorithm::Sha512).with_thread_count(thread_count);
+        let token = scanner.get_cancel_token();
+        let barrier = Arc::new(Barrier::new(2));
+        let worker_barrier = Arc::clone(&barrier);
+        let files_clone = large_files.clone();
+
+        let handle = thread::spawn(move || {
+            worker_barrier.wait();
+            let result = scanner.hash_files(&files_clone);
+            (scanner, result)
+        });
+
+        barrier.wait();
+        thread::sleep(Duration::from_millis(20));
+        let cancelled_at = Instant::now();
+        token.cancel();
+
+        let (scanner, result) = handle.join().expect("worker thread must not panic");
+        let shutdown_elapsed = cancelled_at.elapsed();
+
+        assert!(
+            result
+                .expect_err("hash_files must be cancelled")
+                .is_cancelled(),
+            "expected ScanCancelled for thread_count={thread_count}"
+        );
+        assert!(
+            shutdown_elapsed < Duration::from_secs(2),
+            "hash_files (threads={thread_count}) took too long to stop: {shutdown_elapsed:?}"
+        );
+        assert!(scanner.get_list().is_empty());
+        assert_eq!(scanner.get_hash_manager().get_files_counted(), 0);
+    }
 }

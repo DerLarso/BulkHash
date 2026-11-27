@@ -4,7 +4,63 @@ use crate::core::structs::{file_info::FileInfo, single_file_hash::SingleFileHash
 use std::cmp::Reverse;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+#[derive(Debug, Clone, Default)]
+pub struct ScanCancelToken {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl ScanCancelToken {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[must_use]
+    pub fn from_atomic(flag: Arc<AtomicBool>) -> Self {
+        Self { cancelled: flag }
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    pub fn reset(&self) {
+        self.cancelled.store(false, Ordering::Release);
+    }
+
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    #[must_use]
+    pub fn as_atomic(&self) -> &AtomicBool {
+        &self.cancelled
+    }
+
+    #[must_use]
+    pub fn clone_atomic(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancelled)
+    }
+}
+
+impl From<Arc<AtomicBool>> for ScanCancelToken {
+    fn from(flag: Arc<AtomicBool>) -> Self {
+        Self::from_atomic(flag)
+    }
+}
+
+impl AsRef<AtomicBool> for ScanCancelToken {
+    fn as_ref(&self) -> &AtomicBool {
+        self.as_atomic()
+    }
+}
 
 struct DiscoveredFile {
     path: PathBuf,
@@ -28,6 +84,7 @@ pub struct ScanManager {
     start_path: String,
     hash_time: Duration,
     thread_count: Option<usize>,
+    cancel_token: ScanCancelToken,
 }
 
 impl ScanManager {
@@ -38,6 +95,7 @@ impl ScanManager {
             start_path: String::new(),
             hash_time: Duration::ZERO,
             thread_count: None,
+            cancel_token: ScanCancelToken::new(),
         }
     }
 
@@ -46,8 +104,37 @@ impl ScanManager {
         self
     }
 
+    pub fn with_cancel_token(mut self, cancel_token: impl Into<ScanCancelToken>) -> Self {
+        self.cancel_token = cancel_token.into();
+        self
+    }
+
     pub fn set_thread_count(&mut self, thread_count: Option<usize>) {
         self.thread_count = thread_count.filter(|&count| count > 0);
+    }
+
+    pub fn set_cancel_token(&mut self, cancel_token: impl Into<ScanCancelToken>) {
+        self.cancel_token = cancel_token.into();
+    }
+
+    pub fn get_cancel_token(&self) -> ScanCancelToken {
+        self.cancel_token.clone()
+    }
+
+    pub fn get_cancel_flag(&self) -> Arc<AtomicBool> {
+        self.cancel_token.clone_atomic()
+    }
+
+    pub fn cancel(&self) {
+        self.cancel_token.cancel();
+    }
+
+    pub fn reset_cancel(&self) {
+        self.cancel_token.reset();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel_token.is_cancelled()
     }
 
     pub fn get_thread_count(&self) -> Option<usize> {
@@ -61,6 +148,10 @@ impl ScanManager {
     pub fn start_hash(&mut self, path: String) -> Result<(), BulkHashError> {
         self.reset_state(&path);
 
+        if self.is_cancelled() {
+            return Err(BulkHashError::ScanCancelled);
+        }
+
         let start_time = Instant::now();
         let root_path = Path::new(&path);
 
@@ -72,26 +163,42 @@ impl ScanManager {
             return Err(BulkHashError::PathNotFound(path));
         }
 
+        if self.is_cancelled() {
+            return Err(BulkHashError::ScanCancelled);
+        }
+
         let root_metadata =
             fs::metadata(root_path).map_err(|err| BulkHashError::from_io(err, path.clone()))?;
 
         if root_metadata.is_file() {
-            let result = self.compute_hash(root_path);
-            self.file_list.push(FileInfo::new(path, result));
+            match self.compute_hash(root_path) {
+                Err(BulkHashError::ScanCancelled) => return Err(BulkHashError::ScanCancelled),
+                result => self.file_list.push(FileInfo::new(path, result)),
+            }
         } else if root_metadata.is_dir() {
             // Verify the root directory itself is readable so top-level access errors surface directly.
             let initial_entries =
                 fs::read_dir(root_path).map_err(|err| BulkHashError::from_io(err, path.clone()))?;
-            let mut discovered = Self::collect_directory_iterative(initial_entries, root_path);
+            let mut discovered = Self::collect_directory_iterative(
+                initial_entries,
+                root_path,
+                self.cancel_token.as_atomic(),
+            )?;
+
+            if self.is_cancelled() {
+                return Err(BulkHashError::ScanCancelled);
+            }
 
             // Schedule larger files first (LPT) so worker threads finish closer together.
             discovered
                 .files
                 .sort_unstable_by_key(|file| Reverse(file.size));
 
-            let hashed_files = self
-                .hasher
-                .hash_files_with_threads(&discovered.files, self.thread_count)?;
+            let hashed_files = self.hasher.hash_files_with_threads_cancellable(
+                &discovered.files,
+                self.thread_count,
+                self.cancel_token.as_atomic(),
+            )?;
 
             self.file_list
                 .reserve(discovered.errors.len().saturating_add(hashed_files.len()));
@@ -111,10 +218,16 @@ impl ScanManager {
     {
         self.reset_state("");
 
+        if self.is_cancelled() {
+            return Err(BulkHashError::ScanCancelled);
+        }
+
         let start_time = Instant::now();
-        self.file_list = self
-            .hasher
-            .hash_files_with_threads(paths, self.thread_count)?;
+        self.file_list = self.hasher.hash_files_with_threads_cancellable(
+            paths,
+            self.thread_count,
+            self.cancel_token.as_atomic(),
+        )?;
         self.hash_time = start_time.elapsed();
 
         Ok(())
@@ -128,7 +241,13 @@ impl ScanManager {
         let path_display = file_path.to_string_lossy().into_owned();
         self.reset_state(&path_display);
 
-        let result = self.hasher.hash_single_file(file_path)?;
+        if self.is_cancelled() {
+            return Err(BulkHashError::ScanCancelled);
+        }
+
+        let result = self
+            .hasher
+            .hash_single_file_cancellable(file_path, self.cancel_token.as_atomic())?;
 
         self.hash_time = result.get_hash_time();
         self.file_list.push(FileInfo::new(
@@ -150,22 +269,39 @@ impl ScanManager {
     fn collect_directory_iterative(
         initial_entries: fs::ReadDir,
         root_path: &Path,
-    ) -> DiscoveredEntries {
+        cancel_flag: &AtomicBool,
+    ) -> Result<DiscoveredEntries, BulkHashError> {
         let mut discovered = DiscoveredEntries {
             files: Vec::new(),
             errors: Vec::new(),
         };
         let mut dir_stack: Vec<PathBuf> = Vec::new();
-        Self::process_read_dir(initial_entries, root_path, &mut dir_stack, &mut discovered);
+        Self::process_read_dir(
+            initial_entries,
+            root_path,
+            &mut dir_stack,
+            &mut discovered,
+            cancel_flag,
+        )?;
 
         while let Some(current_dir) = dir_stack.pop() {
+            if cancel_flag.load(Ordering::Acquire) {
+                return Err(BulkHashError::ScanCancelled);
+            }
+
             if Self::is_excluded_system_path(&current_dir) {
                 continue;
             }
 
             match fs::read_dir(&current_dir) {
                 Ok(entries) => {
-                    Self::process_read_dir(entries, &current_dir, &mut dir_stack, &mut discovered);
+                    Self::process_read_dir(
+                        entries,
+                        &current_dir,
+                        &mut dir_stack,
+                        &mut discovered,
+                        cancel_flag,
+                    )?;
                 }
                 Err(err) => {
                     let dir_str = current_dir.to_string_lossy().into_owned();
@@ -177,7 +313,7 @@ impl ScanManager {
             }
         }
 
-        discovered
+        Ok(discovered)
     }
 
     fn process_read_dir(
@@ -185,8 +321,13 @@ impl ScanManager {
         parent_dir: &Path,
         dir_stack: &mut Vec<PathBuf>,
         discovered: &mut DiscoveredEntries,
-    ) {
+        cancel_flag: &AtomicBool,
+    ) -> Result<(), BulkHashError> {
         for entry_result in entries {
+            if cancel_flag.load(Ordering::Acquire) {
+                return Err(BulkHashError::ScanCancelled);
+            }
+
             let entry = match entry_result {
                 Ok(entry) => entry,
                 Err(err) => {
@@ -229,6 +370,8 @@ impl ScanManager {
                 dir_stack.push(entry_path);
             }
         }
+
+        Ok(())
     }
 
     fn is_excluded_system_path(path: &Path) -> bool {
@@ -258,7 +401,8 @@ impl ScanManager {
     }
 
     fn compute_hash(&mut self, path: &Path) -> Result<String, BulkHashError> {
-        self.hasher.get_hash_code(path)
+        self.hasher
+            .get_hash_code_cancellable(path, self.cancel_token.as_atomic())
     }
 
     pub fn get_hash_manager(&self) -> &HashManager {

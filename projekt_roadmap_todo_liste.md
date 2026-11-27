@@ -12,7 +12,7 @@ Backend - Core & Hashing:
 	[#] Einzeldatei-Hashing: Gezieltes Hashen einer einzelnen Datei statt eines ganzen Ordners ; Rust
 	[#] Weitere Hash-Algorithmen: Unterstützung für MD5, SHA512 und xxHash (extrem schnell) ; Rust
 	[#] Multithreading-Scanner: Paralleles Hashen mehrerer Dateien über alle CPU-Kerne (Rayon) ; Rust
-	[X] Scan-Abbruchfunktion: Sicheres Stoppen eines laufenden Scan-Vorgangs über AtomicBool ; Rust
+	[#] Scan-Abbruchfunktion: Sicheres Stoppen eines laufenden Scan-Vorgangs über AtomicBool ; Rust
 	[X] Pause- & Fortsetzen-Funktion: Laufende Scans temporär pausieren und weiterführen ; Rust
 	[X] Ignore-Listen Support: Überspringen von Ordnern/Dateien per Muster (z. B. node_modules, .git) ; Rust
 	[X] Versteckte Dateien filtern: Option zum Ein- oder Ausschließen von Dotfiles/Systemdateien ; Rust
@@ -27,6 +27,7 @@ Backend - Dateiformat & IO (.hashed):
 	[X] Versions-Migration: Abwärtskompatibilität für zukünftige Versionen des .hashed-Formats ; Rust
 	[X] Snapshot-Verschlüsselung: Optionaler Passwortschutz (AES-GCM) für sensible Dateibäume ; Rust
 	[X] Snapshot-Komprimierungsgrad: Einstellbare ZIP-Kompressionsstärke (Schnell vs. Kleine Datei) ; Rust
+	[X] Die tree.json segmentieren für schnelleren zugriff und weniger ram Auslastung, wenn nicht der ganze Baum gebraucht wird ; Rust
 
 Backend - Diff-Engine & Analyse:
 	[X] Baum-Vergleichsalgorithmus: Rekursiver Abgleich von zwei DirectoryNode-Strukturen ; Rust

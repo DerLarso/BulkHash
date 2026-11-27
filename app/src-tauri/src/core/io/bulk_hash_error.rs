@@ -17,6 +17,7 @@ pub enum BulkHashError {
     UnsupportedAlgorithm(String),
     UnsupportedVersion(usize),
     FileIsCorrupted(String),
+    ScanCancelled,
     Io {
         path: Option<String>,
         source: io::Error,
@@ -52,12 +53,17 @@ impl BulkHashError {
             Self::UnsupportedAlgorithm(_) => "UnsupportedAlgorithm",
             Self::UnsupportedVersion(_) => "UnsupportedVersion",
             Self::FileIsCorrupted(_) => "FileIsCorrupted",
+            Self::ScanCancelled => "ScanCancelled",
             Self::Io { .. } => "Io",
             Self::JsonError(_) => "JsonError",
             Self::ZipError(_) => "ZipError",
             Self::ThreadPoolError(_) => "ThreadPoolError",
             Self::TauriError(_) => "TauriError",
         }
+    }
+
+    pub const fn is_cancelled(&self) -> bool {
+        matches!(self, Self::ScanCancelled)
     }
 }
 
@@ -80,6 +86,7 @@ impl fmt::Display for BulkHashError {
                 write!(f, "Unsupported version: {version}")
             }
             Self::FileIsCorrupted(file) => write!(f, "File is corrupted: {file}"),
+            Self::ScanCancelled => write!(f, "Scan was cancelled"),
             Self::Io {
                 path: Some(path),
                 source,
