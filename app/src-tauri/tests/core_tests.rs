@@ -8,11 +8,18 @@ use bulk_hash_lib::core::{
     io::{
         bulk_hash_error::BulkHashError,
         directory_node::{DirectoryNode, FileEntry},
+        encryption::{
+            ENCRYPTED_TREE_ENTRY, EncryptionCipher, EncryptionOptions, KdfParams,
+            KeyDerivationAlgorithm, MAX_KDF_ITERATIONS, MAX_KDF_MEMORY_KIB, MAX_KDF_PARALLELISM,
+            MIN_KDF_MEMORY_KIB, PayloadCompression, build_tree_aad, decrypt_tree_payload,
+            encrypt_tree_payload, prepare_encryption_metadata,
+        },
         file_manager::FileManager,
         meta_data::MetaData,
         migration::{
-            CURRENT_FORMAT_VERSION, FORMAT_VERSION_V1, FORMAT_VERSION_V2, FormatMigration,
-            MIN_SUPPORTED_FORMAT_VERSION, MigrationRegistry, SnapshotPayload, VersionCompatibility,
+            CURRENT_FORMAT_VERSION, FORMAT_VERSION_V1, FORMAT_VERSION_V2, FORMAT_VERSION_V3,
+            FormatMigration, MIN_SUPPORTED_FORMAT_VERSION, MigrationRegistry, SnapshotPayload,
+            VersionCompatibility,
         },
     },
     scan_manager::{ScanCancelToken, ScanControl, ScanControlState, ScanManager},
@@ -3494,7 +3501,11 @@ fn legacy_v1_hashed_archive_without_extended_metadata_opens_cleanly() {
         .expect("v1 archive should produce a MigrationReport");
     assert_eq!(report.original_version(), FORMAT_VERSION_V1);
     assert_eq!(report.target_version(), CURRENT_FORMAT_VERSION);
-    assert_eq!(report.steps().len(), 1);
+    assert_eq!(report.steps().len(), 2);
+    assert_eq!(report.steps()[0].from_version, FORMAT_VERSION_V1);
+    assert_eq!(report.steps()[0].to_version, FORMAT_VERSION_V2);
+    assert_eq!(report.steps()[1].from_version, FORMAT_VERSION_V2);
+    assert_eq!(report.steps()[1].to_version, FORMAT_VERSION_V3);
     assert_eq!(loaded.get_meta().get_total_size(), None);
     assert_eq!(loaded.get_meta().get_files_hashed(), 2);
 
@@ -3653,20 +3664,22 @@ fn inspect_version_and_future_version_probing_work_without_latest_schema() {
     let meta = MetaData::new(1, Duration::from_millis(5), Utc::now())
         .with_algorithm(HashAlgorithm::Blake3)
         .with_total_size(12);
-    let v2_path = FileManager::save_file(dir.path(), &tree, &meta).expect("save v2 archive");
+    let current_path = FileManager::save_file(dir.path(), &tree, &meta).expect("save v3 archive");
 
-    let v2_info = FileManager::inspect_version(&v2_path).expect("inspect v2");
-    assert_eq!(v2_info.version, FORMAT_VERSION_V2);
-    assert_eq!(v2_info.current_version, CURRENT_FORMAT_VERSION);
-    assert!(v2_info.is_supported());
-    assert!(v2_info.is_current());
-    assert!(!v2_info.needs_migration());
-    assert_eq!(v2_info.compatibility, VersionCompatibility::Current);
-    assert!(v2_info.entries.iter().any(|e| e == "meta.json"));
-    assert!(v2_info.entries.iter().any(|e| e == "tree.json"));
-    assert!(v2_info.entries.iter().any(|e| e == "hash.sha256"));
+    let current_info = FileManager::inspect_version(&current_path).expect("inspect current");
+    assert_eq!(current_info.version, FORMAT_VERSION_V3);
+    assert_eq!(current_info.current_version, CURRENT_FORMAT_VERSION);
+    assert!(current_info.is_supported());
+    assert!(current_info.is_current());
+    assert!(!current_info.needs_migration());
+    assert!(!current_info.is_encrypted());
+    assert!(current_info.encryption().is_none());
+    assert_eq!(current_info.compatibility, VersionCompatibility::Current);
+    assert!(current_info.entries.iter().any(|e| e == "meta.json"));
+    assert!(current_info.entries.iter().any(|e| e == "tree.json"));
+    assert!(current_info.entries.iter().any(|e| e == "hash.sha256"));
 
-    // 2. Legacy v1 archive
+    // 2. Legacy v1 archive (requires 2 migration steps: v1 -> v2 -> v3)
     let v1_path = dir.path().join("legacy_v1.hashed");
     let v1_tree = r#"{"name":"/v1","files":{"a.txt":{"Ok":"deadbeef"}},"sub_directories":{}}"#;
     let v1_hash = HashAlgorithm::Sha256.get_hash_from_bytes(v1_tree.as_bytes());
@@ -3688,12 +3701,13 @@ fn inspect_version_and_future_version_probing_work_without_latest_schema() {
     assert!(v1_info.is_supported());
     assert!(!v1_info.is_current());
     assert!(v1_info.needs_migration());
+    assert!(!v1_info.is_encrypted());
     assert_eq!(
         v1_info.compatibility,
         VersionCompatibility::NeedsMigration {
             from_version: FORMAT_VERSION_V1,
             to_version: CURRENT_FORMAT_VERSION,
-            steps_required: 1,
+            steps_required: 2,
         }
     );
 
@@ -3802,7 +3816,7 @@ fn v1_to_v2_in_memory_migration_handles_legacy_transitional_mixed_and_corrupt_ar
     let loaded_min = FileManager::open_file(&minimal_v1).expect("minimal v1 must migrate");
     assert!(loaded_min.was_migrated());
     assert_eq!(loaded_min.get_original_version(), FORMAT_VERSION_V1);
-    assert_eq!(loaded_min.get_meta().get_version(), FORMAT_VERSION_V2);
+    assert_eq!(loaded_min.get_meta().get_version(), CURRENT_FORMAT_VERSION);
     assert_eq!(
         loaded_min.get_meta().get_migrated_from(),
         Some(FORMAT_VERSION_V1)
@@ -3868,7 +3882,7 @@ fn v1_to_v2_in_memory_migration_handles_legacy_transitional_mixed_and_corrupt_ar
     let loaded_trans =
         FileManager::open_file(&transitional_v1).expect("transitional v1 must migrate");
     assert!(loaded_trans.was_migrated());
-    assert_eq!(loaded_trans.get_meta().get_version(), FORMAT_VERSION_V2);
+    assert_eq!(loaded_trans.get_meta().get_version(), CURRENT_FORMAT_VERSION);
     // Backfilled total_size counts hashed files (100 + 250 = 350), not errored file (999)
     assert_eq!(loaded_trans.get_meta().get_total_size(), Some(350));
     assert_eq!(
@@ -4008,12 +4022,12 @@ fn migrate_file_and_migrate_file_in_place_upgrade_archives_atomically_with_backu
     let original_v1_bytes = fs::read(&v1_src).expect("read original v1 bytes");
 
     // 1. Out-of-place migration via migrate_file(src, dst)
-    let v2_dst = dir.path().join("upgraded_v2.hashed");
-    let report = FileManager::migrate_file(&v1_src, &v2_dst).expect("migrate_file v1 -> v2");
+    let upgraded_dst = dir.path().join("upgraded_current.hashed");
+    let report = FileManager::migrate_file(&v1_src, &upgraded_dst).expect("migrate_file v1 -> current");
     assert!(report.was_migrated());
     assert_eq!(report.original_version(), FORMAT_VERSION_V1);
-    assert_eq!(report.target_version(), FORMAT_VERSION_V2);
-    assert_eq!(report.steps().len(), 1);
+    assert_eq!(report.target_version(), CURRENT_FORMAT_VERSION);
+    assert_eq!(report.steps().len(), 2);
     assert!(report.backup_path().is_none());
 
     // Original v1 source must remain completely untouched
@@ -4022,31 +4036,31 @@ fn migrate_file_and_migrate_file_in_place_upgrade_archives_atomically_with_backu
         original_v1_bytes
     );
 
-    // Upgraded v2 destination must contain canonical v2 meta.json, canonical v2 tree.json,
+    // Upgraded destination must contain canonical current meta.json, canonical tree.json,
     // and matching hash.sha256
-    let dst_meta_raw = read_zip_entry_string(&v2_dst, "meta.json");
+    let dst_meta_raw = read_zip_entry_string(&upgraded_dst, "meta.json");
     let dst_meta_val: serde_json::Value =
         serde_json::from_str(&dst_meta_raw).expect("parse dst meta.json");
-    assert_eq!(dst_meta_val["version"], FORMAT_VERSION_V2);
+    assert_eq!(dst_meta_val["version"], CURRENT_FORMAT_VERSION);
     assert_eq!(dst_meta_val["migrated_from"], FORMAT_VERSION_V1);
 
-    let dst_tree_raw = read_zip_entry_string(&v2_dst, "tree.json");
+    let dst_tree_raw = read_zip_entry_string(&upgraded_dst, "tree.json");
     assert!(dst_tree_raw.contains(r#""hash":"1111aaaa""#));
     assert!(dst_tree_raw.contains(r#""error":"Permission denied: /project/locked.dat""#));
     assert!(!dst_tree_raw.contains(r#""Ok""#));
     assert!(!dst_tree_raw.contains(r#""Err""#));
 
-    let dst_hash_raw = read_zip_entry_string(&v2_dst, "hash.sha256");
+    let dst_hash_raw = read_zip_entry_string(&upgraded_dst, "hash.sha256");
     assert_eq!(
         dst_hash_raw.trim(),
         HashAlgorithm::Sha256.get_hash_from_bytes(dst_tree_raw.as_bytes())
     );
 
-    // Re-opening the upgraded v2 file must NOT require migration anymore
-    let reopened = FileManager::open_file(&v2_dst).expect("open upgraded v2 file");
+    // Re-opening the upgraded file must NOT require migration anymore
+    let reopened = FileManager::open_file(&upgraded_dst).expect("open upgraded file");
     assert!(!reopened.was_migrated());
-    assert_eq!(reopened.get_original_version(), FORMAT_VERSION_V2);
-    assert_eq!(reopened.get_meta().get_version(), FORMAT_VERSION_V2);
+    assert_eq!(reopened.get_original_version(), CURRENT_FORMAT_VERSION);
+    assert_eq!(reopened.get_meta().get_version(), CURRENT_FORMAT_VERSION);
     assert_eq!(
         reopened.get_meta().get_migrated_from(),
         Some(FORMAT_VERSION_V1)
@@ -4066,12 +4080,13 @@ fn migrate_file_and_migrate_file_in_place_upgrade_archives_atomically_with_backu
         Some("2222bbbb")
     );
 
-    // 2. Migrating an already-v2 file to a new destination reports up-to-date
-    let v2_copy = dir.path().join("v2_copy.hashed");
-    let copy_report = FileManager::migrate_file(&v2_dst, &v2_copy).expect("migrate v2 -> v2");
+    // 2. Migrating an already-current file to a new destination reports up-to-date
+    let current_copy = dir.path().join("current_copy.hashed");
+    let copy_report =
+        FileManager::migrate_file(&upgraded_dst, &current_copy).expect("migrate current -> current");
     assert!(!copy_report.was_migrated());
     assert!(copy_report.steps().is_empty());
-    assert!(v2_copy.exists());
+    assert!(current_copy.exists());
 
     // 3. In-place migration WITH backup creates .v1.bak containing exact original bytes
     let in_place_a = dir.path().join("in_place_a.hashed");
@@ -4081,7 +4096,7 @@ fn migrate_file_and_migrate_file_in_place_upgrade_archives_atomically_with_backu
         FileManager::migrate_file_in_place(&in_place_a, true).expect("migrate in place w/ backup");
     assert!(in_place_report.was_migrated());
     assert_eq!(in_place_report.original_version(), FORMAT_VERSION_V1);
-    assert_eq!(in_place_report.target_version(), FORMAT_VERSION_V2);
+    assert_eq!(in_place_report.target_version(), CURRENT_FORMAT_VERSION);
     let backup_path = in_place_report
         .backup_path()
         .expect("backup path must be returned");
@@ -4099,7 +4114,7 @@ fn migrate_file_and_migrate_file_in_place_upgrade_archives_atomically_with_backu
 
     let after_in_place = FileManager::open_file(&in_place_a).expect("open upgraded in_place_a");
     assert!(!after_in_place.was_migrated());
-    assert_eq!(after_in_place.get_meta().get_version(), FORMAT_VERSION_V2);
+    assert_eq!(after_in_place.get_meta().get_version(), CURRENT_FORMAT_VERSION);
     assert_eq!(
         after_in_place.get_meta().get_migrated_from(),
         Some(FORMAT_VERSION_V1)
@@ -4470,5 +4485,1842 @@ fn deep_v1_tree_migration_and_save_file_version_guard() {
     assert!(matches!(
         save_err,
         BulkHashError::UnsupportedVersion(FORMAT_VERSION_V1)
+    ));
+}
+
+
+fn read_zip_entry_bytes(path: &Path, entry_name: &str) -> Vec<u8> {
+    use std::io::Read;
+
+    let file = File::open(path).expect("open zip archive");
+    let mut archive = zip::ZipArchive::new(file).expect("parse zip archive");
+    let mut entry = archive.by_name(entry_name).expect("find zip entry");
+    let mut content = Vec::new();
+    entry.read_to_end(&mut content).expect("read zip entry");
+    content
+}
+
+fn fast_test_kdf_params() -> KdfParams {
+    KdfParams::new(MIN_KDF_MEMORY_KIB, 1, 1).expect("minimal valid Argon2id params for fast tests")
+}
+
+fn fast_encryption_options(password: &str) -> EncryptionOptions {
+    EncryptionOptions::new(password)
+        .expect("valid test password")
+        .with_kdf_params(fast_test_kdf_params())
+        .expect("valid fast test kdf params")
+}
+
+#[test]
+fn encrypted_snapshot_roundtrip_semantic_security_and_zero_plaintext_leakage() {
+    let dir = TempDir::new("encrypted_roundtrip");
+    let ts = DateTime::from_timestamp(1_765_000_123, 0).expect("valid ts");
+
+    let mut tree = DirectoryNode::new(String::from("/vault/top-secret-client-data"));
+    tree.insert_path(
+        &["finances", "tax_return_2026.pdf"],
+        FileEntry::from_hash(
+            String::from("deadbeefcafe111122223333444455556666777788889999aaaabbbbccccdddd"),
+            Some(4096),
+            Some(ts),
+        ),
+    );
+    tree.insert_path(
+        &["ssh", "id_ed25519_private"],
+        FileEntry::from_error(
+            String::from("Permission denied: /vault/top-secret-client-data/ssh/id_ed25519_private"),
+            Some(512),
+            Some(ts),
+        ),
+    );
+
+    let ignore_list = IgnoreList::from_patterns(["*.tmp", "cache/"]).expect("ignore list");
+    let hidden_filter = HiddenFileFilter::exclude_all();
+    let meta = MetaData::new(1, Duration::from_millis(87), ts)
+        .with_algorithm(HashAlgorithm::Blake3)
+        .with_ignore_list(ignore_list.clone())
+        .with_hidden_filter(hidden_filter)
+        .with_total_size(4096);
+
+    let password = "Sup3r S3cret P@ssphrase! 🔒";
+    let enc_opts = fast_encryption_options(password);
+
+    // Debug output must NEVER leak the secret password
+    let debug_repr = format!("{enc_opts:?}");
+    assert!(debug_repr.contains("[REDACTED]"));
+    assert!(!debug_repr.contains(password));
+    assert!(!debug_repr.contains("Sup3r"));
+
+    let plain_dir = TempDir::new("encrypted_roundtrip_plain");
+    let enc_dir_a = TempDir::new("encrypted_roundtrip_a");
+    let enc_dir_b = TempDir::new("encrypted_roundtrip_b");
+
+    let plain_path = FileManager::save_file(plain_dir.path(), &tree, &meta).expect("save plain");
+    let enc_path_a = FileManager::save_file_encrypted(enc_dir_a.path(), &tree, &meta, &enc_opts)
+        .expect("save encrypted A");
+    let enc_path_b =
+        FileManager::save_file_with_encryption(enc_dir_b.path(), &tree, &meta, Some(&enc_opts))
+            .expect("save encrypted B");
+
+    // Lightweight inspection works without a password
+    assert!(!FileManager::is_encrypted(&plain_path).expect("plain is_encrypted"));
+    assert!(FileManager::is_encrypted(&enc_path_a).expect("enc A is_encrypted"));
+
+    let enc_info_a = FileManager::inspect_version(&enc_path_a).expect("inspect enc A");
+    let enc_info_b = FileManager::inspect_version(&enc_path_b).expect("inspect enc B");
+    assert_eq!(enc_info_a.version, FORMAT_VERSION_V3);
+    assert!(enc_info_a.is_current());
+    assert!(enc_info_a.is_encrypted());
+    assert!(enc_info_a.entries.iter().any(|e| e == "meta.json"));
+    assert!(enc_info_a.entries.iter().any(|e| e == ENCRYPTED_TREE_ENTRY));
+    assert!(enc_info_a.entries.iter().any(|e| e == "hash.sha256"));
+    assert!(!enc_info_a.entries.iter().any(|e| e == "tree.json"));
+
+    let enc_meta_a = enc_info_a.encryption().expect("encryption metadata A");
+    let enc_meta_b = enc_info_b.encryption().expect("encryption metadata B");
+    assert_eq!(enc_meta_a.cipher, EncryptionCipher::Aes256Gcm);
+    assert_eq!(enc_meta_a.kdf, KeyDerivationAlgorithm::Argon2id);
+    assert_eq!(enc_meta_a.kdf_params, fast_test_kdf_params());
+    assert_eq!(enc_meta_a.payload_compression, PayloadCompression::Deflate);
+
+    // Semantic security: encrypting the identical tree + meta + password twice must produce
+    // completely fresh salt, nonce, ciphertext, and ciphertext digest.
+    assert_ne!(enc_meta_a.salt, enc_meta_b.salt);
+    assert_ne!(enc_meta_a.nonce, enc_meta_b.nonce);
+    let ct_a = read_zip_entry_bytes(&enc_path_a, ENCRYPTED_TREE_ENTRY);
+    let ct_b = read_zip_entry_bytes(&enc_path_b, ENCRYPTED_TREE_ENTRY);
+    assert_ne!(ct_a, ct_b);
+    let disk_hash_a = read_zip_entry_string(&enc_path_a, "hash.sha256");
+    let disk_hash_b = read_zip_entry_string(&enc_path_b, "hash.sha256");
+    assert_ne!(disk_hash_a, disk_hash_b);
+    assert_eq!(
+        disk_hash_a.trim(),
+        HashAlgorithm::Sha256.get_hash_from_bytes(&ct_a)
+    );
+
+    // Zero plaintext leakage anywhere in raw .hashed archive bytes, meta.json, or tree.enc
+    let raw_archive_a = fs::read(&enc_path_a).expect("read raw encrypted archive");
+    let meta_raw_a = read_zip_entry_string(&enc_path_a, "meta.json");
+    let sensitive_needles = [
+        "top-secret-client-data",
+        "tax_return_2026.pdf",
+        "id_ed25519_private",
+        "finances",
+        "deadbeefcafe11112222",
+        "Permission denied",
+    ];
+    for needle in sensitive_needles {
+        assert!(
+            !raw_archive_a
+                .windows(needle.len())
+                .any(|w| w == needle.as_bytes()),
+            "sensitive string '{needle}' leaked in raw encrypted archive!"
+        );
+        assert!(
+            !meta_raw_a.contains(needle),
+            "sensitive string '{needle}' leaked in meta.json!"
+        );
+    }
+
+    // Verify tree.enc is stored uncompressed (Stored) inside the ZIP container
+    {
+        let f = File::open(&enc_path_a).expect("open enc A zip");
+        let mut zip = zip::ZipArchive::new(f).expect("parse zip");
+        let entry = zip.by_name(ENCRYPTED_TREE_ENTRY).expect("find tree.enc");
+        assert_eq!(entry.compression(), zip::CompressionMethod::Stored);
+    }
+
+    // Opening without password MUST fail with PasswordRequired
+    let no_pw_err = FileManager::open_file(&enc_path_a).expect_err("open_file must reject encrypted");
+    assert!(matches!(no_pw_err, BulkHashError::PasswordRequired(_)));
+    assert!(no_pw_err.is_password_required());
+
+    // Unlocking with the correct password restores the exact tree, metadata, and logical tree hash
+    let loaded_plain = FileManager::open_file(&plain_path).expect("open plain");
+    let loaded_enc =
+        FileManager::open_file_with_password(&enc_path_a, password).expect("open encrypted A");
+    assert!(!loaded_plain.is_encrypted());
+    assert!(loaded_enc.is_encrypted());
+    assert!(loaded_enc.get_encryption().is_some());
+    assert_eq!(loaded_enc.get_tree(), &tree);
+    assert_eq!(loaded_enc.get_hash(), loaded_plain.get_hash());
+    // On-disk hash.sha256 MUST NOT equal plaintext tree hash (no plaintext hash oracle!)
+    assert_ne!(disk_hash_a.trim(), loaded_plain.get_hash());
+    assert_eq!(
+        loaded_enc.get_meta().get_algorithm(),
+        Some(HashAlgorithm::Blake3)
+    );
+    assert_eq!(loaded_enc.get_meta().get_ignore_list(), Some(&ignore_list));
+    assert_eq!(
+        loaded_enc.get_meta().get_hidden_filter(),
+        Some(hidden_filter)
+    );
+    assert_eq!(loaded_enc.get_meta().get_total_size(), Some(4096));
+
+    // Re-saving loaded encrypted metadata via unencrypted save_file strips stale encryption header
+    let stripped_dir = TempDir::new("stripped_plain_out");
+    let stripped_path =
+        FileManager::save_file(stripped_dir.path(), loaded_enc.get_tree(), loaded_enc.get_meta())
+            .expect("save plain from loaded encrypted meta");
+    assert!(!FileManager::is_encrypted(&stripped_path).expect("stripped must be unencrypted"));
+    let reopened_plain = FileManager::open_file(&stripped_path).expect("open stripped plain");
+    assert_eq!(reopened_plain.get_tree(), &tree);
+    assert!(!reopened_plain.is_encrypted());
+
+    // Re-saving loaded encrypted metadata via save_file_encrypted MUST rotate salt & nonce
+    let rotated_path = FileManager::save_file_encrypted(
+        dir.path(),
+        loaded_enc.get_tree(),
+        loaded_enc.get_meta(),
+        &enc_opts,
+    )
+    .expect("resave encrypted");
+    let rotated_info = FileManager::inspect_version(&rotated_path).expect("inspect rotated");
+    let rotated_enc = rotated_info.encryption().expect("rotated enc meta");
+    assert_ne!(rotated_enc.salt, enc_meta_a.salt);
+    assert_ne!(rotated_enc.nonce, enc_meta_a.nonce);
+
+    // Opening an unencrypted snapshot via open_file_with_password works cleanly
+    let plain_via_pw =
+        FileManager::open_file_with_password(&plain_path, "unused").expect("open plain via pw");
+    assert!(!plain_via_pw.is_encrypted());
+    assert_eq!(plain_via_pw.get_tree(), &tree);
+}
+
+#[test]
+fn encrypted_snapshot_standard_kdf_presets_payload_compression_and_password_whitespace() {
+    let ts = DateTime::from_timestamp(1_765_100_000, 0).expect("valid ts");
+    let mut tree = DirectoryNode::new(String::from("/large-repetitive-tree"));
+    for idx in 0..200usize {
+        tree.insert_path(
+            &["modules", &format!("service_{:02}", idx % 10), &format!("file_{idx:03}.rs")],
+            FileEntry::from_hash(
+                format!("{idx:064x}"),
+                Some(1024 + idx as u64),
+                Some(ts),
+            ),
+        );
+    }
+    let meta = MetaData::new(200, Duration::from_secs(1), ts).with_algorithm(HashAlgorithm::Sha256);
+
+    // 1. Real default KdfParams::standard() + whitespace-sensitive password
+    let std_dir = TempDir::new("enc_standard_kdf");
+    let spaced_pw = "  correct horse battery staple  ";
+    let std_opts = EncryptionOptions::new(spaced_pw).expect("standard opts");
+    assert_eq!(std_opts.kdf_params(), KdfParams::standard());
+    assert_eq!(std_opts.payload_compression(), PayloadCompression::Deflate);
+
+    let std_path =
+        FileManager::save_file_encrypted(std_dir.path(), &tree, &meta, &std_opts).expect("save std");
+    // Trimmed password MUST fail (whitespace is significant!)
+    let trimmed_err = FileManager::open_file_with_password(&std_path, spaced_pw.trim())
+        .expect_err("trimmed password must fail");
+    assert!(matches!(trimmed_err, BulkHashError::DecryptionFailed(_)));
+
+    let std_loaded =
+        FileManager::open_file_with_password(&std_path, spaced_pw).expect("unlock std");
+    assert_eq!(std_loaded.get_tree(), &tree);
+    assert_eq!(
+        std_loaded.get_encryption().expect("enc").kdf_params,
+        KdfParams::standard()
+    );
+
+    // 2. Compare PayloadCompression::Deflate vs PayloadCompression::None using interactive preset
+    let deflate_dir = TempDir::new("enc_deflate");
+    let raw_dir = TempDir::new("enc_uncompressed");
+
+    let deflate_opts = EncryptionOptions::new("pw-compress")
+        .expect("opts")
+        .with_kdf_params(KdfParams::interactive())
+        .expect("interactive")
+        .with_payload_compression(PayloadCompression::Deflate);
+    let raw_opts = EncryptionOptions::new("pw-compress")
+        .expect("opts")
+        .with_kdf_params(KdfParams::interactive())
+        .expect("interactive")
+        .with_payload_compression(PayloadCompression::None);
+
+    let deflate_path =
+        FileManager::save_file_encrypted(deflate_dir.path(), &tree, &meta, &deflate_opts)
+            .expect("save deflate");
+    let raw_path =
+        FileManager::save_file_encrypted(raw_dir.path(), &tree, &meta, &raw_opts).expect("save raw");
+
+    let deflate_ct = read_zip_entry_bytes(&deflate_path, ENCRYPTED_TREE_ENTRY);
+    let raw_ct = read_zip_entry_bytes(&raw_path, ENCRYPTED_TREE_ENTRY);
+    assert!(
+        deflate_ct.len() * 2 < raw_ct.len(),
+        "inner Deflate should significantly shrink encrypted repetitive tree ({} vs {})",
+        deflate_ct.len(),
+        raw_ct.len()
+    );
+
+    let loaded_deflate =
+        FileManager::open_file_with_password(&deflate_path, "pw-compress").expect("open deflate");
+    let loaded_raw =
+        FileManager::open_file_with_password(&raw_path, "pw-compress").expect("open raw");
+    assert_eq!(loaded_deflate.get_tree(), &tree);
+    assert_eq!(loaded_raw.get_tree(), &tree);
+    assert_eq!(loaded_deflate.get_hash(), loaded_raw.get_hash());
+}
+
+#[test]
+fn encrypted_snapshot_rejects_wrong_password_tampering_aad_modification_and_confusion() {
+    let dir = TempDir::new("enc_tamper");
+    let ts = DateTime::from_timestamp(1_765_200_000, 0).expect("valid ts");
+
+    let mut tree_a = DirectoryNode::new(String::from("/alpha"));
+    tree_a.insert_path(
+        &["secret.txt"],
+        FileEntry::from_hash(String::from("aaaa1111"), Some(42), Some(ts)),
+    );
+    let mut tree_b = DirectoryNode::new(String::from("/beta"));
+    tree_b.insert_path(
+        &["other.txt"],
+        FileEntry::from_hash(String::from("bbbb2222"), Some(99), Some(ts)),
+    );
+
+    let meta = MetaData::new(1, Duration::from_millis(12), ts);
+    let opts = fast_encryption_options("master-key-123");
+
+    let dir_a = TempDir::new("enc_tamper_a");
+    let dir_b = TempDir::new("enc_tamper_b");
+    let path_a =
+        FileManager::save_file_encrypted(dir_a.path(), &tree_a, &meta, &opts).expect("save A");
+    let path_b =
+        FileManager::save_file_encrypted(dir_b.path(), &tree_b, &meta, &opts).expect("save B");
+
+    // 1. Empty password rejected on construction & open
+    assert!(matches!(
+        EncryptionOptions::new(""),
+        Err(BulkHashError::EmptyPassword)
+    ));
+    assert!(matches!(
+        FileManager::open_file_with_password(&path_a, ""),
+        Err(BulkHashError::EmptyPassword)
+    ));
+
+    // 2. Wrong password rejected with DecryptionFailed
+    let wrong_pw = FileManager::open_file_with_password(&path_a, "wrong-password")
+        .expect_err("wrong password must fail");
+    assert!(matches!(wrong_pw, BulkHashError::DecryptionFailed(_)));
+
+    let orig_meta = read_zip_entry_bytes(&path_a, "meta.json");
+    let orig_ct = read_zip_entry_bytes(&path_a, ENCRYPTED_TREE_ENTRY);
+    let orig_hash = read_zip_entry_bytes(&path_a, "hash.sha256");
+
+    // 3. Bit-flip in ciphertext WITHOUT updating hash.sha256 -> fast HashMismatch before KDF
+    let mut flipped_ct = orig_ct.clone();
+    flipped_ct[0] ^= 0x01;
+    let corrupt_ct_path = dir.path().join("bitflip_no_rehash.hashed");
+    write_raw_hashed_archive(
+        &corrupt_ct_path,
+        &[
+            ("meta.json", &orig_meta),
+            (ENCRYPTED_TREE_ENTRY, &flipped_ct),
+            ("hash.sha256", &orig_hash),
+        ],
+    );
+    assert!(matches!(
+        FileManager::open_file_with_password(&corrupt_ct_path, "master-key-123"),
+        Err(BulkHashError::HashMismatch { .. })
+    ));
+
+    // 4. Bit-flip in ciphertext WITH attacker recomputing hash.sha256 -> AES-GCM tag fails!
+    let forged_hash = HashAlgorithm::Sha256.get_hash_from_bytes(&flipped_ct);
+    let forged_ct_path = dir.path().join("bitflip_rehashed.hashed");
+    write_raw_hashed_archive(
+        &forged_ct_path,
+        &[
+            ("meta.json", &orig_meta),
+            (ENCRYPTED_TREE_ENTRY, &flipped_ct),
+            ("hash.sha256", forged_hash.as_bytes()),
+        ],
+    );
+    assert!(matches!(
+        FileManager::open_file_with_password(&forged_ct_path, "master-key-123"),
+        Err(BulkHashError::DecryptionFailed(_))
+    ));
+
+    // 5. Tampering with meta.json (AAD binding!) -> AES-GCM authentication fails!
+    let mut tampered_meta_val: serde_json::Value =
+        serde_json::from_slice(&orig_meta).expect("parse meta");
+    tampered_meta_val["files_hashed"] = serde_json::Value::from(999);
+    let tampered_meta_bytes = serde_json::to_vec(&tampered_meta_val).expect("serialize meta");
+    let tampered_meta_path = dir.path().join("tampered_meta_aad.hashed");
+    write_raw_hashed_archive(
+        &tampered_meta_path,
+        &[
+            ("meta.json", &tampered_meta_bytes),
+            (ENCRYPTED_TREE_ENTRY, &orig_ct),
+            ("hash.sha256", &orig_hash),
+        ],
+    );
+    assert!(matches!(
+        FileManager::open_file_with_password(&tampered_meta_path, "master-key-123"),
+        Err(BulkHashError::DecryptionFailed(_))
+    ));
+
+    // 6. Cross-snapshot ciphertext transplant (same password, different archive) -> DecryptionFailed!
+    let ct_b = read_zip_entry_bytes(&path_b, ENCRYPTED_TREE_ENTRY);
+    let hash_b = read_zip_entry_bytes(&path_b, "hash.sha256");
+    let transplanted_path = dir.path().join("transplanted.hashed");
+    write_raw_hashed_archive(
+        &transplanted_path,
+        &[
+            ("meta.json", &orig_meta),
+            (ENCRYPTED_TREE_ENTRY, &ct_b),
+            ("hash.sha256", &hash_b),
+        ],
+    );
+    assert!(matches!(
+        FileManager::open_file_with_password(&transplanted_path, "master-key-123"),
+        Err(BulkHashError::DecryptionFailed(_))
+    ));
+
+    // 7. Truncated ciphertext (< 16-byte GCM tag) with matching hash -> FileIsCorrupted
+    let short_ct = b"too-short";
+    let short_hash = HashAlgorithm::Sha256.get_hash_from_bytes(short_ct);
+    let short_path = dir.path().join("truncated_ct.hashed");
+    write_raw_hashed_archive(
+        &short_path,
+        &[
+            ("meta.json", &orig_meta),
+            (ENCRYPTED_TREE_ENTRY, short_ct),
+            ("hash.sha256", short_hash.as_bytes()),
+        ],
+    );
+    assert!(matches!(
+        FileManager::open_file_with_password(&short_path, "master-key-123"),
+        Err(BulkHashError::FileIsCorrupted(_))
+    ));
+
+    // 8. Confusion attack: encrypted archive also containing plaintext tree.json -> FileIsCorrupted
+    let dual_entry_path = dir.path().join("dual_entries.hashed");
+    write_raw_hashed_archive(
+        &dual_entry_path,
+        &[
+            ("meta.json", &orig_meta),
+            (ENCRYPTED_TREE_ENTRY, &orig_ct),
+            ("tree.json", br#"{"name":"/fake","files":{},"sub_directories":{}}"#),
+            ("hash.sha256", &orig_hash),
+        ],
+    );
+    assert!(matches!(
+        FileManager::open_file_with_password(&dual_entry_path, "master-key-123"),
+        Err(BulkHashError::FileIsCorrupted(_))
+    ));
+
+    // 9. Reverse confusion: unencrypted meta.json with stray tree.enc -> FileIsCorrupted
+    let plain_meta = serde_json::to_vec(&meta).expect("plain meta");
+    let plain_tree = serde_json::to_vec(&tree_a).expect("plain tree");
+    let plain_hash = HashAlgorithm::Sha256.get_hash_from_bytes(&plain_tree);
+    let stray_enc_path = dir.path().join("stray_tree_enc.hashed");
+    write_raw_hashed_archive(
+        &stray_enc_path,
+        &[
+            ("meta.json", &plain_meta),
+            ("tree.json", &plain_tree),
+            (ENCRYPTED_TREE_ENTRY, &orig_ct),
+            ("hash.sha256", plain_hash.as_bytes()),
+        ],
+    );
+    assert!(matches!(
+        FileManager::open_file(&stray_enc_path),
+        Err(BulkHashError::FileIsCorrupted(_))
+    ));
+
+    // 10. Pre-v3 (v2) archive claiming encryption -> FileIsCorrupted on inspect & open
+    let mut v2_bogus_meta: serde_json::Value =
+        serde_json::from_slice(&orig_meta).expect("parse orig meta");
+    v2_bogus_meta["version"] = serde_json::Value::from(FORMAT_VERSION_V2);
+    let v2_bogus_bytes = serde_json::to_vec(&v2_bogus_meta).expect("serialize v2 bogus");
+    let v2_enc_path = dir.path().join("v2_claiming_encryption.hashed");
+    write_raw_hashed_archive(
+        &v2_enc_path,
+        &[
+            ("meta.json", &v2_bogus_bytes),
+            (ENCRYPTED_TREE_ENTRY, &orig_ct),
+            ("hash.sha256", &orig_hash),
+        ],
+    );
+    assert!(matches!(
+        FileManager::inspect_version(&v2_enc_path),
+        Err(BulkHashError::FileIsCorrupted(_))
+    ));
+    assert!(matches!(
+        FileManager::open_file_with_password(&v2_enc_path, "master-key-123"),
+        Err(BulkHashError::FileIsCorrupted(_))
+    ));
+}
+
+#[test]
+fn encryption_parameter_validation_dos_bounds_and_decompression_bomb_protection() {
+    let dir = TempDir::new("enc_dos_bounds");
+
+    // 1. KdfParams boundary checks
+    assert!(matches!(
+        KdfParams::new(0, 1, 1),
+        Err(BulkHashError::InvalidEncryptionParameters(_))
+    ));
+    assert!(matches!(
+        KdfParams::new(MIN_KDF_MEMORY_KIB - 1, 1, 1),
+        Err(BulkHashError::InvalidEncryptionParameters(_))
+    ));
+    assert!(matches!(
+        KdfParams::new(MAX_KDF_MEMORY_KIB + 1, 1, 1),
+        Err(BulkHashError::InvalidEncryptionParameters(_))
+    ));
+    assert!(matches!(
+        KdfParams::new(64, 0, 1),
+        Err(BulkHashError::InvalidEncryptionParameters(_))
+    ));
+    assert!(matches!(
+        KdfParams::new(64, MAX_KDF_ITERATIONS + 1, 1),
+        Err(BulkHashError::InvalidEncryptionParameters(_))
+    ));
+    assert!(matches!(
+        KdfParams::new(64, 1, 0),
+        Err(BulkHashError::InvalidEncryptionParameters(_))
+    ));
+    assert!(matches!(
+        KdfParams::new(1024, 1, MAX_KDF_PARALLELISM + 1),
+        Err(BulkHashError::InvalidEncryptionParameters(_))
+    ));
+    // Argon2 invariant: memory_kib >= 8 * parallelism (64 < 8 * 16 = 128)
+    assert!(matches!(
+        KdfParams::new(64, 1, 16),
+        Err(BulkHashError::InvalidEncryptionParameters(_))
+    ));
+    assert!(KdfParams::new(128, 1, 16).is_ok());
+
+    // 2. Malicious archives with OOM / CPU-hang / bad base64 / wrong lengths / unknown cipher
+    let malicious_encryption_headers = [
+        // 4 TB Argon2 memory OOM DoS
+        serde_json::json!({
+            "cipher": "aes-256-gcm",
+            "kdf": "argon2id",
+            "kdf_params": { "memory_kib": u32::MAX, "iterations": 1, "parallelism": 1 },
+            "salt": "AAAAAAAAAAAAAAAAAAAAAA==",
+            "nonce": "AAAAAAAAAAAAAAAA"
+        }),
+        // 1 million iterations CPU freeze DoS
+        serde_json::json!({
+            "cipher": "aes-256-gcm",
+            "kdf": "argon2id",
+            "kdf_params": { "memory_kib": 64, "iterations": 1_000_000, "parallelism": 1 },
+            "salt": "AAAAAAAAAAAAAAAAAAAAAA==",
+            "nonce": "AAAAAAAAAAAAAAAA"
+        }),
+        // Invalid Base64 salt
+        serde_json::json!({
+            "cipher": "aes-256-gcm",
+            "kdf": "argon2id",
+            "kdf_params": { "memory_kib": 64, "iterations": 1, "parallelism": 1 },
+            "salt": "not!!valid!!base64",
+            "nonce": "AAAAAAAAAAAAAAAA"
+        }),
+        // Salt too short (8 bytes instead of >= 16)
+        serde_json::json!({
+            "cipher": "aes-256-gcm",
+            "kdf": "argon2id",
+            "kdf_params": { "memory_kib": 64, "iterations": 1, "parallelism": 1 },
+            "salt": "AAAAAAAAAAA=",
+            "nonce": "AAAAAAAAAAAAAAAA"
+        }),
+        // Nonce wrong length (16 bytes instead of 12)
+        serde_json::json!({
+            "cipher": "aes-256-gcm",
+            "kdf": "argon2id",
+            "kdf_params": { "memory_kib": 64, "iterations": 1, "parallelism": 1 },
+            "salt": "AAAAAAAAAAAAAAAAAAAAAA==",
+            "nonce": "AAAAAAAAAAAAAAAAAAAAAA=="
+        }),
+        // Unsupported cipher
+        serde_json::json!({
+            "cipher": "chacha20-poly1305",
+            "kdf": "argon2id",
+            "kdf_params": { "memory_kib": 64, "iterations": 1, "parallelism": 1 },
+            "salt": "AAAAAAAAAAAAAAAAAAAAAA==",
+            "nonce": "AAAAAAAAAAAAAAAA"
+        }),
+        // Unsupported KDF
+        serde_json::json!({
+            "cipher": "aes-256-gcm",
+            "kdf": "pbkdf2",
+            "kdf_params": { "memory_kib": 64, "iterations": 1, "parallelism": 1 },
+            "salt": "AAAAAAAAAAAAAAAAAAAAAA==",
+            "nonce": "AAAAAAAAAAAAAAAA"
+        }),
+    ];
+
+    let dummy_ct = vec![0xAAu8; 32];
+    let dummy_hash = HashAlgorithm::Sha256.get_hash_from_bytes(&dummy_ct);
+    for (idx, enc_header) in malicious_encryption_headers.iter().enumerate() {
+        let meta_json = serde_json::json!({
+            "version": FORMAT_VERSION_V3,
+            "files_hashed": 0,
+            "hash_time": { "secs": 0, "nanos": 0 },
+            "date_utc": Utc::now().to_rfc3339(),
+            "local_time": "2026-01-01T00:00:00Z",
+            "os": "linux",
+            "encryption": enc_header
+        });
+        let meta_bytes = serde_json::to_vec(&meta_json).expect("serialize malicious meta");
+        let path = dir.path().join(format!("malicious_{idx}.hashed"));
+        write_raw_hashed_archive(
+            &path,
+            &[
+                ("meta.json", &meta_bytes),
+                (ENCRYPTED_TREE_ENTRY, &dummy_ct),
+                ("hash.sha256", dummy_hash.as_bytes()),
+            ],
+        );
+
+        let inspect_err = FileManager::inspect_version(&path)
+            .expect_err("malicious encryption header must fail inspect");
+        assert!(
+            matches!(inspect_err, BulkHashError::InvalidEncryptionParameters(_)),
+            "case {idx} inspect expected InvalidEncryptionParameters, got {inspect_err:?}"
+        );
+
+        let open_err = FileManager::open_file_with_password(&path, "any-pw")
+            .expect_err("malicious encryption header must fail open before KDF");
+        assert!(
+            matches!(open_err, BulkHashError::InvalidEncryptionParameters(_)),
+            "case {idx} open expected InvalidEncryptionParameters, got {open_err:?}"
+        );
+    }
+
+    // 3. Decompression-bomb guard: 16 KiB highly-compressible payload rejected when max_bytes = 256
+    let bomb_plaintext = vec![b'A'; 16 * 1024];
+    let opts = fast_encryption_options("bomb-pw")
+        .with_payload_compression(PayloadCompression::Deflate);
+    let enc_meta = prepare_encryption_metadata(&opts).expect("enc meta");
+    let aad = build_tree_aad(FORMAT_VERSION_V3, b"{}");
+    let ct = encrypt_tree_payload(&bomb_plaintext, &opts, &enc_meta, &aad).expect("encrypt bomb");
+    assert!(ct.len() < 128, "compressed ciphertext should be tiny");
+
+    let bomb_err = decrypt_tree_payload(&ct, "bomb-pw", &enc_meta, &aad, 256, "bomb.hashed")
+        .expect_err("decompression exceeding limit must fail");
+    assert!(matches!(bomb_err, BulkHashError::FileIsCorrupted(_)));
+
+    // Exact bound succeeds
+    let ok_plain = decrypt_tree_payload(
+        &ct,
+        "bomb-pw",
+        &enc_meta,
+        &aad,
+        bomb_plaintext.len() as u64,
+        "bomb.hashed",
+    )
+    .expect("exact bound must succeed");
+    assert_eq!(ok_plain.as_slice(), bomb_plaintext.as_slice());
+}
+
+#[test]
+fn encrypt_decrypt_reencrypt_and_password_aware_migration_workflows() {
+    let dir = TempDir::new("enc_workflows");
+    let ts = DateTime::from_timestamp(1_765_300_000, 0).expect("valid ts");
+
+    let mut tree = DirectoryNode::new(String::from("/project"));
+    tree.insert_path(
+        &["src", "secret.rs"],
+        FileEntry::from_hash(String::from("1234abcd"), Some(2048), Some(ts)),
+    );
+    let meta = MetaData::new(1, Duration::from_millis(55), ts)
+        .with_algorithm(HashAlgorithm::Blake3)
+        .with_total_size(2048);
+
+    // 1. Out-of-place encrypt_file on an unencrypted v3 archive
+    let plain_path = FileManager::save_file(dir.path(), &tree, &meta).expect("save plain");
+    let expected_tree_hash = FileManager::open_file(&plain_path)
+        .expect("open plain")
+        .get_hash()
+        .to_string();
+
+    let enc_out = dir.path().join("encrypted_copy.hashed");
+    let opts_v1 = fast_encryption_options("first-password");
+    let enc_report =
+        FileManager::encrypt_file(&plain_path, &enc_out, &opts_v1).expect("encrypt_file");
+    assert!(!enc_report.was_migrated());
+    assert!(!FileManager::is_encrypted(&plain_path).expect("source stays plain"));
+    assert!(FileManager::is_encrypted(&enc_out).expect("dest is encrypted"));
+
+    let unlocked =
+        FileManager::open_file_with_password(&enc_out, "first-password").expect("unlock");
+    assert_eq!(unlocked.get_tree(), &tree);
+    assert_eq!(unlocked.get_hash(), expected_tree_hash);
+
+    // Calling encrypt_file on an already-encrypted snapshot fails with PasswordRequired
+    assert!(matches!(
+        FileManager::encrypt_file(&enc_out, dir.path().join("dup.hashed"), &opts_v1),
+        Err(BulkHashError::PasswordRequired(_))
+    ));
+
+    // 2. In-place encrypt_file on a legacy v1 snapshot -> transparently upgrades v1 -> v3 & encrypts!
+    let legacy_v1_dir = TempDir::new("enc_v1_inplace");
+    let legacy_v1_path = legacy_v1_dir.path().join("legacy.hashed");
+    let v1_tree = r#"{"name":"/legacy","files":{"doc.txt":{"Ok":"face0001"}},"sub_directories":{}}"#;
+    let v1_hash = HashAlgorithm::Sha256.get_hash_from_bytes(v1_tree.as_bytes());
+    let v1_meta = format!(
+        r#"{{"version":1,"files_hashed":1,"hash_time":{{"secs":0,"nanos":5}},"date_utc":"{}","local_time":"2026-01-01T00:00:00Z","os":"linux"}}"#,
+        ts.to_rfc3339()
+    );
+    write_raw_hashed_archive(
+        &legacy_v1_path,
+        &[
+            ("meta.json", v1_meta.as_bytes()),
+            ("tree.json", v1_tree.as_bytes()),
+            ("hash.sha256", v1_hash.as_bytes()),
+        ],
+    );
+
+    let v1_enc_report =
+        FileManager::encrypt_file(&legacy_v1_path, &legacy_v1_path, &opts_v1)
+            .expect("in-place encrypt v1");
+    assert!(v1_enc_report.was_migrated());
+    assert_eq!(v1_enc_report.original_version(), FORMAT_VERSION_V1);
+    assert_eq!(v1_enc_report.target_version(), FORMAT_VERSION_V3);
+    assert!(FileManager::is_encrypted(&legacy_v1_path).expect("v1 now encrypted"));
+    let loaded_v1_enc =
+        FileManager::open_file_with_password(&legacy_v1_path, "first-password").expect("open v1 enc");
+    assert_eq!(loaded_v1_enc.get_meta().get_version(), FORMAT_VERSION_V3);
+    assert_eq!(
+        loaded_v1_enc.get_meta().get_migrated_from(),
+        Some(FORMAT_VERSION_V1)
+    );
+    assert_eq!(
+        loaded_v1_enc
+            .get_tree()
+            .files
+            .get("doc.txt")
+            .and_then(FileEntry::hash),
+        Some("face0001")
+    );
+    // Ensure zero leftover temp staging files in directory
+    assert_eq!(
+        fs::read_dir(legacy_v1_dir.path()).expect("read dir").count(),
+        1
+    );
+
+    // 3. Re-encrypt (password rotation + compression change) in-place & out-of-place
+    let old_enc_meta = FileManager::inspect_version(&enc_out)
+        .expect("inspect before reencrypt")
+        .encryption()
+        .expect("old enc meta")
+        .clone();
+    let opts_v2 = fast_encryption_options("second-rotated-password")
+        .with_payload_compression(PayloadCompression::None);
+
+    // Wrong current password leaves file untouched
+    let orig_enc_bytes = fs::read(&enc_out).expect("read enc_out bytes");
+    assert!(matches!(
+        FileManager::reencrypt_file(&enc_out, &enc_out, "wrong-old-pw", &opts_v2),
+        Err(BulkHashError::DecryptionFailed(_))
+    ));
+    assert_eq!(fs::read(&enc_out).expect("verify untouched"), orig_enc_bytes);
+
+    // Valid in-place rotation
+    FileManager::reencrypt_file(&enc_out, &enc_out, "first-password", &opts_v2)
+        .expect("in-place reencrypt");
+    let new_enc_meta = FileManager::inspect_version(&enc_out)
+        .expect("inspect after reencrypt")
+        .encryption()
+        .expect("new enc meta")
+        .clone();
+    assert_ne!(new_enc_meta.salt, old_enc_meta.salt);
+    assert_ne!(new_enc_meta.nonce, old_enc_meta.nonce);
+    assert_eq!(new_enc_meta.payload_compression, PayloadCompression::None);
+
+    // Old password no longer works; new password succeeds
+    assert!(matches!(
+        FileManager::open_file_with_password(&enc_out, "first-password"),
+        Err(BulkHashError::DecryptionFailed(_))
+    ));
+    let reopened_rotated = FileManager::open_file_with_password(&enc_out, "second-rotated-password")
+        .expect("open with new password");
+    assert_eq!(reopened_rotated.get_tree(), &tree);
+    assert_eq!(reopened_rotated.get_hash(), expected_tree_hash);
+
+    // 4. Password-aware migration on encrypted v3 preserves encryption (fresh salt/nonce)
+    assert!(matches!(
+        FileManager::migrate_file(&enc_out, dir.path().join("mig_no_pw.hashed")),
+        Err(BulkHashError::PasswordRequired(_))
+    ));
+    let mig_enc_copy = dir.path().join("mig_enc_copy.hashed");
+    let mig_enc_report = FileManager::migrate_file_with_password(
+        &enc_out,
+        &mig_enc_copy,
+        Some("second-rotated-password"),
+    )
+    .expect("migrate encrypted copy");
+    assert!(!mig_enc_report.was_migrated());
+    assert!(FileManager::is_encrypted(&mig_enc_copy).expect("copy stays encrypted"));
+    let copy_enc_meta = FileManager::inspect_version(&mig_enc_copy)
+        .expect("inspect copy")
+        .encryption()
+        .expect("copy enc")
+        .clone();
+    assert_ne!(copy_enc_meta.salt, new_enc_meta.salt);
+    assert_ne!(copy_enc_meta.nonce, new_enc_meta.nonce);
+    assert_eq!(copy_enc_meta.kdf_params, new_enc_meta.kdf_params);
+    assert_eq!(
+        copy_enc_meta.payload_compression,
+        new_enc_meta.payload_compression
+    );
+
+    let inplace_enc_mig = FileManager::migrate_file_in_place_with_password(
+        &enc_out,
+        true,
+        Some("second-rotated-password"),
+    )
+    .expect("in-place migrate current encrypted is no-op");
+    assert!(!inplace_enc_mig.was_migrated());
+    assert!(inplace_enc_mig.backup_path().is_none());
+
+    // 5. Decrypt back to unencrypted (out-of-place & in-place)
+    let dec_out = dir.path().join("decrypted.hashed");
+    FileManager::decrypt_file(&enc_out, &dec_out, "second-rotated-password")
+        .expect("decrypt out-of-place");
+    assert!(!FileManager::is_encrypted(&dec_out).expect("decrypted is plain"));
+    let dec_meta_raw = read_zip_entry_string(&dec_out, "meta.json");
+    assert!(!dec_meta_raw.contains("encryption"));
+    let dec_loaded = FileManager::open_file(&dec_out).expect("open decrypted without pw");
+    assert_eq!(dec_loaded.get_tree(), &tree);
+    assert_eq!(dec_loaded.get_hash(), expected_tree_hash);
+
+    // In-place decrypt
+    FileManager::decrypt_file(&enc_out, &enc_out, "second-rotated-password")
+        .expect("decrypt in-place");
+    assert!(!FileManager::is_encrypted(&enc_out).expect("enc_out now plain"));
+    assert_eq!(
+        FileManager::open_file(&enc_out).expect("open now-plain").get_tree(),
+        &tree
+    );
+
+    // Calling decrypt_file or reencrypt_file on an unencrypted archive returns SnapshotNotEncrypted
+    assert!(matches!(
+        FileManager::decrypt_file(&plain_path, dir.path().join("x.hashed"), ""),
+        Err(BulkHashError::SnapshotNotEncrypted(_))
+    ));
+    assert!(matches!(
+        FileManager::reencrypt_file(&plain_path, dir.path().join("x.hashed"), "any", &opts_v1),
+        Err(BulkHashError::SnapshotNotEncrypted(_))
+    ));
+}
+
+#[test]
+fn v2_to_v3_migration_and_encryption_error_gui_serialization() {
+    let dir = TempDir::new("v2_to_v3_and_errors");
+    let ts = DateTime::from_timestamp(1_765_400_000, 0).expect("valid ts");
+
+    // 1. Construct a canonical v2 archive and verify 1-step v2 -> v3 migration
+    let v2_path = dir.path().join("snapshot_v2.hashed");
+    let v2_tree = serde_json::json!({
+        "name": "/v2_workspace",
+        "files": {
+            "app.bin": { "hash": "9999ffff", "size": 512, "modified_utc": ts.to_rfc3339() }
+        },
+        "sub_directories": {}
+    });
+    let v2_tree_bytes = serde_json::to_vec(&v2_tree).expect("serialize v2 tree");
+    let v2_hash = HashAlgorithm::Sha256.get_hash_from_bytes(&v2_tree_bytes);
+    let v2_meta = serde_json::json!({
+        "version": FORMAT_VERSION_V2,
+        "files_hashed": 1,
+        "hash_time": { "secs": 0, "nanos": 1000 },
+        "date_utc": ts.to_rfc3339(),
+        "local_time": "2026-01-01T00:00:00Z",
+        "os": "linux",
+        "algorithm": "Blake3",
+        "total_size": 512
+    });
+    let v2_meta_bytes = serde_json::to_vec(&v2_meta).expect("serialize v2 meta");
+    write_raw_hashed_archive(
+        &v2_path,
+        &[
+            ("meta.json", &v2_meta_bytes),
+            ("tree.json", &v2_tree_bytes),
+            ("hash.sha256", v2_hash.as_bytes()),
+        ],
+    );
+
+    let v2_info = FileManager::inspect_version(&v2_path).expect("inspect v2");
+    assert_eq!(v2_info.version, FORMAT_VERSION_V2);
+    assert!(!v2_info.is_encrypted());
+    assert_eq!(
+        v2_info.compatibility,
+        VersionCompatibility::NeedsMigration {
+            from_version: FORMAT_VERSION_V2,
+            to_version: FORMAT_VERSION_V3,
+            steps_required: 1,
+        }
+    );
+
+    let loaded_v2 = FileManager::open_file(&v2_path).expect("open & migrate v2 -> v3");
+    assert!(loaded_v2.was_migrated());
+    assert_eq!(loaded_v2.get_original_version(), FORMAT_VERSION_V2);
+    assert_eq!(loaded_v2.get_meta().get_version(), FORMAT_VERSION_V3);
+    assert_eq!(
+        loaded_v2.get_meta().get_migrated_from(),
+        Some(FORMAT_VERSION_V2)
+    );
+    assert_eq!(loaded_v2.get_meta().get_total_size(), Some(512));
+    assert!(!loaded_v2.is_encrypted());
+
+    let mig_report =
+        FileManager::migrate_file_in_place(&v2_path, true).expect("in-place migrate v2 -> v3");
+    assert!(mig_report.was_migrated());
+    assert_eq!(mig_report.original_version(), FORMAT_VERSION_V2);
+    assert_eq!(mig_report.target_version(), FORMAT_VERSION_V3);
+    assert_eq!(mig_report.steps().len(), 1);
+    assert!(
+        mig_report
+            .backup_path()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with(".v2.bak"))
+    );
+
+    let reopened_v3 = FileManager::open_file(&v2_path).expect("reopen upgraded v3");
+    assert!(!reopened_v3.was_migrated());
+    assert_eq!(reopened_v3.get_meta().get_version(), FORMAT_VERSION_V3);
+    assert_eq!(
+        reopened_v3.get_meta().get_migrated_from(),
+        Some(FORMAT_VERSION_V2)
+    );
+
+    // 2. Verify clean GUI/IPC JSON serialization of all new encryption BulkHashError variants
+    let error_cases = [
+        (
+            BulkHashError::PasswordRequired(String::from("/tmp/secret.hashed")),
+            "PasswordRequired",
+        ),
+        (BulkHashError::EmptyPassword, "EmptyPassword"),
+        (
+            BulkHashError::DecryptionFailed(String::from("/tmp/secret.hashed")),
+            "DecryptionFailed",
+        ),
+        (
+            BulkHashError::EncryptionFailed(String::from("rng unavailable")),
+            "EncryptionFailed",
+        ),
+        (
+            BulkHashError::InvalidEncryptionParameters(String::from("bad salt")),
+            "InvalidEncryptionParameters",
+        ),
+        (
+            BulkHashError::SnapshotNotEncrypted(String::from("/tmp/plain.hashed")),
+            "SnapshotNotEncrypted",
+        ),
+    ];
+
+    for (err, expected_kind) in error_cases {
+        let json = serde_json::to_value(&err).expect("serialize BulkHashError");
+        assert_eq!(json["kind"], expected_kind);
+        assert!(
+            json["message"]
+                .as_str()
+                .is_some_and(|msg| !msg.is_empty()),
+            "error message for {expected_kind} must be non-empty"
+        );
+    }
+}
+
+fn read_zip_entry_bytes(path: &Path, entry_name: &str) -> (Vec<u8>, zip::CompressionMethod) {
+    use std::io::Read;
+
+    let file = File::open(path).expect("open zip archive");
+    let mut archive = zip::ZipArchive::new(file).expect("parse zip archive");
+    let mut entry = archive.by_name(entry_name).expect("find zip entry");
+    let method = entry.compression();
+    let mut buf = Vec::new();
+    entry.read_to_end(&mut buf).expect("read zip entry bytes");
+    (buf, method)
+}
+
+fn fast_test_kdf_params() -> KdfParams {
+    KdfParams::new(64, 1, 1).expect("valid fast test KDF params")
+}
+
+#[test]
+fn encrypted_snapshot_roundtrip_default_standard_kdf_and_confidentiality() {
+    let dir = TempDir::new("enc_roundtrip_default");
+    let scan_root = dir.path().join("sensitive_vault");
+    let secrets_dir = scan_root.join("secrets");
+    fs::create_dir_all(&secrets_dir).expect("create secrets dir");
+
+    fs::write(scan_root.join("payroll_2026.xlsx"), b"confidential salary data")
+        .expect("write payroll");
+    fs::write(secrets_dir.join("api_keys.env"), b"SECRET_API_TOKEN=xyz987654")
+        .expect("write api_keys");
+    fs::write(
+        secrets_dir.join("überprüfung_🔒.txt"),
+        b"unicode filename payload",
+    )
+    .expect("write unicode file");
+
+    let mut scanner = ScanManager::new(HashAlgorithm::Blake3);
+    scanner
+        .start_hash(scan_root.to_string_lossy().into_owned())
+        .expect("scan sensitive_vault");
+
+    let mut tree = DirectoryNode::build_tree(scanner.get_path(), scanner.get_list());
+    // Also include an error entry containing a sensitive path to ensure errors are encrypted too.
+    tree.insert_path(
+        &["secrets", "locked_private.key"],
+        FileEntry::from_error(
+            String::from("Permission denied: /sensitive_vault/secrets/locked_private.key"),
+            Some(2048),
+            None,
+        ),
+    );
+
+    let meta = MetaData::new(
+        scanner.get_hash_manager().get_files_counted(),
+        scanner.get_hash_time(),
+        Utc::now(),
+    )
+    .with_algorithm(scanner.get_algorithm())
+    .with_total_size(scanner.get_total_size());
+
+    let password = "Sup3r S3cret Passphrase! 🔐";
+    let options = EncryptionOptions::new(password).expect("valid EncryptionOptions");
+
+    // Password MUST be redacted from Debug output!
+    let debug_repr = format!("{options:?}");
+    assert!(debug_repr.contains("[REDACTED]"));
+    assert!(!debug_repr.contains("Sup3r"));
+    assert!(!debug_repr.contains("Passphrase"));
+
+    let out_dir = TempDir::new("enc_out_default");
+    let saved_path =
+        FileManager::save_file_encrypted(out_dir.path(), &tree, &meta, &options)
+            .expect("save_file_encrypted with default standard Argon2id");
+    assert!(saved_path.exists());
+
+    // 1. Inspect archive without password
+    let info = FileManager::inspect_version(&saved_path).expect("inspect_version");
+    assert_eq!(info.version, FORMAT_VERSION_V3);
+    assert_eq!(info.current_version, CURRENT_FORMAT_VERSION);
+    assert!(info.is_supported());
+    assert!(info.is_current());
+    assert!(!info.needs_migration());
+    assert!(info.is_encrypted());
+    assert!(FileManager::is_encrypted(&saved_path).expect("is_encrypted"));
+    assert!(info.entries.iter().any(|e| e == "meta.json"));
+    assert!(info.entries.iter().any(|e| e == ENCRYPTED_TREE_ENTRY));
+    assert!(info.entries.iter().any(|e| e == "hash.sha256"));
+    assert!(!info.entries.iter().any(|e| e == "tree.json"));
+
+    let enc_meta = info.encryption().expect("encryption metadata must be present");
+    assert_eq!(enc_meta.cipher, EncryptionCipher::Aes256Gcm);
+    assert_eq!(enc_meta.kdf, KeyDerivationAlgorithm::Argon2id);
+    assert_eq!(enc_meta.kdf_params, KdfParams::standard());
+    assert_eq!(enc_meta.payload_compression, PayloadCompression::Deflate);
+    assert_eq!(enc_meta.decode_salt().expect("valid salt").len(), 16);
+    assert_eq!(enc_meta.decode_nonce().expect("valid nonce").len(), 12);
+
+    // 2. Verify confidentiality and storage format on disk
+    let meta_raw = read_zip_entry_string(&saved_path, "meta.json");
+    let (ciphertext_bytes, enc_method) = read_zip_entry_bytes(&saved_path, ENCRYPTED_TREE_ENTRY);
+    let hash_raw = read_zip_entry_string(&saved_path, "hash.sha256");
+
+    assert_eq!(
+        enc_method,
+        zip::CompressionMethod::Stored,
+        "ciphertext entry should be stored without redundant ZIP deflation"
+    );
+    assert_eq!(
+        hash_raw.trim(),
+        HashAlgorithm::Sha256.get_hash_from_bytes(&ciphertext_bytes),
+        "hash.sha256 on disk must cover ciphertext"
+    );
+
+    let plaintext_tree_bytes = serde_json::to_vec(&tree).expect("serialize tree");
+    let plaintext_tree_hash = HashAlgorithm::Sha256.get_hash_from_bytes(&plaintext_tree_bytes);
+    assert_ne!(
+        hash_raw.trim(),
+        plaintext_tree_hash,
+        "on-disk hash.sha256 must NEVER leak plaintext tree SHA-256"
+    );
+
+    for sensitive_needle in [
+        "payroll_2026.xlsx",
+        "api_keys.env",
+        "locked_private.key",
+        "sensitive_vault",
+    ] {
+        assert!(
+            !meta_raw.contains(sensitive_needle),
+            "meta.json leaked '{sensitive_needle}'"
+        );
+        assert!(
+            !ciphertext_bytes
+                .windows(sensitive_needle.len())
+                .any(|w| w == sensitive_needle.as_bytes()),
+            "tree.enc leaked plaintext '{sensitive_needle}'"
+        );
+    }
+
+    // 3. Opening without password, with empty password, or with wrong passwords MUST fail cleanly
+    let no_pw_err =
+        FileManager::open_file(&saved_path).expect_err("open_file must reject encrypted archive");
+    assert!(matches!(no_pw_err, BulkHashError::PasswordRequired(_)));
+    assert!(no_pw_err.is_password_required());
+
+    let empty_pw_err = FileManager::open_file_with_password(&saved_path, "")
+        .expect_err("empty password must be rejected");
+    assert!(matches!(empty_pw_err, BulkHashError::EmptyPassword));
+
+    let wrong_pw_err = FileManager::open_file_with_password(&saved_path, "wrong-password")
+        .expect_err("wrong password must fail decryption");
+    assert!(matches!(wrong_pw_err, BulkHashError::DecryptionFailed(_)));
+
+    // Trailing space must NOT be trimmed; exact passphrase is required
+    let space_pw_err =
+        FileManager::open_file_with_password(&saved_path, "Sup3r S3cret Passphrase! 🔐 ")
+            .expect_err("password with extra trailing space must fail");
+    assert!(matches!(space_pw_err, BulkHashError::DecryptionFailed(_)));
+
+    // 4. Unlocking with the exact password restores every tree entry, metadata field, and hash
+    let loaded = FileManager::open_file_with_password(&saved_path, password)
+        .expect("correct password must unlock snapshot");
+    assert!(loaded.is_encrypted());
+    assert!(loaded.get_meta().is_encrypted());
+    assert_eq!(loaded.get_encryption(), Some(enc_meta));
+    assert!(!loaded.was_migrated());
+    assert_eq!(loaded.get_meta().get_version(), FORMAT_VERSION_V3);
+    assert_eq!(loaded.get_tree(), &tree);
+    assert_eq!(loaded.get_hash(), plaintext_tree_hash);
+    assert_eq!(
+        loaded
+            .get_tree()
+            .sub_directories
+            .get("secrets")
+            .and_then(|s| s.files.get("überprüfung_🔒.txt"))
+            .and_then(FileEntry::hash),
+        Some(
+            HashAlgorithm::Blake3
+                .get_hash_from_bytes(b"unicode filename payload")
+                .as_str()
+        )
+    );
+}
+
+#[test]
+fn encrypted_snapshot_semantic_security_fresh_salt_nonce_and_compression_modes() {
+    let ts = DateTime::from_timestamp(1_765_000_000, 0).expect("valid ts");
+    let mut tree = DirectoryNode::new(String::from("/repeated/project/root"));
+    for idx in 0..60usize {
+        let dir_name = format!("module_{:02}", idx % 6);
+        let file_name = format!("component_implementation_file_{idx:03}.rs");
+        let fake_hash = HashAlgorithm::Sha256.get_hash_from_bytes(file_name.as_bytes());
+        tree.insert_path(
+            &[dir_name.as_str(), file_name.as_str()],
+            FileEntry::from_hash(fake_hash, Some((idx as u64 + 1) * 1024), Some(ts)),
+        );
+    }
+
+    let meta = MetaData::new(60, Duration::from_millis(75), ts)
+        .with_algorithm(HashAlgorithm::Sha256)
+        .with_total_size(tree.hashed_size());
+
+    let fast_kdf = fast_test_kdf_params();
+    let deflate_opts = EncryptionOptions::new("same-password")
+        .expect("opts")
+        .with_kdf_params(fast_kdf)
+        .expect("kdf")
+        .with_payload_compression(PayloadCompression::Deflate);
+    let raw_opts = EncryptionOptions::new("same-password")
+        .expect("opts")
+        .with_kdf_params(fast_kdf)
+        .expect("kdf")
+        .with_payload_compression(PayloadCompression::None);
+
+    let dir_a = TempDir::new("enc_sem_a");
+    let dir_b = TempDir::new("enc_sem_b");
+    let dir_raw = TempDir::new("enc_sem_raw");
+
+    let path_a =
+        FileManager::save_file_encrypted(dir_a.path(), &tree, &meta, &deflate_opts).expect("save a");
+    let path_b =
+        FileManager::save_file_encrypted(dir_b.path(), &tree, &meta, &deflate_opts).expect("save b");
+    let path_raw =
+        FileManager::save_file_encrypted(dir_raw.path(), &tree, &meta, &raw_opts).expect("save raw");
+
+    let info_a = FileManager::inspect_version(&path_a).expect("inspect a");
+    let info_b = FileManager::inspect_version(&path_b).expect("inspect b");
+    let enc_a = info_a.encryption().expect("enc a");
+    let enc_b = info_b.encryption().expect("enc b");
+
+    // Identical plaintext + identical password MUST produce distinct salt, nonce, ciphertext, and hash
+    assert_ne!(enc_a.salt, enc_b.salt, "salt must be freshly randomized");
+    assert_ne!(enc_a.nonce, enc_b.nonce, "nonce must be freshly randomized");
+
+    let (ct_a, _) = read_zip_entry_bytes(&path_a, ENCRYPTED_TREE_ENTRY);
+    let (ct_b, _) = read_zip_entry_bytes(&path_b, ENCRYPTED_TREE_ENTRY);
+    let (ct_raw, _) = read_zip_entry_bytes(&path_raw, ENCRYPTED_TREE_ENTRY);
+    assert_ne!(ct_a, ct_b, "ciphertexts must differ (IND-CPA)");
+    assert_ne!(
+        read_zip_entry_string(&path_a, "hash.sha256"),
+        read_zip_entry_string(&path_b, "hash.sha256")
+    );
+
+    // Pre-encryption Deflate compression must keep encrypted snapshots substantially smaller
+    assert!(
+        ct_a.len() < ct_raw.len() / 2,
+        "deflate payload ({} bytes) should be much smaller than uncompressed ({} bytes)",
+        ct_a.len(),
+        ct_raw.len()
+    );
+
+    let loaded_a = FileManager::open_file_with_password(&path_a, "same-password").expect("open a");
+    let loaded_raw =
+        FileManager::open_file_with_password(&path_raw, "same-password").expect("open raw");
+    assert_eq!(loaded_a.get_tree(), &tree);
+    assert_eq!(loaded_raw.get_tree(), &tree);
+    assert_eq!(loaded_a.get_hash(), loaded_raw.get_hash());
+
+    // Passing MetaData loaded from an encrypted snapshot into unencrypted `save_file` must strip
+    // stale encryption metadata, and into `save_file_encrypted` must generate fresh salt & nonce!
+    let dir_plain = TempDir::new("enc_strip_plain");
+    let plain_path =
+        FileManager::save_file(dir_plain.path(), loaded_a.get_tree(), loaded_a.get_meta())
+            .expect("save plain from encrypted meta");
+    assert!(!FileManager::is_encrypted(&plain_path).expect("plain check"));
+    let loaded_plain = FileManager::open_file(&plain_path).expect("open stripped plain");
+    assert!(!loaded_plain.is_encrypted());
+    assert_eq!(loaded_plain.get_tree(), &tree);
+
+    let dir_resave = TempDir::new("enc_resave_fresh");
+    let resaved_path = FileManager::save_file_encrypted(
+        dir_resave.path(),
+        loaded_a.get_tree(),
+        loaded_a.get_meta(),
+        &deflate_opts,
+    )
+    .expect("re-save encrypted from encrypted meta");
+    let resaved_info = FileManager::inspect_version(&resaved_path).expect("inspect resaved");
+    let enc_resaved = resaved_info.encryption().expect("enc resaved");
+    assert_ne!(
+        enc_resaved.salt, enc_a.salt,
+        "re-saving must never reuse salt"
+    );
+    assert_ne!(
+        enc_resaved.nonce, enc_a.nonce,
+        "re-saving must never reuse nonce"
+    );
+    let loaded_resaved =
+        FileManager::open_file_with_password(&resaved_path, "same-password").expect("open resaved");
+    assert_eq!(loaded_resaved.get_tree(), &tree);
+}
+
+#[test]
+fn encrypted_snapshot_tamper_detection_ciphertext_hash_and_meta_aad() {
+    let dir = TempDir::new("enc_tamper");
+    let mut tree = DirectoryNode::new(String::from("/guarded"));
+    tree.insert_path(
+        &["document.pdf"],
+        FileEntry::from_hash(String::from("0123456789abcdef"), Some(4096), None),
+    );
+    let meta = MetaData::new(1, Duration::from_secs(1), Utc::now())
+        .with_algorithm(HashAlgorithm::Blake3)
+        .with_total_size(4096);
+
+    let opts = EncryptionOptions::new("correct-horse-battery-staple")
+        .expect("opts")
+        .with_kdf_params(fast_test_kdf_params())
+        .expect("kdf");
+
+    let valid_path =
+        FileManager::save_file_encrypted(dir.path(), &tree, &meta, &opts).expect("save encrypted");
+
+    let meta_bytes = read_zip_entry_string(&valid_path, "meta.json").into_bytes();
+    let (ciphertext, _) = read_zip_entry_bytes(&valid_path, ENCRYPTED_TREE_ENTRY);
+    let valid_hash = read_zip_entry_string(&valid_path, "hash.sha256");
+
+    // 1. Flip a single bit in `tree.enc` WITHOUT updating `hash.sha256` -> fast HashMismatch
+    let mut flipped_ct = ciphertext.clone();
+    flipped_ct[0] ^= 0x01;
+    let bitflip_path = dir.path().join("bitflip_only.hashed");
+    write_raw_hashed_archive(
+        &bitflip_path,
+        &[
+            ("meta.json", &meta_bytes),
+            (ENCRYPTED_TREE_ENTRY, &flipped_ct),
+            ("hash.sha256", valid_hash.as_bytes()),
+        ],
+    );
+    let err = FileManager::open_file_with_password(&bitflip_path, "correct-horse-battery-staple")
+        .expect_err("bit-flipped ciphertext must report HashMismatch");
+    assert!(matches!(err, BulkHashError::HashMismatch { .. }));
+
+    // 2. Coordinated tamper: flip bit in `tree.enc` AND update `hash.sha256` -> AES-GCM catches it!
+    let forged_ct_hash = HashAlgorithm::Sha256.get_hash_from_bytes(&flipped_ct);
+    let forged_ct_path = dir.path().join("forged_ct_and_hash.hashed");
+    write_raw_hashed_archive(
+        &forged_ct_path,
+        &[
+            ("meta.json", &meta_bytes),
+            (ENCRYPTED_TREE_ENTRY, &flipped_ct),
+            ("hash.sha256", forged_ct_hash.as_bytes()),
+        ],
+    );
+    let err =
+        FileManager::open_file_with_password(&forged_ct_path, "correct-horse-battery-staple")
+            .expect_err("GCM auth tag must reject forged ciphertext");
+    assert!(matches!(err, BulkHashError::DecryptionFailed(_)));
+
+    // 3. Tamper with `meta.json` (change `files_hashed` from 1 to 999) while keeping `tree.enc`
+    // and `hash.sha256` intact -> AES-GCM AAD verification MUST catch it!
+    let mut tampered_meta_val: serde_json::Value =
+        serde_json::from_slice(&meta_bytes).expect("parse meta");
+    tampered_meta_val["files_hashed"] = serde_json::Value::from(999);
+    let tampered_meta_bytes = serde_json::to_vec(&tampered_meta_val).expect("serialize meta");
+    let tampered_meta_path = dir.path().join("tampered_meta_aad.hashed");
+    write_raw_hashed_archive(
+        &tampered_meta_path,
+        &[
+            ("meta.json", &tampered_meta_bytes),
+            (ENCRYPTED_TREE_ENTRY, &ciphertext),
+            ("hash.sha256", valid_hash.as_bytes()),
+        ],
+    );
+    let err =
+        FileManager::open_file_with_password(&tampered_meta_path, "correct-horse-battery-staple")
+            .expect_err("GCM AAD must reject tampered meta.json");
+    assert!(matches!(err, BulkHashError::DecryptionFailed(_)));
+
+    // 4. Truncated `tree.enc` (< 16-byte GCM tag) with matching hash -> FileIsCorrupted
+    let short_ct = b"too-short";
+    let short_hash = HashAlgorithm::Sha256.get_hash_from_bytes(short_ct);
+    let truncated_path = dir.path().join("truncated_ct.hashed");
+    write_raw_hashed_archive(
+        &truncated_path,
+        &[
+            ("meta.json", &meta_bytes),
+            (ENCRYPTED_TREE_ENTRY, short_ct),
+            ("hash.sha256", short_hash.as_bytes()),
+        ],
+    );
+    let err =
+        FileManager::open_file_with_password(&truncated_path, "correct-horse-battery-staple")
+            .expect_err("truncated ciphertext must report FileIsCorrupted");
+    assert!(matches!(err, BulkHashError::FileIsCorrupted(_)));
+
+    // 5. Confusion/downgrade checks:
+    // 5a. Encrypted archive containing BOTH `tree.enc` and plaintext `tree.json` -> FileIsCorrupted
+    let mixed_entries_path = dir.path().join("mixed_enc_and_plain.hashed");
+    write_raw_hashed_archive(
+        &mixed_entries_path,
+        &[
+            ("meta.json", &meta_bytes),
+            (ENCRYPTED_TREE_ENTRY, &ciphertext),
+            ("tree.json", b"{}"),
+            ("hash.sha256", valid_hash.as_bytes()),
+        ],
+    );
+    assert!(matches!(
+        FileManager::open_file_with_password(&mixed_entries_path, "correct-horse-battery-staple"),
+        Err(BulkHashError::FileIsCorrupted(_))
+    ));
+
+    // 5b. Unencrypted v3 archive containing stray `tree.enc` -> FileIsCorrupted
+    let plain_meta_bytes = serde_json::to_vec(&meta).expect("plain meta");
+    let plain_tree_bytes = serde_json::to_vec(&tree).expect("plain tree");
+    let plain_hash = HashAlgorithm::Sha256.get_hash_from_bytes(&plain_tree_bytes);
+    let stray_enc_path = dir.path().join("plain_with_stray_enc.hashed");
+    write_raw_hashed_archive(
+        &stray_enc_path,
+        &[
+            ("meta.json", &plain_meta_bytes),
+            ("tree.json", &plain_tree_bytes),
+            (ENCRYPTED_TREE_ENTRY, &ciphertext),
+            ("hash.sha256", plain_hash.as_bytes()),
+        ],
+    );
+    assert!(matches!(
+        FileManager::open_file(&stray_enc_path),
+        Err(BulkHashError::FileIsCorrupted(_))
+    ));
+
+    // 5c. Format v2 archive claiming encryption -> FileIsCorrupted (both inspect and open)
+    let mut v2_enc_meta: serde_json::Value =
+        serde_json::from_slice(&meta_bytes).expect("parse meta");
+    v2_enc_meta["version"] = serde_json::Value::from(FORMAT_VERSION_V2);
+    let v2_enc_meta_bytes = serde_json::to_vec(&v2_enc_meta).expect("serialize v2 enc meta");
+    let v2_enc_path = dir.path().join("invalid_v2_encrypted.hashed");
+    write_raw_hashed_archive(
+        &v2_enc_path,
+        &[
+            ("meta.json", &v2_enc_meta_bytes),
+            (ENCRYPTED_TREE_ENTRY, &ciphertext),
+            ("hash.sha256", valid_hash.as_bytes()),
+        ],
+    );
+    assert!(matches!(
+        FileManager::inspect_version(&v2_enc_path),
+        Err(BulkHashError::FileIsCorrupted(_))
+    ));
+    assert!(matches!(
+        FileManager::open_file_with_password(&v2_enc_path, "correct-horse-battery-staple"),
+        Err(BulkHashError::FileIsCorrupted(_))
+    ));
+
+    // 5d. Encrypted v3 archive missing `tree.enc` -> FileIsCorrupted
+    let missing_ct_path = dir.path().join("missing_tree_enc.hashed");
+    write_raw_hashed_archive(
+        &missing_ct_path,
+        &[
+            ("meta.json", &meta_bytes),
+            ("hash.sha256", valid_hash.as_bytes()),
+        ],
+    );
+    assert!(matches!(
+        FileManager::open_file_with_password(&missing_ct_path, "correct-horse-battery-staple"),
+        Err(BulkHashError::FileIsCorrupted(_))
+    ));
+}
+
+#[test]
+fn encryption_parameter_validation_dos_bounds_and_error_serialization() {
+    let dir = TempDir::new("enc_validation");
+
+    // 1. Empty password rejected at option creation
+    assert!(matches!(
+        EncryptionOptions::new(""),
+        Err(BulkHashError::EmptyPassword)
+    ));
+
+    // 2. KDF preset sanity + custom boundary validation
+    assert!(KdfParams::standard().validate().is_ok());
+    assert!(KdfParams::interactive().validate().is_ok());
+    assert!(KdfParams::high().validate().is_ok());
+
+    for invalid_case in [
+        (0, 1, 1),
+        (32, 1, 1),
+        (MAX_KDF_MEMORY_KIB + 1, 1, 1),
+        (u32::MAX, 1, 1),
+        (64, 0, 1),
+        (64, MAX_KDF_ITERATIONS + 1, 1),
+        (64, 1, 0),
+        (64, 1, MAX_KDF_PARALLELISM + 1),
+        (64, 1, 16), // 64 < 8 * 16 (128)
+    ] {
+        let err = KdfParams::new(invalid_case.0, invalid_case.1, invalid_case.2)
+            .expect_err("invalid KDF params must be rejected");
+        assert!(
+            matches!(err, BulkHashError::InvalidEncryptionParameters(_)),
+            "expected InvalidEncryptionParameters for {invalid_case:?}, got {err:?}"
+        );
+    }
+
+    // 3. Crafted DoS / malformed encryption headers in `.hashed` archives are rejected immediately
+    // BEFORE running Argon2id (zero OOM / hang risk)
+    let ts = Utc::now().to_rfc3339();
+    let valid_salt_b64 = "AAAAAAAAAAAAAAAAAAAAAA=="; // 16 zero bytes
+    let valid_nonce_b64 = "AAAAAAAAAAAAAAAA"; // 12 zero bytes
+    let dummy_ct = [0u8; 32];
+    let dummy_hash = HashAlgorithm::Sha256.get_hash_from_bytes(&dummy_ct);
+
+    let malformed_headers = [
+        // OOM DoS: 4 TiB Argon2 memory request
+        serde_json::json!({
+            "cipher": "aes-256-gcm",
+            "kdf": "argon2id",
+            "kdf_params": { "memory_kib": 4_000_000_000u32, "iterations": 3, "parallelism": 1 },
+            "salt": valid_salt_b64,
+            "nonce": valid_nonce_b64,
+            "payload_compression": "deflate"
+        }),
+        // CPU DoS: 1,000,000 iterations
+        serde_json::json!({
+            "cipher": "aes-256-gcm",
+            "kdf": "argon2id",
+            "kdf_params": { "memory_kib": 64, "iterations": 1_000_000, "parallelism": 1 },
+            "salt": valid_salt_b64,
+            "nonce": valid_nonce_b64
+        }),
+        // Salt too short (8 bytes)
+        serde_json::json!({
+            "cipher": "aes-256-gcm",
+            "kdf": "argon2id",
+            "kdf_params": { "memory_kib": 64, "iterations": 1, "parallelism": 1 },
+            "salt": "AAAAAAAAAAA=",
+            "nonce": valid_nonce_b64
+        }),
+        // Nonce wrong length (16 bytes instead of 12)
+        serde_json::json!({
+            "cipher": "aes-256-gcm",
+            "kdf": "argon2id",
+            "kdf_params": { "memory_kib": 64, "iterations": 1, "parallelism": 1 },
+            "salt": valid_salt_b64,
+            "nonce": valid_salt_b64
+        }),
+        // Invalid Base64
+        serde_json::json!({
+            "cipher": "aes-256-gcm",
+            "kdf": "argon2id",
+            "kdf_params": { "memory_kib": 64, "iterations": 1, "parallelism": 1 },
+            "salt": "!!!not-base64!!!",
+            "nonce": valid_nonce_b64
+        }),
+        // Unsupported cipher
+        serde_json::json!({
+            "cipher": "chacha20-poly1305",
+            "kdf": "argon2id",
+            "kdf_params": { "memory_kib": 64, "iterations": 1, "parallelism": 1 },
+            "salt": valid_salt_b64,
+            "nonce": valid_nonce_b64
+        }),
+        // Unsupported KDF
+        serde_json::json!({
+            "cipher": "aes-256-gcm",
+            "kdf": "scrypt",
+            "kdf_params": { "memory_kib": 64, "iterations": 1, "parallelism": 1 },
+            "salt": valid_salt_b64,
+            "nonce": valid_nonce_b64
+        }),
+    ];
+
+    for (idx, bad_enc) in malformed_headers.iter().enumerate() {
+        let crafted_meta = serde_json::json!({
+            "version": FORMAT_VERSION_V3,
+            "files_hashed": 1,
+            "hash_time": { "secs": 0, "nanos": 1 },
+            "date_utc": ts,
+            "local_time": "2026-01-01T00:00:00Z",
+            "os": "linux",
+            "encryption": bad_enc
+        });
+        let crafted_meta_bytes = serde_json::to_vec(&crafted_meta).expect("serialize crafted meta");
+        let path = dir.path().join(format!("crafted_enc_{idx}.hashed"));
+        write_raw_hashed_archive(
+            &path,
+            &[
+                ("meta.json", &crafted_meta_bytes),
+                (ENCRYPTED_TREE_ENTRY, &dummy_ct),
+                ("hash.sha256", dummy_hash.as_bytes()),
+            ],
+        );
+
+        assert!(
+            matches!(
+                FileManager::inspect_version(&path),
+                Err(BulkHashError::InvalidEncryptionParameters(_))
+            ),
+            "inspect_version must reject malformed header case {idx}"
+        );
+        assert!(
+            matches!(
+                FileManager::open_file_with_password(&path, "any-password"),
+                Err(BulkHashError::InvalidEncryptionParameters(_))
+            ),
+            "open_file_with_password must reject malformed header case {idx}"
+        );
+    }
+
+    // 4. All new BulkHashError encryption variants serialize cleanly for GUI IPC
+    let gui_errors = [
+        (
+            BulkHashError::PasswordRequired(String::from("/tmp/vault.hashed")),
+            "PasswordRequired",
+        ),
+        (BulkHashError::EmptyPassword, "EmptyPassword"),
+        (
+            BulkHashError::DecryptionFailed(String::from("/tmp/vault.hashed")),
+            "DecryptionFailed",
+        ),
+        (
+            BulkHashError::EncryptionFailed(String::from("rng unavailable")),
+            "EncryptionFailed",
+        ),
+        (
+            BulkHashError::InvalidEncryptionParameters(String::from("bad salt")),
+            "InvalidEncryptionParameters",
+        ),
+        (
+            BulkHashError::SnapshotNotEncrypted(String::from("/tmp/plain.hashed")),
+            "SnapshotNotEncrypted",
+        ),
+    ];
+
+    for (err, expected_kind) in gui_errors {
+        assert_eq!(err.kind(), expected_kind);
+        let json = serde_json::to_value(&err).expect("serialize error");
+        assert_eq!(json["kind"], expected_kind);
+        assert!(
+            json["message"]
+                .as_str()
+                .is_some_and(|msg| !msg.is_empty()),
+            "error message for {expected_kind} must be non-empty"
+        );
+    }
+}
+
+#[test]
+fn encrypt_decrypt_reencrypt_files_and_v2_to_v3_migration() {
+    let dir = TempDir::new("enc_lifecycle");
+    let ts = DateTime::from_timestamp(1_766_000_000, 0).expect("valid ts");
+    let fast_kdf = fast_test_kdf_params();
+
+    // 1. Seed a legacy v2 unencrypted snapshot on disk
+    let v2_path = dir.path().join("snapshot_v2.hashed");
+    let v2_tree = serde_json::json!({
+        "name": "/workspace/app",
+        "files": {
+            "Cargo.toml": { "hash": "aaaa1111", "size": 512, "modified_utc": ts.to_rfc3339() }
+        },
+        "sub_directories": {
+            "src": {
+                "name": "src",
+                "files": {
+                    "lib.rs": { "hash": "bbbb2222", "size": 1024, "modified_utc": ts.to_rfc3339() }
+                },
+                "sub_directories": {}
+            }
+        }
+    });
+    let v2_tree_bytes = serde_json::to_vec(&v2_tree).expect("serialize v2 tree");
+    let v2_tree_hash = HashAlgorithm::Sha256.get_hash_from_bytes(&v2_tree_bytes);
+    let v2_meta = serde_json::json!({
+        "version": FORMAT_VERSION_V2,
+        "files_hashed": 2,
+        "hash_time": { "secs": 1, "nanos": 0 },
+        "date_utc": ts.to_rfc3339(),
+        "local_time": "2026-01-01T10:00:00Z",
+        "os": "linux",
+        "algorithm": "Blake3",
+        "total_size": 1536
+    });
+    let v2_meta_bytes = serde_json::to_vec(&v2_meta).expect("serialize v2 meta");
+    write_raw_hashed_archive(
+        &v2_path,
+        &[
+            ("meta.json", &v2_meta_bytes),
+            ("tree.json", &v2_tree_bytes),
+            ("hash.sha256", v2_tree_hash.as_bytes()),
+        ],
+    );
+
+    // 1a. Verify direct v2 -> v3 in-memory and in-place migration with .v2.bak backup
+    let v2_copy = dir.path().join("v2_for_inplace.hashed");
+    fs::copy(&v2_path, &v2_copy).expect("copy v2");
+    let v2_mig_report =
+        FileManager::migrate_file_in_place(&v2_copy, true).expect("migrate v2 -> v3 in place");
+    assert!(v2_mig_report.was_migrated());
+    assert_eq!(v2_mig_report.original_version(), FORMAT_VERSION_V2);
+    assert_eq!(v2_mig_report.target_version(), FORMAT_VERSION_V3);
+    assert_eq!(v2_mig_report.steps().len(), 1);
+    assert!(
+        v2_mig_report
+            .backup_path()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with(".v2.bak"))
+    );
+    let loaded_v3_from_v2 = FileManager::open_file(&v2_copy).expect("open migrated v3");
+    assert!(!loaded_v3_from_v2.was_migrated());
+    assert_eq!(
+        loaded_v3_from_v2.get_meta().get_migrated_from(),
+        Some(FORMAT_VERSION_V2)
+    );
+    assert_eq!(loaded_v3_from_v2.get_meta().get_total_size(), Some(1536));
+
+    // 2. Out-of-place `encrypt_file` on legacy v2 upgrades v2 -> v3 AND encrypts atomically!
+    let opts_v1 = EncryptionOptions::new("initial-secret-1")
+        .expect("opts")
+        .with_kdf_params(fast_kdf)
+        .expect("kdf");
+    let encrypted_path = dir.path().join("encrypted.hashed");
+    let enc_report = FileManager::encrypt_file(&v2_path, &encrypted_path, &opts_v1)
+        .expect("encrypt_file v2 -> encrypted v3");
+    assert!(enc_report.was_migrated());
+    assert_eq!(enc_report.original_version(), FORMAT_VERSION_V2);
+    assert_eq!(enc_report.target_version(), FORMAT_VERSION_V3);
+    assert!(FileManager::is_encrypted(&encrypted_path).expect("encrypted check"));
+
+    let unlocked = FileManager::open_file_with_password(&encrypted_path, "initial-secret-1")
+        .expect("unlock encrypted file");
+    assert!(unlocked.is_encrypted());
+    assert_eq!(unlocked.get_meta().get_migrated_from(), Some(FORMAT_VERSION_V2));
+    assert_eq!(unlocked.get_tree().hashed_file_count(), 2);
+
+    // Encrypting an already-encrypted archive fails with PasswordRequired
+    assert!(matches!(
+        FileManager::encrypt_file(&encrypted_path, dir.path().join("dup.hashed"), &opts_v1),
+        Err(BulkHashError::PasswordRequired(_))
+    ));
+
+    // 3. Password rotation via in-place `reencrypt_file` (also changing compression mode)
+    let before_rot_enc = FileManager::inspect_version(&encrypted_path)
+        .expect("inspect before rotation")
+        .encryption()
+        .cloned()
+        .expect("enc before rotation");
+    let opts_v2 = EncryptionOptions::new("rotated-secret-2")
+        .expect("opts2")
+        .with_kdf_params(KdfParams::new(128, 2, 1).expect("kdf2"))
+        .expect("kdf2")
+        .with_payload_compression(PayloadCompression::None);
+
+    // Wrong current password must fail and leave the file intact
+    assert!(matches!(
+        FileManager::reencrypt_file(&encrypted_path, &encrypted_path, "wrong-current", &opts_v2),
+        Err(BulkHashError::DecryptionFailed(_))
+    ));
+    assert!(FileManager::open_file_with_password(&encrypted_path, "initial-secret-1").is_ok());
+
+    // Valid in-place rotation
+    let rot_report = FileManager::reencrypt_file(
+        &encrypted_path,
+        &encrypted_path,
+        "initial-secret-1",
+        &opts_v2,
+    )
+    .expect("in-place reencrypt_file");
+    assert!(!rot_report.was_migrated());
+
+    let after_rot_enc = FileManager::inspect_version(&encrypted_path)
+        .expect("inspect after rotation")
+        .encryption()
+        .cloned()
+        .expect("enc after rotation");
+    assert_ne!(before_rot_enc.salt, after_rot_enc.salt);
+    assert_ne!(before_rot_enc.nonce, after_rot_enc.nonce);
+    assert_eq!(after_rot_enc.payload_compression, PayloadCompression::None);
+    assert_eq!(after_rot_enc.kdf_params.memory_kib, 128);
+
+    // Old password no longer works; new password unlocks identically
+    assert!(matches!(
+        FileManager::open_file_with_password(&encrypted_path, "initial-secret-1"),
+        Err(BulkHashError::DecryptionFailed(_))
+    ));
+    let unlocked_rotated =
+        FileManager::open_file_with_password(&encrypted_path, "rotated-secret-2")
+            .expect("unlock with rotated password");
+    assert_eq!(unlocked_rotated.get_tree(), unlocked.get_tree());
+    assert_eq!(unlocked_rotated.get_hash(), unlocked.get_hash());
+
+    // 4. Password-aware `migrate_file_with_password` preserves encryption with fresh salt/nonce
+    let mig_copy_path = dir.path().join("migrated_encrypted_copy.hashed");
+    assert!(matches!(
+        FileManager::migrate_file(&encrypted_path, &mig_copy_path),
+        Err(BulkHashError::PasswordRequired(_))
+    ));
+    let copy_mig_report = FileManager::migrate_file_with_password(
+        &encrypted_path,
+        &mig_copy_path,
+        Some("rotated-secret-2"),
+    )
+    .expect("migrate_file_with_password copy");
+    assert!(!copy_mig_report.was_migrated());
+    let copy_info = FileManager::inspect_version(&mig_copy_path).expect("inspect copy");
+    assert!(copy_info.is_encrypted());
+    let copy_enc = copy_info.encryption().expect("copy enc");
+    assert_ne!(copy_enc.salt, after_rot_enc.salt);
+    assert_ne!(copy_enc.nonce, after_rot_enc.nonce);
+    assert_eq!(copy_enc.kdf_params, after_rot_enc.kdf_params);
+    assert_eq!(copy_enc.payload_compression, after_rot_enc.payload_compression);
+
+    let inplace_enc_report = FileManager::migrate_file_in_place_with_password(
+        &encrypted_path,
+        true,
+        Some("rotated-secret-2"),
+    )
+    .expect("in-place migrate on current encrypted v3 is no-op");
+    assert!(!inplace_enc_report.was_migrated());
+    assert!(inplace_enc_report.backup_path().is_none());
+
+    // 5. In-place `decrypt_file` converts back to unencrypted v3 cleanly
+    let decrypted_path = dir.path().join("decrypted.hashed");
+    assert!(matches!(
+        FileManager::decrypt_file(&encrypted_path, &decrypted_path, "wrong-pw"),
+        Err(BulkHashError::DecryptionFailed(_))
+    ));
+    assert!(!decrypted_path.exists());
+
+    FileManager::decrypt_file(&encrypted_path, &encrypted_path, "rotated-secret-2")
+        .expect("in-place decrypt_file");
+    assert!(!FileManager::is_encrypted(&encrypted_path).expect("now unencrypted"));
+    let loaded_plain =
+        FileManager::open_file(&encrypted_path).expect("open decrypted snapshot without password");
+    assert!(!loaded_plain.is_encrypted());
+    assert_eq!(loaded_plain.get_tree(), unlocked.get_tree());
+    assert_eq!(loaded_plain.get_hash(), unlocked.get_hash());
+
+    // Calling decrypt_file or reencrypt_file on an unencrypted archive fails with SnapshotNotEncrypted
+    assert!(matches!(
+        FileManager::decrypt_file(&encrypted_path, &decrypted_path, "any"),
+        Err(BulkHashError::SnapshotNotEncrypted(_))
+    ));
+    assert!(matches!(
+        FileManager::reencrypt_file(&encrypted_path, &decrypted_path, "any", &opts_v1),
+        Err(BulkHashError::SnapshotNotEncrypted(_))
+    ));
+
+    // In-place `encrypt_file` on an unencrypted v3 archive also succeeds cleanly
+    FileManager::encrypt_file(&encrypted_path, &encrypted_path, &opts_v1)
+        .expect("in-place encrypt_file");
+    assert!(FileManager::is_encrypted(&encrypted_path).expect("encrypted again"));
+    assert_eq!(
+        FileManager::open_file_with_password(&encrypted_path, "initial-secret-1")
+            .expect("unlock after in-place encrypt")
+            .get_tree(),
+        unlocked.get_tree()
+    );
+}
+
+#[test]
+fn low_level_encryption_aad_and_decompression_bomb_limits() {
+    let fast_kdf = fast_test_kdf_params();
+    let deflate_opts = EncryptionOptions::new("bomb-test-pw")
+        .expect("opts")
+        .with_kdf_params(fast_kdf)
+        .expect("kdf")
+        .with_payload_compression(PayloadCompression::Deflate);
+    let enc_meta = EncryptionMetadata::generate(fast_kdf, PayloadCompression::Deflate)
+        .expect("generate metadata");
+
+    let aad = build_tree_aad(FORMAT_VERSION_V3, br#"{"version":3}"#);
+    let wrong_aad = build_tree_aad(FORMAT_VERSION_V3, br#"{"version":4}"#);
+
+    // Highly compressible 100 KiB payload (compresses to ~150 bytes!)
+    let large_repetitive = vec![b'A'; 100_000];
+    let ct = encrypt_tree_payload(&large_repetitive, &deflate_opts, &enc_meta, &aad)
+        .expect("encrypt repetitive payload");
+    assert!(ct.len() < 1024, "ciphertext should be compact when deflated");
+
+    // Wrong AAD must fail authentication
+    let aad_err = decrypt_tree_payload(&ct, "bomb-test-pw", &enc_meta, &wrong_aad, 200_000, "test")
+        .expect_err("wrong AAD must fail");
+    assert!(matches!(aad_err, BulkHashError::DecryptionFailed(_)));
+
+    // Tight max_plaintext_bytes cap MUST abort decompression cleanly (decompression bomb defense)
+    let bomb_err = decrypt_tree_payload(&ct, "bomb-test-pw", &enc_meta, &aad, 1024, "test")
+        .expect_err("decompression exceeding max_plaintext_bytes must fail");
+    assert!(matches!(bomb_err, BulkHashError::FileIsCorrupted(_)));
+
+    // Within limit succeeds and matches byte-for-byte
+    let restored = decrypt_tree_payload(&ct, "bomb-test-pw", &enc_meta, &aad, 100_000, "test")
+        .expect("decryption within exact limit must succeed");
+    assert_eq!(restored.as_slice(), large_repetitive.as_slice());
+
+    // Uncompressed mode also enforces max_plaintext_bytes
+    let raw_opts = EncryptionOptions::new("bomb-test-pw")
+        .expect("opts")
+        .with_kdf_params(fast_kdf)
+        .expect("kdf")
+        .with_payload_compression(PayloadCompression::None);
+    let raw_meta =
+        EncryptionMetadata::generate(fast_kdf, PayloadCompression::None).expect("raw meta");
+    let raw_ct = encrypt_tree_payload(&[b'B'; 2048], &raw_opts, &raw_meta, &aad)
+        .expect("encrypt raw payload");
+    assert!(matches!(
+        decrypt_tree_payload(&raw_ct, "bomb-test-pw", &raw_meta, &aad, 1024, "test"),
+        Err(BulkHashError::FileIsCorrupted(_))
     ));
 }

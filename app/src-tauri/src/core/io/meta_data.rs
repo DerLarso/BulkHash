@@ -1,6 +1,7 @@
 use crate::core::hash_manager::HashAlgorithm;
 use crate::core::hidden_filter::HiddenFileFilter;
 use crate::core::ignore_list::IgnoreList;
+use crate::core::io::encryption::EncryptionMetadata;
 use crate::core::io::migration::CURRENT_FORMAT_VERSION;
 use chrono::{DateTime, Local, SecondsFormat, Utc};
 use std::time::Duration;
@@ -23,6 +24,8 @@ pub struct MetaData {
     total_size: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     migrated_from: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    encryption: Option<EncryptionMetadata>,
 }
 
 impl MetaData {
@@ -41,6 +44,7 @@ impl MetaData {
             hidden_filter: None,
             total_size: None,
             migrated_from: None,
+            encryption: None,
         }
     }
 
@@ -72,6 +76,14 @@ impl MetaData {
         self
     }
 
+    pub(crate) fn with_encryption_metadata(
+        mut self,
+        encryption: Option<EncryptionMetadata>,
+    ) -> Self {
+        self.encryption = encryption;
+        self
+    }
+
     pub fn get_algorithm(&self) -> Option<HashAlgorithm> {
         self.algorithm
     }
@@ -93,6 +105,16 @@ impl MetaData {
     #[must_use]
     pub const fn get_migrated_from(&self) -> Option<usize> {
         self.migrated_from
+    }
+
+    #[must_use]
+    pub const fn is_encrypted(&self) -> bool {
+        self.encryption.is_some()
+    }
+
+    #[must_use]
+    pub const fn get_encryption(&self) -> Option<&EncryptionMetadata> {
+        self.encryption.as_ref()
     }
 
     pub fn get_local_time(&self) -> &str {

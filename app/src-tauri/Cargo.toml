@@ -29,5 +29,11 @@ blake3 = "1.8.7"
 xxhash-rust = { version = "0.8.21", features = ["xxh3", "xxh64"] }
 rayon = "1.12.0"
 zip = "9.8.2"
-chrono = {version = "0.4.45", features = ["serde"] }
+chrono = { version = "0.4.45", features = ["serde"] }
+aes-gcm = { version = "0.11", features = ["zeroize"] }
+argon2 = { version = "0.6", features = ["zeroize", "parallel"] }
+base64 = "0.22"
+flate2 = "1.1"
+getrandom = "0.4"
+zeroize = "1.9"
 

@@ -1,5 +1,6 @@
 use crate::core::io::{
-    directory_node::DirectoryNode, meta_data::MetaData, migration::MigrationReport,
+    directory_node::DirectoryNode, encryption::EncryptionMetadata, meta_data::MetaData,
+    migration::MigrationReport,
 };
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -60,5 +61,15 @@ impl BulkHashFileStruct {
         self.migration
             .as_ref()
             .map_or_else(|| self.meta.get_version(), MigrationReport::original_version)
+    }
+
+    #[must_use]
+    pub const fn is_encrypted(&self) -> bool {
+        self.meta.is_encrypted()
+    }
+
+    #[must_use]
+    pub const fn get_encryption(&self) -> Option<&EncryptionMetadata> {
+        self.meta.get_encryption()
     }
 }

@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Local, SecondsFormat, Utc};
 use serde_json::{Map, Value};
 
-use crate::core::io::bulk_hash_error::BulkHashError;
+use crate::core::io::{
+    bulk_hash_error::BulkHashError,
+    encryption::{ENCRYPTED_TREE_ENTRY, EncryptionMetadata},
+};
 
 /// Lowest `.hashed` format version that this version of `BulkHash` can read and migrate.
 pub const MIN_SUPPORTED_FORMAT_VERSION: usize = 1;
@@ -18,17 +21,42 @@ pub const FORMAT_VERSION_V1: usize = 1;
 /// `migrated_from` provenance in `meta.json`).
 pub const FORMAT_VERSION_V2: usize = 2;
 
+/// Encryption-capable `.hashed` format version supporting optional AES-256-GCM + Argon2id
+/// snapshot protection (`meta.json` with optional `encryption` header, `tree.enc` when encrypted
+/// or `tree.json` when unencrypted, plus `hash.sha256`).
+pub const FORMAT_VERSION_V3: usize = 3;
+
 /// Latest `.hashed` format version produced when saving or migrating snapshots.
-pub const CURRENT_FORMAT_VERSION: usize = FORMAT_VERSION_V2;
+pub const CURRENT_FORMAT_VERSION: usize = FORMAT_VERSION_V3;
 
-const V1_V2_REQUIRED_ENTRIES: &[&str] = &["meta.json", "hash.sha256", "tree.json"];
+const UNENCRYPTED_REQUIRED_ENTRIES: &[&str] = &["meta.json", "hash.sha256", "tree.json"];
+const V3_ENCRYPTED_REQUIRED_ENTRIES: &[&str] = &["meta.json", "hash.sha256", ENCRYPTED_TREE_ENTRY];
 
-/// Returns the required ZIP archive entries for a known `.hashed` format version,
+/// Returns whether a `.hashed` format version supports snapshot encryption.
+#[must_use]
+pub const fn supports_encryption(version: usize) -> bool {
+    version >= FORMAT_VERSION_V3
+}
+
+/// Returns the required ZIP archive entries for an unencrypted `.hashed` format version,
 /// or `None` if the version is unknown to this build.
 #[must_use]
 pub const fn required_entries_for_version(version: usize) -> Option<&'static [&'static str]> {
-    match version {
-        FORMAT_VERSION_V1 | FORMAT_VERSION_V2 => Some(V1_V2_REQUIRED_ENTRIES),
+    required_entries_for_archive(version, false)
+}
+
+/// Returns the required ZIP archive entries for a known `.hashed` format version and
+/// encryption state, or `None` if the combination is not supported by this build.
+#[must_use]
+pub const fn required_entries_for_archive(
+    version: usize,
+    encrypted: bool,
+) -> Option<&'static [&'static str]> {
+    match (version, encrypted) {
+        (FORMAT_VERSION_V1 | FORMAT_VERSION_V2 | FORMAT_VERSION_V3, false) => {
+            Some(UNENCRYPTED_REQUIRED_ENTRIES)
+        }
+        (FORMAT_VERSION_V3, true) => Some(V3_ENCRYPTED_REQUIRED_ENTRIES),
         _ => None,
     }
 }
@@ -103,13 +131,16 @@ impl VersionCompatibility {
     }
 }
 
-/// Lightweight version and structure probe returned by inspecting a `.hashed` archive
-/// without reading or deserializing `tree.json`.
+/// Lightweight version, encryption, and structure probe returned by inspecting a `.hashed`
+/// archive without reading or decrypting `tree.json` / `tree.enc`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ArchiveVersionInfo {
     pub version: usize,
     pub current_version: usize,
     pub compatibility: VersionCompatibility,
+    pub encrypted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption: Option<EncryptionMetadata>,
     pub entries: Vec<String>,
 }
 
@@ -127,6 +158,16 @@ impl ArchiveVersionInfo {
     #[must_use]
     pub const fn needs_migration(&self) -> bool {
         self.compatibility.needs_migration()
+    }
+
+    #[must_use]
+    pub const fn is_encrypted(&self) -> bool {
+        self.encrypted
+    }
+
+    #[must_use]
+    pub const fn encryption(&self) -> Option<&EncryptionMetadata> {
+        self.encryption.as_ref()
     }
 }
 
@@ -272,6 +313,7 @@ impl MigrationRegistry {
         let mut registry = Self::new(MIN_SUPPORTED_FORMAT_VERSION, CURRENT_FORMAT_VERSION);
         // Built-in chain invariants are verified by unit tests; registration cannot fail here.
         let _ = registry.register(Box::new(V1ToV2Migration));
+        let _ = registry.register(Box::new(V2ToV3Migration));
         registry
     }
 
@@ -772,6 +814,81 @@ fn v1_to_v2_err(reason: impl Into<String>) -> BulkHashError {
     BulkHashError::MigrationFailed {
         from_version: FORMAT_VERSION_V1,
         to_version: FORMAT_VERSION_V2,
+        reason: reason.into(),
+    }
+}
+
+/// Built-in migration upgrading `.hashed` snapshots from format v2 to format v3.
+///
+/// Transformations performed:
+/// - Validates that `meta.json` and `tree.json` are well-formed JSON objects and that the v2
+///   archive does not carry an invalid pre-v3 `encryption` header.
+/// - Advances `meta.version` from `2` to `3` while preserving any earlier `migrated_from`
+///   provenance (e.g. `1` across a `v1 -> v2 -> v3` chain) or recording `migrated_from = 2`.
+pub struct V2ToV3Migration;
+
+impl FormatMigration for V2ToV3Migration {
+    fn source_version(&self) -> usize {
+        FORMAT_VERSION_V2
+    }
+
+    fn target_version(&self) -> usize {
+        FORMAT_VERSION_V3
+    }
+
+    fn description(&self) -> &'static str {
+        "Upgrade .hashed snapshot from v2 to v3 (encryption-capable format schema)"
+    }
+
+    fn migrate(&self, payload: &mut SnapshotPayload) -> Result<Vec<String>, BulkHashError> {
+        let tree_obj = payload
+            .tree
+            .as_object()
+            .ok_or_else(|| v2_to_v3_err("root node in 'tree.json' must be a JSON object"))?;
+        if !matches!(tree_obj.get("name"), Some(Value::String(_))) {
+            return Err(v2_to_v3_err(
+                "root node in 'tree.json' is missing a valid string 'name' field",
+            ));
+        }
+
+        let meta_obj = payload
+            .meta
+            .as_object_mut()
+            .ok_or_else(|| v2_to_v3_err("metadata must be a JSON object"))?;
+
+        if meta_obj
+            .get("encryption")
+            .is_some_and(|val| !val.is_null())
+        {
+            return Err(v2_to_v3_err(
+                "format v2 snapshots cannot contain an 'encryption' header",
+            ));
+        }
+
+        meta_obj.insert(
+            String::from("version"),
+            Value::from(FORMAT_VERSION_V3 as u64),
+        );
+        let has_provenance = meta_obj
+            .get("migrated_from")
+            .is_some_and(|val| !val.is_null());
+        if !has_provenance {
+            meta_obj.insert(
+                String::from("migrated_from"),
+                Value::from(FORMAT_VERSION_V2 as u64),
+            );
+        }
+
+        Ok(vec![String::from(
+            "Upgraded unencrypted v2 snapshot metadata to format v3",
+        )])
+    }
+}
+
+fn v2_to_v3_err(reason: impl Into<String>) -> BulkHashError {
+    BulkHashError::MigrationFailed {
+        from_version: FORMAT_VERSION_V2,
+        to_version: FORMAT_VERSION_V3,
         reason: reason.into(),
     }
 }

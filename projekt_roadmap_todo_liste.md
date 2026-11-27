@@ -25,7 +25,7 @@ Backend - Dateiformat & IO (.hashed):
 	[#] Eigenes Error-Handling: Zentrale HashedError-Enum (Ausformulierte Display-Texte fehlen noch) ; Rust
 	[#] Erweiterte Datei-Metadaten: Speichern von Dateigröße und letztem Änderungsdatum pro Datei ; Rust
 	[#] Versions-Migration: Abwärtskompatibilität für zukünftige Versionen des .hashed-Formats ; Rust
-	[X] Snapshot-Verschlüsselung: Optionaler Passwortschutz (AES-GCM) für sensible Dateibäume ; Rust
+	[#] Snapshot-Verschlüsselung: Optionaler Passwortschutz (AES-GCM) für sensible Dateibäume ; Rust
 	[X] Snapshot-Komprimierungsgrad: Einstellbare ZIP-Kompressionsstärke (Schnell vs. Kleine Datei) ; Rust
 	[X] Die tree.json segmentieren für schnelleren zugriff und weniger ram Auslastung, wenn nicht der ganze Baum gebraucht wird ; Rust
 

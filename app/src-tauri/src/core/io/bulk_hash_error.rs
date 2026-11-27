@@ -26,6 +26,12 @@ pub enum BulkHashError {
         pattern: String,
         reason: String,
     },
+    PasswordRequired(String),
+    EmptyPassword,
+    DecryptionFailed(String),
+    EncryptionFailed(String),
+    InvalidEncryptionParameters(String),
+    SnapshotNotEncrypted(String),
     FileIsCorrupted(String),
     ScanCancelled,
     Io {
@@ -64,6 +70,12 @@ impl BulkHashError {
             Self::UnsupportedVersion(_) => "UnsupportedVersion",
             Self::MigrationFailed { .. } => "MigrationFailed",
             Self::InvalidIgnorePattern { .. } => "InvalidIgnorePattern",
+            Self::PasswordRequired(_) => "PasswordRequired",
+            Self::EmptyPassword => "EmptyPassword",
+            Self::DecryptionFailed(_) => "DecryptionFailed",
+            Self::EncryptionFailed(_) => "EncryptionFailed",
+            Self::InvalidEncryptionParameters(_) => "InvalidEncryptionParameters",
+            Self::SnapshotNotEncrypted(_) => "SnapshotNotEncrypted",
             Self::FileIsCorrupted(_) => "FileIsCorrupted",
             Self::ScanCancelled => "ScanCancelled",
             Self::Io { .. } => "Io",
@@ -76,6 +88,10 @@ impl BulkHashError {
 
     pub const fn is_cancelled(&self) -> bool {
         matches!(self, Self::ScanCancelled)
+    }
+
+    pub const fn is_password_required(&self) -> bool {
+        matches!(self, Self::PasswordRequired(_))
     }
 }
 
@@ -113,6 +129,21 @@ impl fmt::Display for BulkHashError {
             Self::InvalidIgnorePattern { pattern, reason } => {
                 write!(f, "Invalid ignore pattern '{pattern}': {reason}")
             }
+            Self::PasswordRequired(path) => {
+                write!(f, "Snapshot is encrypted and requires a password: {path}")
+            }
+            Self::EmptyPassword => write!(f, "Password must not be empty"),
+            Self::DecryptionFailed(path) => {
+                write!(
+                    f,
+                    "Failed to decrypt snapshot '{path}': wrong password or tampered data"
+                )
+            }
+            Self::EncryptionFailed(reason) => write!(f, "Failed to encrypt snapshot: {reason}"),
+            Self::InvalidEncryptionParameters(reason) => {
+                write!(f, "Invalid encryption parameters: {reason}")
+            }
+            Self::SnapshotNotEncrypted(path) => write!(f, "Snapshot is not encrypted: {path}"),
             Self::FileIsCorrupted(file) => write!(f, "File is corrupted: {file}"),
             Self::ScanCancelled => write!(f, "Scan was cancelled"),
             Self::Io {
