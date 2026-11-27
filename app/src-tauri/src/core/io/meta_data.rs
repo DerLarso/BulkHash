@@ -1,4 +1,5 @@
 use crate::core::hash_manager::HashAlgorithm;
+use crate::core::hidden_filter::HiddenFileFilter;
 use crate::core::ignore_list::IgnoreList;
 use chrono::{DateTime, Local, SecondsFormat, Utc};
 use std::time::Duration;
@@ -15,6 +16,8 @@ pub struct MetaData {
     algorithm: Option<HashAlgorithm>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ignore_list: Option<IgnoreList>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hidden_filter: Option<HiddenFileFilter>,
 }
 
 impl MetaData {
@@ -30,6 +33,7 @@ impl MetaData {
             os: std::env::consts::OS.to_string(),
             algorithm: None,
             ignore_list: None,
+            hidden_filter: None,
         }
     }
 
@@ -43,12 +47,23 @@ impl MetaData {
         self
     }
 
+    #[must_use]
+    pub fn with_hidden_filter(mut self, hidden_filter: HiddenFileFilter) -> Self {
+        self.hidden_filter = hidden_filter.is_active().then_some(hidden_filter);
+        self
+    }
+
     pub fn get_algorithm(&self) -> Option<HashAlgorithm> {
         self.algorithm
     }
 
     pub fn get_ignore_list(&self) -> Option<&IgnoreList> {
         self.ignore_list.as_ref()
+    }
+
+    #[must_use]
+    pub const fn get_hidden_filter(&self) -> Option<HiddenFileFilter> {
+        self.hidden_filter
     }
 
     pub fn get_local_time(&self) -> &str {

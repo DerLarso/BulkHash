@@ -15,7 +15,7 @@ Backend - Core & Hashing:
 	[#] Scan-Abbruchfunktion: Sicheres Stoppen eines laufenden Scan-Vorgangs über AtomicBool ; Rust
 	[#] Pause- & Fortsetzen-Funktion: Laufende Scans temporär pausieren und weiterführen ; Rust
 	[#] Ignore-Listen Support: Überspringen von Ordnern/Dateien per Muster (z. B. node_modules, .git) ; Rust
-	[X] Versteckte Dateien filtern: Option zum Ein- oder Ausschließen von Dotfiles/Systemdateien ; Rust
+	[#] Versteckte Dateien filtern: Option zum Ein- oder Ausschließen von Dotfiles/Systemdateien ; Rust
 
 Backend - Dateiformat & IO (.hashed):
 	[#] ZIP-Containerformat: Speichern und Laden von meta.json, tree.json und hash.sha256 ; Rust

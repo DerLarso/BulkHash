@@ -1,5 +1,9 @@
 use bulk_hash_lib::core::{
     hash_manager::{HashAlgorithm, HashManager},
+    hidden_filter::{
+        HiddenFileFilter, has_os_hidden_attribute, has_os_system_attribute, is_dotfile_name,
+        is_known_system_name,
+    },
     ignore_list::IgnoreList,
     io::{
         bulk_hash_error::BulkHashError, directory_node::DirectoryNode, file_manager::FileManager,
@@ -9,6 +13,7 @@ use bulk_hash_lib::core::{
     structs::file_info::FileInfo,
 };
 use chrono::Utc;
+use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -2458,4 +2463,558 @@ fn scan_manager_ignore_list_directory_pruning_and_snapshot_roundtrip() {
     assert_eq!(meta_empty_ignore.get_ignore_list(), None);
     let meta_json = serde_json::to_value(&meta_empty_ignore).expect("serialize meta");
     assert!(meta_json.get("ignore_list").is_none());
+}
+
+#[test]
+fn hidden_file_filter_presets_builders_matching_and_serde() {
+    // Default / include_all includes everything
+    let default_filter = HiddenFileFilter::default();
+    assert_eq!(default_filter, HiddenFileFilter::new());
+    assert_eq!(default_filter, HiddenFileFilter::include_all());
+    assert!(default_filter.includes_all());
+    assert!(!default_filter.is_active());
+    assert!(!default_filter.excludes_all());
+    assert!(!default_filter.excludes_dotfiles());
+    assert!(!default_filter.excludes_os_hidden());
+    assert!(!default_filter.excludes_system_files());
+
+    // Presets
+    let all = HiddenFileFilter::exclude_all();
+    assert!(all.is_active());
+    assert!(all.excludes_all());
+    assert!(!all.includes_all());
+    assert!(all.excludes_dotfiles());
+    assert!(all.excludes_os_hidden());
+    assert!(all.excludes_system_files());
+
+    let hidden_only = HiddenFileFilter::exclude_hidden();
+    assert!(hidden_only.is_active());
+    assert!(!hidden_only.excludes_all());
+    assert!(hidden_only.excludes_dotfiles());
+    assert!(hidden_only.excludes_os_hidden());
+    assert!(!hidden_only.excludes_system_files());
+
+    let dotfiles_only = HiddenFileFilter::exclude_dotfiles();
+    assert!(dotfiles_only.is_active());
+    assert!(dotfiles_only.excludes_dotfiles());
+    assert!(!dotfiles_only.excludes_os_hidden());
+    assert!(!dotfiles_only.excludes_system_files());
+
+    let system_only = HiddenFileFilter::exclude_system_files();
+    assert!(system_only.is_active());
+    assert!(!system_only.excludes_dotfiles());
+    assert!(!system_only.excludes_os_hidden());
+    assert!(system_only.excludes_system_files());
+
+    // Builders and mutable setters
+    let mut custom = HiddenFileFilter::new()
+        .with_exclude_dotfiles(true)
+        .with_exclude_os_hidden(false)
+        .with_exclude_system_files(true);
+    assert!(custom.excludes_dotfiles());
+    assert!(!custom.excludes_os_hidden());
+    assert!(custom.excludes_system_files());
+
+    custom.set_exclude_dotfiles(false);
+    custom.set_exclude_os_hidden(true);
+    custom.set_exclude_system_files(false);
+    assert!(!custom.excludes_dotfiles());
+    assert!(custom.excludes_os_hidden());
+    assert!(!custom.excludes_system_files());
+
+    // Dotfile name detection (including edge cases `.`, `..`, `..weird`, non-UTF-8 on Unix)
+    assert!(is_dotfile_name(OsStr::new(".env")));
+    assert!(is_dotfile_name(OsStr::new(".git")));
+    assert!(is_dotfile_name(OsStr::new(".DS_Store")));
+    assert!(is_dotfile_name(OsStr::new("..hidden")));
+    assert!(!is_dotfile_name(OsStr::new(".")));
+    assert!(!is_dotfile_name(OsStr::new("..")));
+    assert!(!is_dotfile_name(OsStr::new("")));
+    assert!(!is_dotfile_name(OsStr::new("normal.txt")));
+    assert!(!is_dotfile_name(OsStr::new("archive.tar.gz")));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        assert!(is_dotfile_name(OsStr::from_bytes(b".\xffhidden")));
+        assert!(!is_dotfile_name(OsStr::from_bytes(b"visible\xff")));
+        assert!(!is_known_system_name(OsStr::from_bytes(b"thumbs.db\xff")));
+    }
+
+    // Known OS system/metadata entry names (case-insensitive ASCII)
+    for name in [
+        "desktop.ini",
+        "DESKTOP.INI",
+        "Thumbs.db",
+        "thumbs.db",
+        "ehthumbs.db",
+        "ehthumbs_vista.db",
+        "$RECYCLE.BIN",
+        "System Volume Information",
+        "pagefile.sys",
+        "hiberfil.sys",
+        "swapfile.sys",
+        "NTUSER.DAT",
+        ".DS_Store",
+        ".AppleDouble",
+        ".Spotlight-V100",
+        ".Trashes",
+        ".fseventsd",
+        ".TemporaryItems",
+        "lost+found",
+        ".Trash",
+        ".Trash-1000",
+    ] {
+        assert!(
+            is_known_system_name(OsStr::new(name)),
+            "expected system name match for {name:?}"
+        );
+    }
+
+    for name in [
+        "normal.txt",
+        ".env",
+        ".gitignore",
+        ".git",
+        "my_thumbs.db",
+        ".Trash-",
+        ".Trash-abc",
+        "recycler",
+    ] {
+        assert!(
+            !is_known_system_name(OsStr::new(name)),
+            "did not expect system name match for {name:?}"
+        );
+    }
+
+    // Path-based helpers: is_hidden_entry, is_hidden_path, is_hidden_under
+    assert!(!default_filter.is_hidden_entry("/workspace/.env"));
+    assert!(!default_filter.is_hidden_path("/workspace/.git/HEAD"));
+    assert!(!default_filter.is_hidden_under("/workspace", "/workspace/.env"));
+
+    assert!(dotfiles_only.is_hidden_entry("/workspace/.env"));
+    assert!(!dotfiles_only.is_hidden_entry("/workspace/.git/HEAD"));
+    assert!(!dotfiles_only.is_hidden_entry("/workspace/Thumbs.db"));
+    assert!(dotfiles_only.is_hidden_path(".git/HEAD"));
+    assert!(dotfiles_only.is_hidden_path("./.env"));
+    assert!(dotfiles_only.is_hidden_path("../.secret/key"));
+    assert!(!dotfiles_only.is_hidden_path("./src/main.rs"));
+    assert!(!dotfiles_only.is_hidden_path("../docs/readme.md"));
+    assert!(!dotfiles_only.is_hidden_path("sub/Thumbs.db"));
+
+    assert!(system_only.is_hidden_entry("/workspace/Thumbs.db"));
+    assert!(system_only.is_hidden_entry("/workspace/.DS_Store"));
+    assert!(!system_only.is_hidden_entry("/workspace/.env"));
+    assert!(system_only.is_hidden_path("sub/desktop.ini"));
+    assert!(system_only.is_hidden_path("$RECYCLE.BIN/deleted.txt"));
+    assert!(system_only.is_hidden_path("lost+found/node"));
+    assert!(system_only.is_hidden_path(".Trash-1000/item.txt"));
+    assert!(!system_only.is_hidden_path(".git/HEAD"));
+    assert!(!system_only.is_hidden_path(".env"));
+
+    // Hidden directories *above* scan root must never exclude visible entries inside root
+    assert!(!all.is_hidden_under(
+        "/home/user/.config/myapp",
+        "/home/user/.config/myapp/settings.toml"
+    ));
+    assert!(!all.is_hidden_under("/home/user/.config/myapp", "/home/user/.config/myapp"));
+    assert!(all.is_hidden_under(
+        "/home/user/.config/myapp",
+        "/home/user/.config/myapp/.cache/blob.bin"
+    ));
+    assert!(all.is_hidden_under(
+        "/home/user/.config/myapp",
+        "/home/user/.config/myapp/sub/Thumbs.db"
+    ));
+
+    // OS attribute helpers on a normal file return false on Linux/non-attributed files
+    let dir = TempDir::new("hidden_attr_check");
+    let regular = dir.path().join("regular.txt");
+    fs::write(&regular, b"hello").expect("write regular file");
+    let regular_meta = fs::symlink_metadata(&regular).expect("metadata");
+    assert!(!has_os_hidden_attribute(&regular_meta));
+    assert!(!has_os_system_attribute(&regular_meta));
+
+    // Serde JSON roundtrip and partial deserialization with defaults
+    let json = serde_json::to_value(all).expect("serialize HiddenFileFilter");
+    assert_eq!(json["exclude_dotfiles"], true);
+    assert_eq!(json["exclude_os_hidden"], true);
+    assert_eq!(json["exclude_system_files"], true);
+    let restored: HiddenFileFilter = serde_json::from_value(json).expect("deserialize");
+    assert_eq!(restored, all);
+
+    let partial: HiddenFileFilter =
+        serde_json::from_value(serde_json::json!({ "exclude_dotfiles": true }))
+            .expect("deserialize partial");
+    assert_eq!(partial, HiddenFileFilter::exclude_dotfiles());
+
+    let empty_obj: HiddenFileFilter =
+        serde_json::from_value(serde_json::json!({})).expect("deserialize empty object");
+    assert_eq!(empty_obj, HiddenFileFilter::include_all());
+}
+
+#[test]
+fn scan_manager_hidden_file_filter_modes_pruning_and_root_inside_hidden_dir() {
+    let dir = TempDir::new("hidden_filter_modes");
+    let root = dir.path();
+
+    fs::create_dir_all(root.join("src")).expect("create src");
+    fs::create_dir_all(root.join("docs")).expect("create docs");
+    fs::create_dir_all(root.join(".git/objects/ab")).expect("create .git");
+    fs::create_dir_all(root.join("sub/.hidden_sub")).expect("create sub/.hidden_sub");
+    fs::create_dir_all(root.join("System Volume Information")).expect("create SVI");
+    fs::create_dir_all(root.join("lost+found")).expect("create lost+found");
+    fs::create_dir_all(root.join(".Trash-1000")).expect("create .Trash-1000");
+
+    let normal_files = vec![
+        root.join("src/main.rs"),
+        root.join("docs/readme.md"),
+        root.join("normal.txt"),
+    ];
+    let user_dot_files = vec![
+        root.join(".env"),
+        root.join(".gitignore"),
+        root.join(".git/HEAD"),
+        root.join(".git/objects/ab/cd"),
+        root.join("sub/.hidden_sub/nested.txt"),
+        root.join("sub/.dot_in_sub"),
+    ];
+    let non_dot_system_files = vec![
+        root.join("Thumbs.db"),
+        root.join("sub/desktop.ini"),
+        root.join("System Volume Information/WPSettings.dat"),
+        root.join("lost+found/orphan.bin"),
+    ];
+    let dot_system_files = vec![root.join(".DS_Store"), root.join(".Trash-1000/deleted.txt")];
+
+    for path in normal_files
+        .iter()
+        .chain(&user_dot_files)
+        .chain(&non_dot_system_files)
+        .chain(&dot_system_files)
+    {
+        fs::write(path, path.to_string_lossy().as_bytes()).expect("write fixture file");
+    }
+
+    let total_files = normal_files.len()
+        + user_dot_files.len()
+        + non_dot_system_files.len()
+        + dot_system_files.len();
+    let root_str = root.to_string_lossy().into_owned();
+
+    // 1. Default ScanManager includes all hidden & system files
+    let mut default_scan = ScanManager::new(HashAlgorithm::Blake3);
+    assert!(default_scan.includes_hidden());
+    assert_eq!(
+        default_scan.get_hidden_filter(),
+        HiddenFileFilter::include_all()
+    );
+    assert_eq!(default_scan.get_hidden_skipped_count(), 0);
+    default_scan
+        .start_hash(root_str.clone())
+        .expect("default scan");
+    assert_eq!(default_scan.get_list().len(), total_files);
+    assert_eq!(default_scan.get_hidden_skipped_count(), 0);
+
+    // 2. Exclude all hidden & system files (single-threaded and parallel must match identically)
+    let mut single_exclude = ScanManager::new(HashAlgorithm::Blake3)
+        .with_thread_count(1)
+        .with_include_hidden(false);
+    assert!(!single_exclude.includes_hidden());
+    assert_eq!(
+        single_exclude.get_hidden_filter(),
+        HiddenFileFilter::exclude_all()
+    );
+    single_exclude
+        .start_hash(root_str.clone())
+        .expect("single-threaded exclude-all scan");
+
+    let mut parallel_exclude = ScanManager::new(HashAlgorithm::Blake3)
+        .with_thread_count(4)
+        .with_hidden_filter(HiddenFileFilter::exclude_all());
+    parallel_exclude
+        .start_hash(root_str.clone())
+        .expect("parallel exclude-all scan");
+
+    assert_eq!(single_exclude.get_list().len(), normal_files.len());
+    assert_eq!(parallel_exclude.get_list().len(), normal_files.len());
+    assert_eq!(
+        parallel_exclude.get_hash_manager().get_files_counted(),
+        normal_files.len()
+    );
+    // Skipped entries:
+    // Top-level: .env, .gitignore, .git (pruned dir), Thumbs.db, System Volume Information (pruned dir),
+    //            lost+found (pruned dir), .DS_Store, .Trash-1000 (pruned dir) = 8
+    // Under sub/: .hidden_sub (pruned dir), .dot_in_sub, desktop.ini = 3
+    // Total = 11
+    assert_eq!(single_exclude.get_hidden_skipped_count(), 11);
+    assert_eq!(parallel_exclude.get_hidden_skipped_count(), 11);
+
+    let tree_single =
+        DirectoryNode::build_tree(single_exclude.get_path(), single_exclude.get_list());
+    let tree_parallel =
+        DirectoryNode::build_tree(parallel_exclude.get_path(), parallel_exclude.get_list());
+    assert_eq!(tree_parallel, tree_single);
+
+    for path in &normal_files {
+        let path_str = path.to_string_lossy();
+        assert!(
+            parallel_exclude
+                .get_list()
+                .iter()
+                .any(|entry| entry.get_path() == path_str && entry.get_result().is_ok()),
+            "missing expected normal file: {path_str}"
+        );
+    }
+
+    // 3. Exclude dotfiles only: skips dotfiles & dot-system entries, keeps non-dot system files
+    let mut dot_only_scan = ScanManager::new(HashAlgorithm::Blake3)
+        .with_hidden_filter(HiddenFileFilter::exclude_dotfiles());
+    dot_only_scan
+        .start_hash(root_str.clone())
+        .expect("dotfiles-only scan");
+    assert_eq!(
+        dot_only_scan.get_list().len(),
+        normal_files.len() + non_dot_system_files.len()
+    );
+    // Skipped: .env, .gitignore, .git (dir), .DS_Store, .Trash-1000 (dir), sub/.hidden_sub (dir), sub/.dot_in_sub = 7
+    assert_eq!(dot_only_scan.get_hidden_skipped_count(), 7);
+    for path in normal_files.iter().chain(&non_dot_system_files) {
+        let path_str = path.to_string_lossy();
+        assert!(
+            dot_only_scan
+                .get_list()
+                .iter()
+                .any(|entry| entry.get_path() == path_str && entry.get_result().is_ok()),
+            "expected file missing in dotfiles-only scan: {path_str}"
+        );
+    }
+
+    // 4. Exclude system files only: skips OS metadata files, keeps user dotfiles
+    let mut sys_only_scan = ScanManager::new(HashAlgorithm::Blake3)
+        .with_hidden_filter(HiddenFileFilter::exclude_system_files());
+    sys_only_scan
+        .start_hash(root_str.clone())
+        .expect("system-files-only scan");
+    assert_eq!(
+        sys_only_scan.get_list().len(),
+        normal_files.len() + user_dot_files.len()
+    );
+    // Skipped: Thumbs.db, sub/desktop.ini, System Volume Information (dir), lost+found (dir), .DS_Store, .Trash-1000 (dir) = 6
+    assert_eq!(sys_only_scan.get_hidden_skipped_count(), 6);
+    for path in normal_files.iter().chain(&user_dot_files) {
+        let path_str = path.to_string_lossy();
+        assert!(
+            sys_only_scan
+                .get_list()
+                .iter()
+                .any(|entry| entry.get_path() == path_str && entry.get_result().is_ok()),
+            "expected file missing in system-files-only scan: {path_str}"
+        );
+    }
+
+    // 5. Explicitly scanning a directory inside a hidden parent (or a hidden directory itself)
+    //    must still scan non-hidden files underneath it while filtering hidden children.
+    let hidden_parent_root = root.join(".config_parent/myapp");
+    fs::create_dir_all(hidden_parent_root.join(".cache")).expect("create .cache");
+    let visible_in_hidden_parent = hidden_parent_root.join("settings.toml");
+    fs::write(&visible_in_hidden_parent, b"theme = 'dark'").expect("write settings");
+    fs::write(hidden_parent_root.join(".secret"), b"token").expect("write .secret");
+    fs::write(hidden_parent_root.join(".cache/data.bin"), b"cached").expect("write cached");
+
+    let mut nested_root_scan = ScanManager::new(HashAlgorithm::Blake3).with_include_hidden(false);
+    nested_root_scan
+        .start_hash(hidden_parent_root.to_string_lossy().into_owned())
+        .expect("scan root under hidden parent");
+    assert_eq!(nested_root_scan.get_list().len(), 1);
+    assert_eq!(
+        nested_root_scan.get_list()[0].get_path(),
+        visible_in_hidden_parent.to_string_lossy()
+    );
+    assert_eq!(nested_root_scan.get_hidden_skipped_count(), 2);
+
+    let hidden_self_root = root.join(".hidden_root_dir");
+    fs::create_dir_all(hidden_self_root.join(".inner")).expect("create .inner");
+    let visible_in_hidden_root = hidden_self_root.join("keep.txt");
+    fs::write(&visible_in_hidden_root, b"keep").expect("write keep");
+    fs::write(hidden_self_root.join(".inner/drop.txt"), b"drop").expect("write drop");
+
+    nested_root_scan
+        .start_hash(hidden_self_root.to_string_lossy().into_owned())
+        .expect("scan hidden root dir");
+    assert_eq!(nested_root_scan.get_list().len(), 1);
+    assert_eq!(
+        nested_root_scan.get_list()[0].get_path(),
+        visible_in_hidden_root.to_string_lossy()
+    );
+    assert_eq!(nested_root_scan.get_hidden_skipped_count(), 1);
+
+    // 6. Early pruning of hidden directories prevents reading unreadable hidden folders on Unix
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let locked_hidden = root.join(".locked_hidden");
+        fs::create_dir_all(&locked_hidden).expect("create .locked_hidden");
+        fs::write(locked_hidden.join("secret.bin"), b"secret").expect("write secret");
+        fs::set_permissions(&locked_hidden, fs::Permissions::from_mode(0o000))
+            .expect("chmod 000 .locked_hidden");
+
+        if fs::read_dir(&locked_hidden).is_err() {
+            let mut pruned = ScanManager::new(HashAlgorithm::Blake3).with_include_hidden(false);
+            pruned
+                .start_hash(root_str.clone())
+                .expect("pruned unreadable hidden dir scan");
+            assert_eq!(pruned.get_list().len(), normal_files.len());
+            assert!(pruned.get_list().iter().all(|f| f.get_result().is_ok()));
+            // Original 11 + .config_parent + .hidden_root_dir + .locked_hidden = 14
+            assert_eq!(pruned.get_hidden_skipped_count(), 14);
+        }
+
+        let _ = fs::set_permissions(&locked_hidden, fs::Permissions::from_mode(0o755));
+        let _ = fs::remove_dir_all(&locked_hidden);
+    }
+}
+
+#[test]
+fn scan_manager_hidden_filter_combined_with_ignore_list_single_file_batch_and_snapshot() {
+    let dir = TempDir::new("hidden_combined_e2e");
+    let root = dir.path();
+
+    fs::create_dir_all(root.join("src")).expect("create src");
+    fs::create_dir_all(root.join("node_modules/pkg")).expect("create node_modules");
+    fs::create_dir_all(root.join(".git")).expect("create .git");
+    fs::create_dir_all(root.join(".config")).expect("create .config");
+
+    let keep_file = root.join("src/main.rs");
+    let ignored_log = root.join("src/debug.log");
+    let ignored_nm = root.join("node_modules/pkg/index.js");
+    let hidden_env = root.join(".env");
+    let hidden_log = root.join(".hidden.log");
+    let hidden_git_head = root.join(".git/HEAD");
+    let system_thumbs = root.join("Thumbs.db");
+    let visible_under_dot_dir = root.join(".config/visible.txt");
+
+    fs::write(&keep_file, b"fn main() {}").expect("write");
+    fs::write(&ignored_log, b"debug").expect("write");
+    fs::write(&ignored_nm, b"module.exports = {};").expect("write");
+    fs::write(&hidden_env, b"SECRET=1").expect("write");
+    fs::write(&hidden_log, b"hidden log").expect("write");
+    fs::write(&hidden_git_head, b"ref: refs/heads/main").expect("write");
+    fs::write(&system_thumbs, b"thumbs").expect("write");
+    fs::write(&visible_under_dot_dir, b"visible file").expect("write");
+
+    let root_str = root.to_string_lossy().into_owned();
+    let mut scanner = ScanManager::new(HashAlgorithm::Blake3)
+        .with_include_hidden(false)
+        .with_ignore_patterns(["node_modules/", "*.log"])
+        .expect("valid ignore patterns");
+
+    scanner
+        .start_hash(root_str.clone())
+        .expect("combined scan should succeed");
+
+    assert_eq!(scanner.get_list().len(), 1);
+    assert_eq!(
+        scanner.get_list()[0].get_path(),
+        keep_file.to_string_lossy()
+    );
+    // Hidden filter runs first: .env, .hidden.log, .git (dir), .config (dir), Thumbs.db = 5
+    assert_eq!(scanner.get_hidden_skipped_count(), 5);
+    // Ignore list skips: node_modules (dir), src/debug.log = 2
+    assert_eq!(scanner.get_ignored_count(), 2);
+
+    // Single-file start_hash respects HiddenFileFilter on the leaf file only
+    scanner
+        .start_hash(hidden_env.to_string_lossy().into_owned())
+        .expect("single-file hidden start_hash");
+    assert!(scanner.get_list().is_empty());
+    assert_eq!(scanner.get_hidden_skipped_count(), 1);
+    assert_eq!(scanner.get_ignored_count(), 0);
+
+    scanner
+        .start_hash(system_thumbs.to_string_lossy().into_owned())
+        .expect("single-file system start_hash");
+    assert!(scanner.get_list().is_empty());
+    assert_eq!(scanner.get_hidden_skipped_count(), 1);
+
+    // Visible file inside a hidden parent directory is NOT excluded by single-file start_hash
+    scanner
+        .start_hash(visible_under_dot_dir.to_string_lossy().into_owned())
+        .expect("visible leaf inside hidden parent");
+    assert_eq!(scanner.get_list().len(), 1);
+    assert_eq!(scanner.get_hidden_skipped_count(), 0);
+
+    // Explicit hash_single_file always hashes the chosen file even when hidden
+    let single_res = scanner
+        .hash_single_file(&hidden_env)
+        .expect("hash_single_file must hash explicitly chosen hidden file");
+    assert_eq!(single_res.get_file_name(), ".env");
+    assert_eq!(scanner.get_hidden_skipped_count(), 0);
+
+    // Batch hash_files applies HiddenFileFilter + IgnoreList and resets counts on re-enable
+    let batch_inputs = vec![
+        keep_file.clone(),
+        hidden_env.clone(),
+        hidden_git_head.clone(),
+        system_thumbs.clone(),
+        ignored_log.clone(),
+    ];
+    scanner
+        .hash_files(&batch_inputs)
+        .expect("hash_files with hidden + ignore filters");
+    assert_eq!(scanner.get_list().len(), 1);
+    assert_eq!(
+        scanner.get_list()[0].get_path(),
+        keep_file.to_string_lossy()
+    );
+    assert_eq!(scanner.get_hidden_skipped_count(), 3);
+    assert_eq!(scanner.get_ignored_count(), 1);
+
+    scanner.set_include_hidden(true);
+    scanner.clear_ignore_list();
+    assert!(scanner.includes_hidden());
+    scanner
+        .hash_files(&batch_inputs)
+        .expect("hash_files after re-enabling hidden and clearing ignore list");
+    assert_eq!(scanner.get_list().len(), batch_inputs.len());
+    assert_eq!(scanner.get_hidden_skipped_count(), 0);
+    assert_eq!(scanner.get_ignored_count(), 0);
+
+    // Mutable hidden filter accessor works cleanly
+    scanner.get_hidden_filter_mut().set_exclude_dotfiles(true);
+    assert!(!scanner.includes_hidden());
+    assert_eq!(
+        scanner.get_hidden_filter(),
+        HiddenFileFilter::exclude_dotfiles()
+    );
+
+    // Cancelled scan leaves hidden_skipped_count clean at 0
+    let mut cancelled = ScanManager::new(HashAlgorithm::Blake3).with_include_hidden(false);
+    cancelled.cancel();
+    let cancel_err = cancelled
+        .start_hash(root_str)
+        .expect_err("expected ScanCancelled");
+    assert!(cancel_err.is_cancelled());
+    assert!(cancelled.get_list().is_empty());
+    assert_eq!(cancelled.get_hidden_skipped_count(), 0);
+
+    // Snapshot MetaData roundtrip preserves active HiddenFileFilter and omits inactive filter
+    let output_dir = TempDir::new("hidden_snapshot_out");
+    let tree = DirectoryNode::new(String::from("/project"));
+    let active_filter = HiddenFileFilter::exclude_all();
+    let meta_with_filter = MetaData::new(1, Duration::from_millis(12), Utc::now())
+        .with_algorithm(HashAlgorithm::Blake3)
+        .with_hidden_filter(active_filter);
+
+    let saved =
+        FileManager::save_file(output_dir.path(), &tree, &meta_with_filter).expect("save snapshot");
+    let loaded = FileManager::open_file(&saved).expect("open snapshot");
+    assert_eq!(loaded.get_meta().get_hidden_filter(), Some(active_filter));
+
+    let meta_inactive = MetaData::new(0, Duration::ZERO, Utc::now())
+        .with_hidden_filter(HiddenFileFilter::include_all());
+    assert_eq!(meta_inactive.get_hidden_filter(), None);
+    let meta_json = serde_json::to_value(&meta_inactive).expect("serialize inactive meta");
+    assert!(meta_json.get("hidden_filter").is_none());
 }

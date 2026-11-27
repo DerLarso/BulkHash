@@ -1,9 +1,12 @@
 use crate::core::hash_manager::{HashAlgorithm, HashManager};
+pub use crate::core::hidden_filter::HiddenFileFilter;
 pub use crate::core::ignore_list::IgnoreList;
 use crate::core::io::bulk_hash_error::BulkHashError;
 pub use crate::core::scan_control::{ScanCancelToken, ScanControl, ScanControlState};
 use crate::core::structs::{file_info::FileInfo, single_file_hash::SingleFileHash};
+use std::borrow::Cow;
 use std::cmp::Reverse;
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,6 +28,12 @@ struct DiscoveredEntries {
     files: Vec<DiscoveredFile>,
     errors: Vec<FileInfo>,
     ignored_count: usize,
+    hidden_skipped_count: usize,
+}
+
+enum HiddenCheckOutcome {
+    Keep(Option<fs::Metadata>),
+    Skip,
 }
 
 pub struct ScanManager {
@@ -37,6 +46,8 @@ pub struct ScanManager {
     control: ScanControl,
     ignore_list: IgnoreList,
     ignored_count: usize,
+    hidden_filter: HiddenFileFilter,
+    hidden_skipped_count: usize,
 }
 
 impl ScanManager {
@@ -51,6 +62,8 @@ impl ScanManager {
             control: ScanControl::new(),
             ignore_list: IgnoreList::new(),
             ignored_count: 0,
+            hidden_filter: HiddenFileFilter::include_all(),
+            hidden_skipped_count: 0,
         }
     }
 
@@ -86,6 +99,22 @@ impl ScanManager {
     {
         self.ignore_list = IgnoreList::from_patterns(patterns)?;
         Ok(self)
+    }
+
+    #[must_use]
+    pub const fn with_hidden_filter(mut self, hidden_filter: HiddenFileFilter) -> Self {
+        self.hidden_filter = hidden_filter;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_include_hidden(mut self, include_hidden: bool) -> Self {
+        self.hidden_filter = if include_hidden {
+            HiddenFileFilter::include_all()
+        } else {
+            HiddenFileFilter::exclude_all()
+        };
+        self
     }
 
     pub fn set_thread_count(&mut self, thread_count: Option<usize>) {
@@ -127,6 +156,37 @@ impl ScanManager {
 
     pub fn get_ignored_count(&self) -> usize {
         self.ignored_count
+    }
+
+    pub const fn set_hidden_filter(&mut self, hidden_filter: HiddenFileFilter) {
+        self.hidden_filter = hidden_filter;
+    }
+
+    pub const fn set_include_hidden(&mut self, include_hidden: bool) {
+        self.hidden_filter = if include_hidden {
+            HiddenFileFilter::include_all()
+        } else {
+            HiddenFileFilter::exclude_all()
+        };
+    }
+
+    #[must_use]
+    pub const fn get_hidden_filter(&self) -> HiddenFileFilter {
+        self.hidden_filter
+    }
+
+    pub const fn get_hidden_filter_mut(&mut self) -> &mut HiddenFileFilter {
+        &mut self.hidden_filter
+    }
+
+    #[must_use]
+    pub const fn includes_hidden(&self) -> bool {
+        self.hidden_filter.includes_all()
+    }
+
+    #[must_use]
+    pub const fn get_hidden_skipped_count(&self) -> usize {
+        self.hidden_skipped_count
     }
 
     pub fn get_control(&self) -> ScanControl {
@@ -214,18 +274,30 @@ impl ScanManager {
             fs::metadata(root_path).map_err(|err| BulkHashError::from_io(err, path.clone()))?;
 
         if root_metadata.is_file() {
-            let file_ignored = !self.ignore_list.is_empty()
-                && root_path
-                    .file_name()
-                    .map(|name| name.to_string_lossy())
-                    .is_some_and(|name| self.ignore_list.matches_child(&[], name.as_ref(), false));
+            let os_name = root_path.file_name();
+            let hidden_excluded = self.hidden_filter.is_active()
+                && os_name.is_some_and(|name| {
+                    self.hidden_filter
+                        .matches_entry(name, Some(&root_metadata))
+                });
 
-            if file_ignored {
-                self.ignored_count = self.ignored_count.saturating_add(1);
+            if hidden_excluded {
+                self.hidden_skipped_count = self.hidden_skipped_count.saturating_add(1);
             } else {
-                match self.compute_hash(root_path) {
-                    Err(BulkHashError::ScanCancelled) => return Err(BulkHashError::ScanCancelled),
-                    result => self.file_list.push(FileInfo::new(path, result)),
+                let file_ignored = !self.ignore_list.is_empty()
+                    && os_name.map(OsStr::to_string_lossy).is_some_and(|name| {
+                        self.ignore_list.matches_child(&[], name.as_ref(), false)
+                    });
+
+                if file_ignored {
+                    self.ignored_count = self.ignored_count.saturating_add(1);
+                } else {
+                    match self.compute_hash(root_path) {
+                        Err(BulkHashError::ScanCancelled) => {
+                            return Err(BulkHashError::ScanCancelled);
+                        }
+                        result => self.file_list.push(FileInfo::new(path, result)),
+                    }
                 }
             }
         } else if root_metadata.is_dir() {
@@ -237,6 +309,7 @@ impl ScanManager {
                 root_path,
                 &self.control,
                 &self.ignore_list,
+                self.hidden_filter,
             )?;
 
             self.control.checkpoint()?;
@@ -253,6 +326,7 @@ impl ScanManager {
             )?;
 
             self.ignored_count = discovered.ignored_count;
+            self.hidden_skipped_count = discovered.hidden_skipped_count;
             self.file_list
                 .reserve(discovered.errors.len().saturating_add(hashed_files.len()));
             self.file_list.extend(discovered.errors);
@@ -276,7 +350,10 @@ impl ScanManager {
         let timer = self.control.start_timer();
         self.control.checkpoint()?;
 
-        if self.ignore_list.is_empty() {
+        let has_ignore_rules = !self.ignore_list.is_empty();
+        let has_hidden_filter = self.hidden_filter.is_active();
+
+        if !has_ignore_rules && !has_hidden_filter {
             self.file_list = self.hasher.hash_files_with_threads_controlled(
                 paths,
                 self.thread_count,
@@ -285,6 +362,7 @@ impl ScanManager {
         } else {
             let mut filtered_paths: Vec<&Path> = Vec::with_capacity(paths.len());
             let mut ignored_count = 0usize;
+            let mut hidden_skipped_count = 0usize;
 
             for path in paths {
                 self.control.checkpoint()?;
@@ -292,13 +370,18 @@ impl ScanManager {
                 if Self::is_excluded_system_path(path_ref) {
                     continue;
                 }
-                let is_dir = path_ref
-                    .symlink_metadata()
-                    .map(|meta| meta.is_dir())
-                    .unwrap_or(false);
-                if self.ignore_list.is_ignored(path_ref, is_dir) {
-                    ignored_count = ignored_count.saturating_add(1);
+                if has_hidden_filter && self.hidden_filter.is_hidden_path(path_ref) {
+                    hidden_skipped_count = hidden_skipped_count.saturating_add(1);
                     continue;
+                }
+                if has_ignore_rules {
+                    let is_dir = path_ref
+                        .symlink_metadata()
+                        .is_ok_and(|meta| meta.is_dir());
+                    if self.ignore_list.is_ignored(path_ref, is_dir) {
+                        ignored_count = ignored_count.saturating_add(1);
+                        continue;
+                    }
                 }
                 filtered_paths.push(path_ref);
             }
@@ -309,6 +392,7 @@ impl ScanManager {
                 &self.control,
             )?;
             self.ignored_count = ignored_count;
+            self.hidden_skipped_count = hidden_skipped_count;
         }
 
         let (active_time, paused_time) = timer.finish(&self.control);
@@ -349,6 +433,7 @@ impl ScanManager {
         self.hash_time = Duration::ZERO;
         self.paused_time = Duration::ZERO;
         self.ignored_count = 0;
+        self.hidden_skipped_count = 0;
         self.start_path.clear();
         self.start_path.push_str(start_path);
     }
@@ -358,11 +443,13 @@ impl ScanManager {
         root_path: &Path,
         control: &ScanControl,
         ignore_list: &IgnoreList,
+        hidden_filter: HiddenFileFilter,
     ) -> Result<DiscoveredEntries, BulkHashError> {
         let mut discovered = DiscoveredEntries {
             files: Vec::new(),
             errors: Vec::new(),
             ignored_count: 0,
+            hidden_skipped_count: 0,
         };
         let mut dir_stack: Vec<(PathBuf, Vec<String>)> = Vec::new();
         Self::process_read_dir(
@@ -373,6 +460,7 @@ impl ScanManager {
             &mut discovered,
             control,
             ignore_list,
+            hidden_filter,
         )?;
 
         while let Some((current_dir, current_rel)) = dir_stack.pop() {
@@ -392,6 +480,7 @@ impl ScanManager {
                         &mut discovered,
                         control,
                         ignore_list,
+                        hidden_filter,
                     )?;
                 }
                 Err(err) => {
@@ -407,6 +496,7 @@ impl ScanManager {
         Ok(discovered)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn process_read_dir(
         entries: fs::ReadDir,
         parent_dir: &Path,
@@ -415,8 +505,10 @@ impl ScanManager {
         discovered: &mut DiscoveredEntries,
         control: &ScanControl,
         ignore_list: &IgnoreList,
+        hidden_filter: HiddenFileFilter,
     ) -> Result<(), BulkHashError> {
         let has_ignore_rules = !ignore_list.is_empty();
+        let has_hidden_filter = hidden_filter.is_active();
 
         for entry_result in entries {
             control.checkpoint()?;
@@ -460,9 +552,26 @@ impl ScanManager {
                 continue;
             }
 
+            let os_name = (has_hidden_filter || has_ignore_rules).then(|| entry.file_name());
+            let cached_metadata = if has_hidden_filter {
+                match Self::filter_hidden_dir_entry(
+                    &entry,
+                    &entry_path,
+                    os_name.as_deref(),
+                    hidden_filter,
+                    discovered,
+                ) {
+                    HiddenCheckOutcome::Keep(meta) => meta,
+                    HiddenCheckOutcome::Skip => continue,
+                }
+            } else {
+                None
+            };
+
             if has_ignore_rules {
-                let os_name = entry.file_name();
-                let name_cow = os_name.to_string_lossy();
+                let name_cow = os_name
+                    .as_deref()
+                    .map_or(Cow::Borrowed(""), OsStr::to_string_lossy);
                 if ignore_list.matches_child(parent_rel, name_cow.as_ref(), is_dir) {
                     discovered.ignored_count = discovered.ignored_count.saturating_add(1);
                     continue;
@@ -480,15 +589,19 @@ impl ScanManager {
                 continue;
             }
 
-            let metadata = match entry_path.symlink_metadata() {
-                Ok(meta) => meta,
-                Err(err) => {
-                    let entry_str = entry_path.to_string_lossy().into_owned();
-                    discovered.errors.push(FileInfo::new(
-                        entry_str.clone(),
-                        Err(BulkHashError::from_io(err, entry_str)),
-                    ));
-                    continue;
+            let metadata = if let Some(meta) = cached_metadata {
+                meta
+            } else {
+                match entry_path.symlink_metadata() {
+                    Ok(meta) => meta,
+                    Err(err) => {
+                        let entry_str = entry_path.to_string_lossy().into_owned();
+                        discovered.errors.push(FileInfo::new(
+                            entry_str.clone(),
+                            Err(BulkHashError::from_io(err, entry_str)),
+                        ));
+                        continue;
+                    }
                 }
             };
 
@@ -503,6 +616,48 @@ impl ScanManager {
         }
 
         Ok(())
+    }
+
+    fn filter_hidden_dir_entry(
+        entry: &fs::DirEntry,
+        entry_path: &Path,
+        os_name: Option<&OsStr>,
+        hidden_filter: HiddenFileFilter,
+        discovered: &mut DiscoveredEntries,
+    ) -> HiddenCheckOutcome {
+        if let Some(name) = os_name
+            && hidden_filter.matches_name(name)
+        {
+            discovered.hidden_skipped_count = discovered.hidden_skipped_count.saturating_add(1);
+            return HiddenCheckOutcome::Skip;
+        }
+
+        if !hidden_filter.needs_os_metadata() {
+            return HiddenCheckOutcome::Keep(None);
+        }
+
+        let meta = match entry.metadata() {
+            Ok(meta) => meta,
+            Err(err) => {
+                let entry_str = entry_path.to_string_lossy().into_owned();
+                discovered.errors.push(FileInfo::new(
+                    entry_str.clone(),
+                    Err(BulkHashError::from_io(err, entry_str)),
+                ));
+                return HiddenCheckOutcome::Skip;
+            }
+        };
+
+        if meta.is_symlink() {
+            return HiddenCheckOutcome::Skip;
+        }
+
+        if hidden_filter.matches_metadata(&meta) {
+            discovered.hidden_skipped_count = discovered.hidden_skipped_count.saturating_add(1);
+            return HiddenCheckOutcome::Skip;
+        }
+
+        HiddenCheckOutcome::Keep(Some(meta))
     }
 
     fn is_excluded_system_path(path: &Path) -> bool {
