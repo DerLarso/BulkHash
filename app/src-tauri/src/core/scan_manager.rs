@@ -1,4 +1,4 @@
-use crate::core::hash_manager::{HashAlgorithm, HashManager};
+use crate::core::hash_manager::{DiscoveredFile, HashAlgorithm, HashManager};
 pub use crate::core::hidden_filter::HiddenFileFilter;
 pub use crate::core::ignore_list::IgnoreList;
 use crate::core::io::bulk_hash_error::BulkHashError;
@@ -12,17 +12,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
-
-struct DiscoveredFile {
-    path: PathBuf,
-    size: u64,
-}
-
-impl AsRef<Path> for DiscoveredFile {
-    fn as_ref(&self) -> &Path {
-        &self.path
-    }
-}
 
 struct DiscoveredEntries {
     files: Vec<DiscoveredFile>,
@@ -315,7 +304,7 @@ impl ScanManager {
                 .files
                 .sort_unstable_by_key(|file| Reverse(file.size));
 
-            let hashed_files = self.hasher.hash_files_with_threads_controlled(
+            let hashed_files = self.hasher.hash_discovered_files_controlled(
                 &discovered.files,
                 self.thread_count,
                 &self.control,
@@ -589,7 +578,7 @@ impl ScanManager {
             let metadata = if let Some(meta) = cached_metadata {
                 meta
             } else {
-                match entry_path.symlink_metadata() {
+                match entry.metadata() {
                     Ok(meta) => meta,
                     Err(err) => {
                         let entry_str = entry_path.to_string_lossy().into_owned();
@@ -609,6 +598,7 @@ impl ScanManager {
             discovered.files.push(DiscoveredFile {
                 path: entry_path,
                 size: metadata.len(),
+                modified: metadata.modified().ok(),
             });
         }
 
