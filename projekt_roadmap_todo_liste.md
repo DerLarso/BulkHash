@@ -10,7 +10,7 @@ Backend - Core & Hashing:
 	[#] Rekursiver Ordner-Scanner: Durchsucht Verzeichnisse inklusive Systempfad-Ausnahmen ; Rust
 	[#] Symlink-Filter: Überspringt symbolische Links zur Vermeidung von Endlosschleifen ; Rust
 	[#] Einzeldatei-Hashing: Gezieltes Hashen einer einzelnen Datei statt eines ganzen Ordners ; Rust
-	[X] Weitere Hash-Algorithmen: Unterstützung für MD5, SHA512 und xxHash (extrem schnell) ; Rust
+	[#] Weitere Hash-Algorithmen: Unterstützung für MD5, SHA512 und xxHash (extrem schnell) ; Rust
 	[X] Multithreading-Scanner: Paralleles Hashen mehrerer Dateien über alle CPU-Kerne (Rayon) ; Rust
 	[X] Scan-Abbruchfunktion: Sicheres Stoppen eines laufenden Scan-Vorgangs über AtomicBool ; Rust
 	[X] Pause- & Fortsetzen-Funktion: Laufende Scans temporär pausieren und weiterführen ; Rust
@@ -47,7 +47,7 @@ Backend - Tauri, IPC & System-Integration:
 	[X] Dateityp-Verknüpfung: Doppelklick auf eine .hashed-Datei im System startet direkt die App ; Rust
 	[X] Kontextmenü-Integration: Rechtsklick im Windows-Explorer/Finder "Mit Hashed scannen" ; Rust
 	[X] Headless-CLI-Modus: Steuerung des Programms über das Terminal für automatisierte Update-Skripte ; Rust
-	[X]Lokale Einstellungsverwaltung: Speichern von Nutzer-Präferenzen und letzten Dateien als JSON ; Rust
+	[X] Lokale Einstellungsverwaltung: Speichern von Nutzer-Präferenzen und letzten Dateien als JSON ; Rust
 
 Frontend - Grundgerüst, Layout & Design:
 	[X] Svelte + TypeScript Setup: Basis-Architektur mit Komponenten-Struktur und State-Management ; Svelte / TypeScript

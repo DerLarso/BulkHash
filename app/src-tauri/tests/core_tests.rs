@@ -376,3 +376,178 @@ fn single_file_hashing_rejects_directories_and_missing_files() {
         .expect_err("HashManager::get_hash_code must also reject directories");
     assert!(matches!(hasher_dir_err, BulkHashError::NotAFile(_)));
 }
+
+#[test]
+fn all_hash_algorithms_match_known_test_vectors() {
+    // Official reference digests for empty input ""
+    assert_eq!(
+        HashAlgorithm::Blake3.get_hash_from_bytes(b""),
+        "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+    );
+    assert_eq!(
+        HashAlgorithm::Sha256.get_hash_from_bytes(b""),
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
+    assert_eq!(
+        HashAlgorithm::Sha512.get_hash_from_bytes(b""),
+        "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e"
+    );
+    assert_eq!(
+        HashAlgorithm::Md5.get_hash_from_bytes(b""),
+        "d41d8cd98f00b204e9800998ecf8427e"
+    );
+    assert_eq!(
+        HashAlgorithm::XxHash64.get_hash_from_bytes(b""),
+        "ef46db3751d8e999"
+    );
+    assert_eq!(
+        HashAlgorithm::XxHash3.get_hash_from_bytes(b""),
+        "2d06800538d394c2"
+    );
+    assert_eq!(
+        HashAlgorithm::XxHash128.get_hash_from_bytes(b""),
+        "99aa06d3014798d86001c324468d497f"
+    );
+
+    // Official reference digests for "abc"
+    assert_eq!(
+        HashAlgorithm::Blake3.get_hash_from_bytes(b"abc"),
+        "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85"
+    );
+    assert_eq!(
+        HashAlgorithm::Sha256.get_hash_from_bytes(b"abc"),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+    assert_eq!(
+        HashAlgorithm::Sha512.get_hash_from_bytes(b"abc"),
+        "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
+    );
+    assert_eq!(
+        HashAlgorithm::Md5.get_hash_from_bytes(b"abc"),
+        "900150983cd24fb0d6963f7d28e17f72"
+    );
+
+    for &algo in HashAlgorithm::all() {
+        let digest = algo.get_hash_from_bytes(b"abc");
+        assert_eq!(digest.len(), algo.hex_len(), "unexpected hex length for {algo}");
+        assert!(
+            digest
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+            "digest for {algo} must be lowercase hex"
+        );
+    }
+}
+
+#[test]
+fn all_hash_algorithms_stream_empty_and_multichunk_files_identically() {
+    let dir = TempDir::new("all_algos_streaming");
+
+    // 0-byte empty file
+    let empty_file = dir.path().join("empty.bin");
+    fs::write(&empty_file, b"").expect("write empty file");
+
+    // 200 KiB deterministic payload (> 3x 64 KiB read buffer)
+    let large_payload: Vec<u8> = (0..(200 * 1024))
+        .map(|i| ((i * 31 + 17) % 256) as u8)
+        .collect();
+    let large_file = dir.path().join("large.bin");
+    fs::write(&large_file, &large_payload).expect("write large file");
+
+    let mut mgr = HashManager::new(HashAlgorithm::default());
+    for (idx, &algo) in HashAlgorithm::all().iter().enumerate() {
+        mgr.set_algorithm(algo);
+        assert_eq!(mgr.get_algorithm(), algo);
+
+        let empty_stream = mgr.get_hash_code(&empty_file).expect("hash empty file");
+        assert_eq!(empty_stream, algo.get_hash_from_bytes(b""));
+        assert_eq!(empty_stream.len(), algo.hex_len());
+
+        let large_stream = mgr.get_hash_code(&large_file).expect("hash large file");
+        assert_eq!(large_stream, algo.get_hash_from_bytes(&large_payload));
+        assert_eq!(large_stream.len(), algo.hex_len());
+
+        assert_eq!(mgr.get_files_counted(), (idx + 1) * 2);
+    }
+}
+
+#[test]
+fn hash_algorithm_parsing_metadata_and_snapshot_roundtrip() {
+    use std::str::FromStr;
+
+    assert_eq!(HashAlgorithm::default(), HashAlgorithm::Blake3);
+    assert_eq!(HashAlgorithm::from_str("md5").unwrap(), HashAlgorithm::Md5);
+    assert_eq!(
+        HashAlgorithm::from_str("SHA-512").unwrap(),
+        HashAlgorithm::Sha512
+    );
+    assert_eq!(
+        HashAlgorithm::from_str("sha_256").unwrap(),
+        HashAlgorithm::Sha256
+    );
+    assert_eq!(
+        HashAlgorithm::from_str("xxh64").unwrap(),
+        HashAlgorithm::XxHash64
+    );
+    assert_eq!(
+        HashAlgorithm::from_str("xxhash3").unwrap(),
+        HashAlgorithm::XxHash3
+    );
+    assert_eq!(
+        HashAlgorithm::from_str("XXH3-128").unwrap(),
+        HashAlgorithm::XxHash128
+    );
+    assert_eq!(
+        HashAlgorithm::from_str("xxhash").unwrap(),
+        HashAlgorithm::XxHash128
+    );
+
+    let err = HashAlgorithm::from_str("unknown-algo").expect_err("expected UnsupportedAlgorithm");
+    assert!(matches!(err, BulkHashError::UnsupportedAlgorithm(_)));
+    assert_eq!(err.kind(), "UnsupportedAlgorithm");
+
+    assert!(HashAlgorithm::Blake3.is_cryptographic());
+    assert!(HashAlgorithm::Sha256.is_cryptographic());
+    assert!(HashAlgorithm::Sha512.is_cryptographic());
+    assert!(!HashAlgorithm::Md5.is_cryptographic());
+    assert!(!HashAlgorithm::XxHash64.is_cryptographic());
+    assert!(!HashAlgorithm::XxHash3.is_cryptographic());
+    assert!(!HashAlgorithm::XxHash128.is_cryptographic());
+
+    // ScanManager algorithm switching + MetaData algorithm persistence in .hashed archive
+    let dir = TempDir::new("algo_snapshot");
+    let sample = dir.path().join("data.bin");
+    fs::write(&sample, b"fast xxhash snapshot test").expect("write sample");
+
+    let mut scanner = ScanManager::new(HashAlgorithm::Md5);
+    let md5_res = scanner.hash_single_file(&sample).expect("md5 single hash");
+    assert_eq!(md5_res.get_algorithm(), HashAlgorithm::Md5);
+    assert_eq!(
+        md5_res.get_hash(),
+        HashAlgorithm::Md5.get_hash_from_bytes(b"fast xxhash snapshot test")
+    );
+
+    scanner.set_algorithm(HashAlgorithm::XxHash128);
+    assert_eq!(scanner.get_algorithm(), HashAlgorithm::XxHash128);
+    scanner
+        .start_hash(dir.path().to_string_lossy().into_owned())
+        .expect("scan with XxHash128");
+
+    let tree = DirectoryNode::build_tree(scanner.get_path(), scanner.get_list());
+    let meta = MetaData::new(
+        scanner.get_hash_manager().get_files_counted(),
+        scanner.get_hash_time(),
+        Utc::now(),
+    )
+    .with_algorithm(scanner.get_algorithm());
+
+    let saved = FileManager::save_file(dir.path(), &tree, &meta).expect("save snapshot");
+    let loaded = FileManager::open_file(&saved).expect("open snapshot");
+    assert_eq!(loaded.get_meta().get_algorithm(), Some(HashAlgorithm::XxHash128));
+    assert_eq!(
+        loaded.get_tree().files.get("data.bin"),
+        Some(&Ok(
+            HashAlgorithm::XxHash128.get_hash_from_bytes(b"fast xxhash snapshot test")
+        ))
+    );
+}

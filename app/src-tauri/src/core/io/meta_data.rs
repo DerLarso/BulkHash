@@ -1,3 +1,4 @@
+use crate::core::hash_manager::HashAlgorithm;
 use chrono::{DateTime, Local, SecondsFormat, Utc};
 use std::time::Duration;
 
@@ -9,6 +10,8 @@ pub struct MetaData {
     date_utc: DateTime<Utc>,
     local_time: String,
     os: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    algorithm: Option<HashAlgorithm>,
 }
 
 impl MetaData {
@@ -22,7 +25,17 @@ impl MetaData {
                 .with_timezone(&Local)
                 .to_rfc3339_opts(SecondsFormat::Secs, true),
             os: std::env::consts::OS.to_string(),
+            algorithm: None,
         }
+    }
+
+    pub fn with_algorithm(mut self, algorithm: HashAlgorithm) -> Self {
+        self.algorithm = Some(algorithm);
+        self
+    }
+
+    pub fn get_algorithm(&self) -> Option<HashAlgorithm> {
+        self.algorithm
     }
 
     pub fn get_local_time(&self) -> &str {

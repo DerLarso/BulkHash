@@ -43,7 +43,6 @@ fn run_app() -> Result<(), BulkHashError> {
 //temp
 fn cli() {
     let mut scan = ScanManager::new(HashAlgorithm::Blake3);
-
     match scan.start_hash(String::from("/home/lars/Downloads")) {
         Ok(()) => handle_success(&scan),
         Err(err) => eprintln!("{err}"),
@@ -58,7 +57,8 @@ fn handle_success(s: &ScanManager) {
         s.get_hash_manager().get_files_counted(),
         s.get_hash_time(),
         Utc::now(),
-    );
+    )
+    .with_algorithm(s.get_algorithm());
 
     match FileManager::save_file("/home/lars/Downloads", &tree, &meta) {
         Ok(saved_path) => {

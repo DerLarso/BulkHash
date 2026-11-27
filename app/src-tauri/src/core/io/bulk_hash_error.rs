@@ -14,6 +14,7 @@ pub enum BulkHashError {
         expected: String,
         actual: String,
     },
+    UnsupportedAlgorithm(String),
     UnsupportedVersion(usize),
     FileIsCorrupted(String),
     Io {
@@ -47,6 +48,7 @@ impl BulkHashError {
             Self::PermissionDenied(_) => "PermissionDenied",
             Self::InvalidEnding(_) => "InvalidEnding",
             Self::HashMismatch { .. } => "HashMismatch",
+            Self::UnsupportedAlgorithm(_) => "UnsupportedAlgorithm",
             Self::UnsupportedVersion(_) => "UnsupportedVersion",
             Self::FileIsCorrupted(_) => "FileIsCorrupted",
             Self::Io { .. } => "Io",
@@ -68,6 +70,9 @@ impl fmt::Display for BulkHashError {
             Self::InvalidEnding(ending) => write!(f, "Invalid file extension: {ending}"),
             Self::HashMismatch { expected, actual } => {
                 write!(f, "Hash mismatch: expected '{expected}', got '{actual}'")
+            }
+            Self::UnsupportedAlgorithm(algorithm) => {
+                write!(f, "Unsupported hash algorithm: {algorithm}")
             }
             Self::UnsupportedVersion(version) => {
                 write!(f, "Unsupported version: {version}")

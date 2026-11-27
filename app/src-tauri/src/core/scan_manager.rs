@@ -188,6 +188,14 @@ impl ScanManager {
         &self.hasher
     }
 
+    pub fn get_algorithm(&self) -> HashAlgorithm {
+        self.hasher.get_algorithm()
+    }
+
+    pub fn set_algorithm(&mut self, algorithm: HashAlgorithm) {
+        self.hasher.set_algorithm(algorithm);
+    }
+
     pub fn get_path(&self) -> &str {
         &self.start_path
     }
