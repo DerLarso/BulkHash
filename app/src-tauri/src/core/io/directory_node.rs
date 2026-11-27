@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
+use std::path::{Component, Path};
 
 use crate::core::structs::file_info::FileInfo;
-#[derive(serde::Serialize, serde::Deserialize)]
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DirectoryNode {
     pub name: String,
     pub files: BTreeMap<String, Result<String, String>>,
@@ -11,7 +12,7 @@ pub struct DirectoryNode {
 
 impl DirectoryNode {
     pub fn new(name: String) -> Self {
-        DirectoryNode {
+        Self {
             name,
             files: BTreeMap::new(),
             sub_directories: BTreeMap::new(),
@@ -19,46 +20,56 @@ impl DirectoryNode {
     }
 
     pub fn insert_path(&mut self, path_parts: &[&str], result: Result<String, String>) {
-        if path_parts.is_empty() {
+        let Some((&file_name, dirs)) = path_parts.split_last() else {
             return;
-        }
+        };
 
-        if path_parts.len() == 1 {
-            let file_name = path_parts[0].to_string();
-
-            self.files.insert(file_name, result);
-        } else {
-            let folder_name = path_parts[0].to_string();
-
-            let next_node = self
+        let mut current = self;
+        for &folder in dirs {
+            current = current
                 .sub_directories
-                .entry(folder_name.clone())
-                .or_insert_with(|| DirectoryNode::new(folder_name));
-
-            next_node.insert_path(&path_parts[1..], result);
+                .entry(folder.to_string())
+                .or_insert_with(|| Self::new(folder.to_string()));
         }
+
+        current.files.insert(file_name.to_string(), result);
     }
 
-    pub fn build_tree(start_path: &str, file_list: &[FileInfo]) -> DirectoryNode {
-        let mut start = DirectoryNode::new(start_path.to_string());
+    pub fn build_tree(start_path: &str, file_list: &[FileInfo]) -> Self {
+        let mut root = Self::new(start_path.to_string());
+        let base_path = Path::new(start_path);
 
         for file in file_list {
-            let path = std::path::Path::new(file.get_path());
+            let full_path = Path::new(file.get_path());
+            let relative_path = full_path.strip_prefix(base_path).unwrap_or(full_path);
 
-            let path_parts: Vec<&str> = path
+            let owned_parts: Vec<String> = relative_path
                 .components()
-                .filter_map(|a| a.as_os_str().to_str())
-                .filter(|s| *s != "/" && !s.contains(':'))
+                .filter_map(|component| match component {
+                    Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+                    _ => None,
+                })
                 .collect();
 
-            let result = match file.get_result() {
-                Ok(a) => Ok(a.clone()),
-                Err(e) => Err(e.to_string()),
+            let owned_parts = if owned_parts.is_empty() {
+                full_path
+                    .file_name()
+                    .map(|name| vec![name.to_string_lossy().into_owned()])
+                    .unwrap_or_default()
+            } else {
+                owned_parts
             };
 
-            start.insert_path(&path_parts, result);
+            let path_parts: Vec<&str> = owned_parts.iter().map(String::as_str).collect();
+
+            let result = match file.get_result() {
+                Ok(hash) => Ok(hash.clone()),
+                Err(err) => Err(err.to_string()),
+            };
+
+            root.insert_path(&path_parts, result);
         }
 
-        start
+        root
     }
 }

@@ -1,10 +1,14 @@
-mod core;
+pub mod core;
+
 use crate::core::{
     hash_manager::HashAlgorithm,
-    io::{directory_node::DirectoryNode, file_manager::FileManager, meta_data::MetaData},
+    io::{
+        bulk_hash_error::BulkHashError, directory_node::DirectoryNode, file_manager::FileManager,
+        meta_data::MetaData,
+    },
     scan_manager::ScanManager,
 };
-use chrono::{Utc};
+use chrono::Utc;
 use std::thread;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -19,47 +23,49 @@ pub fn run() {
         }
     }
 
+    if let Err(err) = run_app() {
+        eprintln!("{err}");
+    }
+}
+
+fn run_app() -> Result<(), BulkHashError> {
     tauri::Builder::default()
         .setup(|_app| {
-            thread::spawn(move || {
-                cli();
-            });
+            thread::Builder::new()
+                .name(String::from("cli-scan"))
+                .spawn(cli)?;
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("Error");
+        .run(tauri::generate_context!())?;
+    Ok(())
 }
 
 //temp
 fn cli() {
     let mut scan = ScanManager::new(HashAlgorithm::Blake3);
 
-    let res = scan.start_hash(String::from("/home/lars/Downloads"));
-
-    match res {
-        Ok(()) => handle_success(&mut scan),
-        Err(e) => println!("{}", e),
+    match scan.start_hash(String::from("/home/lars/Downloads")) {
+        Ok(()) => handle_success(&scan),
+        Err(err) => eprintln!("{err}"),
     }
 }
 
-fn handle_success(s: &mut ScanManager) {
+fn handle_success(s: &ScanManager) {
     let finished_list = s.get_list();
 
-    let test = DirectoryNode::build_tree(s.get_path(), finished_list);
+    let tree = DirectoryNode::build_tree(s.get_path(), finished_list);
     let meta = MetaData::new(
-        *s.get_hash_manager().get_files_counted(),
-        *s.get_hash_time(),
+        s.get_hash_manager().get_files_counted(),
+        s.get_hash_time(),
         Utc::now(),
     );
-    let output = FileManager::save_file(String::from("/home/lars/Downloads/"), &test, &meta);
-    match output {
-        Ok(()) => (),
-        Err(_e) => println!("Error"),
-    }
 
-    let read_file = FileManager::open_file(""); //Just to mute the annoying Warnings
-    match read_file {
-        Ok(_e) => (),
-        Err(_e) => (),
+    match FileManager::save_file("/home/lars/Downloads", &tree, &meta) {
+        Ok(saved_path) => {
+            if let Err(err) = FileManager::open_file(&saved_path) {
+                eprintln!("Failed to verify saved file: {err}");
+            }
+        }
+        Err(err) => eprintln!("{err}"),
     }
 }

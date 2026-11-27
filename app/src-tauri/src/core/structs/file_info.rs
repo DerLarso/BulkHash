@@ -1,18 +1,21 @@
+use crate::core::io::bulk_hash_error::BulkHashError;
+
+#[derive(Debug)]
 pub struct FileInfo {
     path: String,
-    result: Result<String, std::io::Error>,
+    result: Result<String, BulkHashError>,
 }
 
 impl FileInfo {
-    pub fn new(path: String, result: std::io::Result<String>) -> Self {
-        FileInfo { path, result }
+    pub fn new(path: String, result: Result<String, BulkHashError>) -> Self {
+        Self { path, result }
     }
 
     pub fn get_path(&self) -> &str {
         &self.path
     }
 
-    pub fn get_result(&self) -> &Result<String, std::io::Error> {
+    pub fn get_result(&self) -> &Result<String, BulkHashError> {
         &self.result
     }
 }

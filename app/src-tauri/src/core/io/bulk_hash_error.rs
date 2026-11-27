@@ -1,3 +1,4 @@
+use serde::ser::SerializeStruct;
 use std::fmt;
 use std::io;
 
@@ -5,37 +6,81 @@ use std::io;
 pub enum BulkHashError {
     PathNotFound(String),
     FileNotFound(String),
+    NotADirectory(String),
+    NotAFile(String),
+    PermissionDenied(String),
     InvalidEnding(String),
-    HashMismatch { expected: String, actual: String },
+    HashMismatch {
+        expected: String,
+        actual: String,
+    },
     UnsupportedVersion(usize),
     FileIsCorrupted(String),
-    Io(io::Error),
+    Io {
+        path: Option<String>,
+        source: io::Error,
+    },
     JsonError(serde_json::Error),
     ZipError(zip::result::ZipError),
+    TauriError(tauri::Error),
+}
+
+impl BulkHashError {
+    pub fn from_io(source: io::Error, path: impl Into<String>) -> Self {
+        let path = path.into();
+        match source.kind() {
+            io::ErrorKind::NotFound => Self::FileNotFound(path),
+            io::ErrorKind::PermissionDenied => Self::PermissionDenied(path),
+            _ => Self::Io {
+                path: Some(path),
+                source,
+            },
+        }
+    }
+
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::PathNotFound(_) => "PathNotFound",
+            Self::FileNotFound(_) => "FileNotFound",
+            Self::NotADirectory(_) => "NotADirectory",
+            Self::NotAFile(_) => "NotAFile",
+            Self::PermissionDenied(_) => "PermissionDenied",
+            Self::InvalidEnding(_) => "InvalidEnding",
+            Self::HashMismatch { .. } => "HashMismatch",
+            Self::UnsupportedVersion(_) => "UnsupportedVersion",
+            Self::FileIsCorrupted(_) => "FileIsCorrupted",
+            Self::Io { .. } => "Io",
+            Self::JsonError(_) => "JsonError",
+            Self::ZipError(_) => "ZipError",
+            Self::TauriError(_) => "TauriError",
+        }
+    }
 }
 
 impl fmt::Display for BulkHashError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            BulkHashError::PathNotFound(path) => write!(f, "Path not found: {}", path),
-            BulkHashError::FileNotFound(file) => write!(f, "File not found: {}", file),
-            BulkHashError::InvalidEnding(ending) => {
-                write!(f, "Invalid file extension: {}", ending)
+            Self::PathNotFound(path) => write!(f, "Path not found: {path}"),
+            Self::FileNotFound(file) => write!(f, "File not found: {file}"),
+            Self::NotADirectory(path) => write!(f, "Path is not a directory: {path}"),
+            Self::NotAFile(path) => write!(f, "Path is not a file: {path}"),
+            Self::PermissionDenied(path) => write!(f, "Permission denied: {path}"),
+            Self::InvalidEnding(ending) => write!(f, "Invalid file extension: {ending}"),
+            Self::HashMismatch { expected, actual } => {
+                write!(f, "Hash mismatch: expected '{expected}', got '{actual}'")
             }
-            BulkHashError::HashMismatch { expected, actual } => {
-                write!(
-                    f,
-                    "Hash mismatch: expected '{}', got '{}'",
-                    expected, actual
-                )
+            Self::UnsupportedVersion(version) => {
+                write!(f, "Unsupported version: {version}")
             }
-            BulkHashError::UnsupportedVersion(version) => {
-                write!(f, "Unsupported version: {}", version)
-            }
-            BulkHashError::FileIsCorrupted(file) => write!(f, "File is corrupted: {}", file),
-            BulkHashError::Io(e) => write!(f, "I/O error: {}", e),
-            BulkHashError::JsonError(e) => write!(f, "JSON parsing error: {}", e),
-            BulkHashError::ZipError(e) => write!(f, "ZIP archive error: {}", e),
+            Self::FileIsCorrupted(file) => write!(f, "File is corrupted: {file}"),
+            Self::Io {
+                path: Some(path),
+                source,
+            } => write!(f, "I/O error at '{path}': {source}"),
+            Self::Io { path: None, source } => write!(f, "I/O error: {source}"),
+            Self::JsonError(e) => write!(f, "JSON parsing error: {e}"),
+            Self::ZipError(e) => write!(f, "ZIP archive error: {e}"),
+            Self::TauriError(e) => write!(f, "Application error: {e}"),
         }
     }
 }
@@ -43,28 +88,47 @@ impl fmt::Display for BulkHashError {
 impl std::error::Error for BulkHashError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            BulkHashError::Io(e) => Some(e),
-            BulkHashError::ZipError(e) => Some(e),
-            BulkHashError::JsonError(e) => Some(e),
+            Self::Io { source, .. } => Some(source),
+            Self::ZipError(e) => Some(e),
+            Self::JsonError(e) => Some(e),
+            Self::TauriError(e) => Some(e),
             _ => None,
         }
     }
 }
 
+impl serde::Serialize for BulkHashError {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut state = serializer.serialize_struct("BulkHashError", 2)?;
+        state.serialize_field("kind", self.kind())?;
+        state.serialize_field("message", &self.to_string())?;
+        state.end()
+    }
+}
+
 impl From<io::Error> for BulkHashError {
-    fn from(err: io::Error) -> Self {
-        BulkHashError::Io(err)
+    fn from(source: io::Error) -> Self {
+        Self::Io { path: None, source }
     }
 }
 
 impl From<serde_json::Error> for BulkHashError {
     fn from(err: serde_json::Error) -> Self {
-        BulkHashError::JsonError(err)
+        Self::JsonError(err)
     }
 }
 
 impl From<zip::result::ZipError> for BulkHashError {
     fn from(err: zip::result::ZipError) -> Self {
-        BulkHashError::ZipError(err)
+        Self::ZipError(err)
+    }
+}
+
+impl From<tauri::Error> for BulkHashError {
+    fn from(err: tauri::Error) -> Self {
+        Self::TauriError(err)
     }
 }

@@ -1,13 +1,18 @@
-use blake3;
-use hex;
+use crate::core::io::bulk_hash_error::BulkHashError;
 use sha2::{Digest, Sha256};
 use std::fs::File;
-use std::io::{self, BufReader, Read};
+use std::io::{self, Read};
+use std::path::Path;
+
+const HASH_BUFFER_SIZE: usize = 64 * 1024;
 
 pub struct HashManager {
     files_counted: usize,
     algorithm: HashAlgorithm,
+    buffer: Vec<u8>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum HashAlgorithm {
     Sha256,
     Blake3,
@@ -15,74 +20,78 @@ pub enum HashAlgorithm {
 
 impl HashManager {
     pub fn new(algorithm: HashAlgorithm) -> Self {
-        HashManager {
+        Self {
             files_counted: 0,
             algorithm,
+            buffer: vec![0u8; HASH_BUFFER_SIZE],
         }
     }
 
-    pub fn get_hash_code(&mut self, path: &str) -> io::Result<String> {
-        let file = File::open(path)?;
+    pub fn get_hash_code(&mut self, path: impl AsRef<Path>) -> Result<String, BulkHashError> {
+        let path_ref = path.as_ref();
+        let path_display = path_ref.to_string_lossy().into_owned();
 
-        let mut reader = BufReader::new(file);
-
-        let mut buffer: [u8; 65536] = [0u8; 64 * 1024];
+        let mut file = File::open(path_ref)
+            .map_err(|err| BulkHashError::from_io(err, path_display.clone()))?;
 
         let hex_string = match self.algorithm {
             HashAlgorithm::Blake3 => {
                 let mut hasher = blake3::Hasher::new();
 
                 loop {
-                    let read_bytes = reader.read(&mut buffer)?;
-
-                    if read_bytes == 0 {
-                        break;
+                    match file.read(&mut self.buffer) {
+                        Ok(0) => break,
+                        Ok(read_bytes) => {
+                            if let Some(chunk) = self.buffer.get(..read_bytes) {
+                                hasher.update(chunk);
+                            }
+                        }
+                        Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                        Err(err) => return Err(BulkHashError::from_io(err, path_display)),
                     }
-
-                    let byte_part = &buffer[..read_bytes];
-
-                    hasher.update(byte_part);
                 }
 
-                let final_hash = hasher.finalize();
-                println!("File {} hashed!", path);
-                final_hash.to_string()
+                hasher.finalize().to_hex().to_string()
             }
             HashAlgorithm::Sha256 => {
                 let mut hasher = Sha256::new();
 
                 loop {
-                    let read_bytes = reader.read(&mut buffer)?;
-
-                    if read_bytes == 0 {
-                        break;
+                    match file.read(&mut self.buffer) {
+                        Ok(0) => break,
+                        Ok(read_bytes) => {
+                            if let Some(chunk) = self.buffer.get(..read_bytes) {
+                                hasher.update(chunk);
+                            }
+                        }
+                        Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                        Err(err) => return Err(BulkHashError::from_io(err, path_display)),
                     }
-
-                    let byte_part = &buffer[..read_bytes];
-
-                    hasher.update(byte_part);
                 }
 
-                let final_hash = hasher.finalize();
-
-                hex::encode(final_hash)
+                hex::encode(hasher.finalize())
             }
         };
 
-        self.files_counted += 1;
+        self.files_counted = self.files_counted.saturating_add(1);
 
         Ok(hex_string)
     }
-    pub fn get_files_counted(&self) -> &usize {
-        &self.files_counted
+
+    pub fn get_files_counted(&self) -> usize {
+        self.files_counted
+    }
+
+    pub fn reset_counter(&mut self) {
+        self.files_counted = 0;
     }
 }
 
 impl HashAlgorithm {
-    pub fn get_hash_from_bytes(&self, bytes: &[u8]) -> String {
+    pub fn get_hash_from_bytes(self, bytes: &[u8]) -> String {
         match self {
-            HashAlgorithm::Blake3 => blake3::hash(bytes).to_hex().to_string(),
-            HashAlgorithm::Sha256 => {
+            Self::Blake3 => blake3::hash(bytes).to_hex().to_string(),
+            Self::Sha256 => {
                 let mut hasher = Sha256::new();
                 hasher.update(bytes);
                 hex::encode(hasher.finalize())
