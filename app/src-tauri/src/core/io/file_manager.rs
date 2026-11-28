@@ -8,7 +8,7 @@ use std::{
 
 use chrono::{DateTime, Local, SecondsFormat, Utc};
 use serde_json::Value;
-use zeroize::Zeroizing;
+use sha2::{Digest, Sha256};
 use zip::{CompressionMethod, ZipArchive, ZipWriter, write::SimpleFileOptions};
 
 use crate::core::{
@@ -22,7 +22,7 @@ use crate::core::{
         directory_node::DirectoryNode,
         encryption::{
             ENCRYPTED_TREE_ENTRY, EncryptionOptions, PayloadCompression, build_tree_aad,
-            decrypt_tree_payload, encrypt_tree_payload_with_compression, parse_encryption_metadata,
+            decrypt_tree_payload, encrypt_json_tree_with_compression, parse_encryption_metadata,
             prepare_encryption_metadata_with_compression,
         },
         meta_data::MetaData,
@@ -40,9 +40,46 @@ const MAX_HASH_BYTES: u64 = 1024; // 1 KiB
 const MAX_TREE_BYTES: u64 = 512 * 1024 * 1024; // 512 MiB
 /// Accommodates worst-case Deflate expansion (~0.03%) plus the 16-byte AES-GCM authentication tag.
 const MAX_ENCRYPTED_TREE_BYTES: u64 = MAX_TREE_BYTES + (1024 * 1024); // 513 MiB
+/// Upper bound on pre-allocation derived from untrusted ZIP central directory entry sizes.
+const MAX_ENTRY_PREALLOC_BYTES: u64 = 8 * 1024 * 1024; // 8 MiB
 const MAX_UNIQUE_PATH_ATTEMPTS: usize = 10_000;
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Streaming `Write` adapter that feeds every written byte into a `Sha256` digest while
+/// forwarding to the underlying writer (e.g., `ZipWriter`), avoiding buffering the full
+/// `tree.json` payload in memory when saving snapshots.
+struct Sha256HashingWriter<W> {
+    inner: W,
+    hasher: Sha256,
+}
+
+impl<W> Sha256HashingWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            hasher: Sha256::new(),
+        }
+    }
+
+    fn finalize_hex(self) -> String {
+        hex::encode(self.hasher.finalize())
+    }
+}
+
+impl<W: Write> Write for Sha256HashingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        if let Some(chunk) = buf.get(..written) {
+            self.hasher.update(chunk);
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
 
 struct ProbedArchive {
     archive: ZipArchive<BufReader<File>>,
@@ -971,6 +1008,9 @@ impl FileManager {
                 MAX_TREE_BYTES,
                 &probed.path_display,
             )?;
+            // Free ciphertext and AAD buffers before deserializing the full directory tree.
+            drop(ciphertext);
+            drop(aad);
             let plaintext_hash = HashAlgorithm::Sha256.get_hash_from_bytes(&tree_bytes);
 
             Self::finalize_loaded_snapshot(
@@ -1289,14 +1329,14 @@ impl FileManager {
             let meta_bytes = serde_json::to_vec(&effective_meta)?;
 
             let aad = build_tree_aad(effective_meta.get_version(), &meta_bytes);
-            let tree_bytes = Zeroizing::new(serde_json::to_vec(json)?);
-            let ciphertext = encrypt_tree_payload_with_compression(
-                &tree_bytes,
+            let ciphertext = encrypt_json_tree_with_compression(
+                json,
                 enc_options,
                 &enc_meta,
                 &aad,
                 compression,
             )?;
+            drop(aad);
             let ciphertext_hash = HashAlgorithm::Sha256.get_hash_from_bytes(&ciphertext);
 
             zip.start_file("meta.json", entry_options)?;
@@ -1310,6 +1350,7 @@ impl FileManager {
             zip.start_file(ENCRYPTED_TREE_ENTRY, stored_options)?;
             zip.write_all(&ciphertext)
                 .map_err(|err| BulkHashError::from_io(err, output_display))?;
+            drop(ciphertext);
 
             zip.start_file("hash.sha256", entry_options)?;
             zip.write_all(ciphertext_hash.as_bytes())
@@ -1320,14 +1361,26 @@ impl FileManager {
                 .with_encryption_metadata(None)
                 .with_compression_metadata(compression_meta);
             zip.start_file("meta.json", entry_options)?;
-            serde_json::to_writer(&mut zip, &clean_meta)?;
+            serde_json::to_writer(&mut zip, &clean_meta).map_err(|err| {
+                if err.is_io() {
+                    BulkHashError::from_io(err.into(), output_display)
+                } else {
+                    BulkHashError::JsonError(err)
+                }
+            })?;
 
-            let tree = serde_json::to_vec(json)?;
-            let hash = HashAlgorithm::Sha256.get_hash_from_bytes(&tree);
-
+            // Stream `tree.json` straight into the ZIP compressor while computing SHA-256 in a
+            // single pass so large snapshots avoid allocating a full intermediate JSON buffer.
             zip.start_file("tree.json", entry_options)?;
-            zip.write_all(&tree)
-                .map_err(|err| BulkHashError::from_io(err, output_display))?;
+            let mut hashing_zip = Sha256HashingWriter::new(&mut zip);
+            serde_json::to_writer(&mut hashing_zip, json).map_err(|err| {
+                if err.is_io() {
+                    BulkHashError::from_io(err.into(), output_display)
+                } else {
+                    BulkHashError::JsonError(err)
+                }
+            })?;
+            let hash = hashing_zip.finalize_hex();
 
             zip.start_file("hash.sha256", entry_options)?;
             zip.write_all(hash.as_bytes())
@@ -1501,7 +1554,9 @@ impl FileManager {
         archive_path: &str,
     ) -> Result<Vec<u8>, BulkHashError> {
         let entry = archive.by_name(entry_name)?;
-        let mut buf = Vec::new();
+        let initial_cap =
+            usize::try_from(entry.size().min(max_bytes).min(MAX_ENTRY_PREALLOC_BYTES)).unwrap_or(0);
+        let mut buf = Vec::with_capacity(initial_cap);
         entry
             .take(max_bytes.saturating_add(1))
             .read_to_end(&mut buf)

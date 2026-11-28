@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 
 use aes_gcm::{
     Aes256Gcm, Nonce,
-    aead::{Aead, KeyInit, Payload},
+    aead::{Aead, AeadInOut, KeyInit, Payload},
 };
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
@@ -572,8 +572,10 @@ pub fn encrypt_tree_payload_with_compression(
     let nonce_bytes = metadata.decode_nonce()?;
     let key = derive_key(options.password(), metadata)?;
 
-    let compressed_buf: Option<Zeroizing<Vec<u8>>> = match metadata.payload_compression {
-        PayloadCompression::None => None,
+    match metadata.payload_compression {
+        PayloadCompression::None => {
+            encrypt_buffer_with_key(plaintext_tree_json, &key, nonce_bytes, metadata.cipher, aad)
+        }
         PayloadCompression::Deflate => {
             let mut encoder = DeflateEncoder::new(Vec::new(), compression.to_flate2_compression());
             encoder.write_all(plaintext_tree_json).map_err(|err| {
@@ -586,15 +588,56 @@ pub fn encrypt_tree_payload_with_compression(
                     "failed to finalize compressed tree payload: {err}"
                 ))
             })?;
-            Some(Zeroizing::new(compressed))
+            encrypt_owned_buffer_in_place(
+                Zeroizing::new(compressed),
+                &key,
+                nonce_bytes,
+                metadata.cipher,
+                aad,
+            )
+        }
+    }
+}
+
+/// Serializes `value` directly into the pre-encryption DEFLATE stream (when enabled) and encrypts
+/// the resulting buffer in place with AES-256-GCM, avoiding holding uncompressed JSON, compressed
+/// plaintext, and ciphertext simultaneously in RAM.
+pub(crate) fn encrypt_json_tree_with_compression<T: serde::Serialize>(
+    value: &T,
+    options: &EncryptionOptions,
+    metadata: &EncryptionMetadata,
+    aad: &[u8],
+    compression: CompressionLevel,
+) -> Result<Vec<u8>, BulkHashError> {
+    metadata.validate()?;
+    let nonce_bytes = metadata.decode_nonce()?;
+    let key = derive_key(options.password(), metadata)?;
+
+    let payload_buf = match metadata.payload_compression {
+        PayloadCompression::None => Zeroizing::new(serde_json::to_vec(value)?),
+        PayloadCompression::Deflate => {
+            let mut encoder = DeflateEncoder::new(Vec::new(), compression.to_flate2_compression());
+            serde_json::to_writer(&mut encoder, value)?;
+            let compressed = encoder.finish().map_err(|err| {
+                BulkHashError::EncryptionFailed(format!(
+                    "failed to finalize compressed tree payload: {err}"
+                ))
+            })?;
+            Zeroizing::new(compressed)
         }
     };
 
-    let msg: &[u8] = compressed_buf
-        .as_deref()
-        .map_or(plaintext_tree_json, Vec::as_slice);
+    encrypt_owned_buffer_in_place(payload_buf, &key, nonce_bytes, metadata.cipher, aad)
+}
 
-    match metadata.cipher {
+fn encrypt_buffer_with_key(
+    msg: &[u8],
+    key: &Zeroizing<[u8; AES_256_KEY_LEN]>,
+    nonce_bytes: [u8; AES_GCM_NONCE_LEN],
+    cipher_kind: EncryptionCipher,
+    aad: &[u8],
+) -> Result<Vec<u8>, BulkHashError> {
+    match cipher_kind {
         EncryptionCipher::Aes256Gcm => {
             let cipher = Aes256Gcm::new_from_slice(key.as_ref()).map_err(|_| {
                 BulkHashError::EncryptionFailed(String::from("failed to initialize AES-256-GCM"))
@@ -605,6 +648,31 @@ pub fn encrypt_tree_payload_with_compression(
                 .map_err(|_| {
                     BulkHashError::EncryptionFailed(String::from("AES-256-GCM encryption failed"))
                 })
+        }
+    }
+}
+
+fn encrypt_owned_buffer_in_place(
+    mut buf: Zeroizing<Vec<u8>>,
+    key: &Zeroizing<[u8; AES_256_KEY_LEN]>,
+    nonce_bytes: [u8; AES_GCM_NONCE_LEN],
+    cipher_kind: EncryptionCipher,
+    aad: &[u8],
+) -> Result<Vec<u8>, BulkHashError> {
+    match cipher_kind {
+        EncryptionCipher::Aes256Gcm => {
+            let cipher = Aes256Gcm::new_from_slice(key.as_ref()).map_err(|_| {
+                BulkHashError::EncryptionFailed(String::from("failed to initialize AES-256-GCM"))
+            })?;
+            let nonce = Nonce::from(nonce_bytes);
+            buf.reserve(AES_GCM_TAG_LEN);
+            cipher
+                .encrypt_in_place(&nonce, aad, &mut *buf)
+                .map_err(|_| {
+                    BulkHashError::EncryptionFailed(String::from("AES-256-GCM encryption failed"))
+                })?;
+            // Buffer now contains authenticated ciphertext; move it out without zeroizing ciphertext.
+            Ok(std::mem::take(&mut *buf))
         }
     }
 }
@@ -674,7 +742,9 @@ pub fn decrypt_tree_payload(
         }
         PayloadCompression::Deflate => {
             let mut decoder = DeflateDecoder::new(decrypted.as_slice());
-            let mut decompressed = Zeroizing::new(Vec::new());
+            let max_cap = usize::try_from(max_plaintext_bytes.min(8 * 1024 * 1024)).unwrap_or(0);
+            let initial_cap = decrypted.len().saturating_mul(4).min(max_cap);
+            let mut decompressed = Zeroizing::new(Vec::with_capacity(initial_cap));
             decoder
                 .by_ref()
                 .take(max_plaintext_bytes.saturating_add(1))

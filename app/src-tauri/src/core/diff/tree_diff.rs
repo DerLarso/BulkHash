@@ -17,6 +17,7 @@ use crate::core::diff::integrity::{
 use crate::core::diff::statistics::{
     DiffStatistics, FolderStorageStats, StorageStatistics, compute_diff_statistics,
     compute_folder_storage_stats, compute_storage_statistics, compute_subtree_statistics,
+    compute_top_folder_storage_changes,
 };
 use crate::core::diff::warnings::{
     ComparisonDiagnostics, ComparisonWarning, PrecheckContext, PrecheckReport, WarningCode,
@@ -670,17 +671,17 @@ impl DiffDirectoryNode {
         false
     }
 
-    /// Returns the total number of compared file positions in this subtree.
+    /// Returns the total number of compared file positions in this subtree in $O(1)$ time.
     #[must_use]
-    pub fn file_count(&self) -> usize {
-        self.iter_directories()
-            .fold(0usize, |acc, dir| acc.saturating_add(dir.files.len()))
+    pub const fn file_count(&self) -> usize {
+        self.status_summary.files.total()
     }
 
-    /// Returns the total number of compared subdirectories in this subtree (excluding `self`).
+    /// Returns the total number of compared subdirectories in this subtree (excluding `self`) in
+    /// $O(1)$ time.
     #[must_use]
-    pub fn directory_count(&self) -> usize {
-        self.iter_directories().count().saturating_sub(1)
+    pub const fn directory_count(&self) -> usize {
+        self.status_summary.directories.total()
     }
 
     /// Iterates over all files in this subtree matching a specific [`FileStatus`].
@@ -1072,12 +1073,33 @@ impl TreeDiff {
         parent_relative_path: &str,
     ) -> Option<Vec<FolderStorageStats>> {
         let parent = self.find_directory(parent_relative_path)?;
-        let target_depth = parent.depth().saturating_add(1);
-        let mut children: Vec<FolderStorageStats> = parent
-            .folder_storage_stats()
-            .into_iter()
-            .filter(|entry| entry.depth == target_depth)
-            .collect();
+        let mut children = Vec::with_capacity(parent.sub_directories.len());
+        for child in parent.sub_directories.values() {
+            let mut direct_files = FileStatusCounts::default();
+            let mut direct_storage = StorageStatistics::default();
+            for entry in child.files.values() {
+                direct_files.increment(entry.status());
+                direct_storage.record_file(entry);
+            }
+
+            let mut recursive_storage = direct_storage;
+            for grand_child in child.sub_directories.values() {
+                for entry in grand_child.iter_files() {
+                    recursive_storage.record_file(entry);
+                }
+            }
+
+            children.push(FolderStorageStats {
+                name: child.name.clone(),
+                relative_path: child.relative_path.clone(),
+                depth: child.depth,
+                status: child.status,
+                direct_files,
+                recursive_files: child.status_counts(),
+                direct_storage,
+                recursive_storage,
+            });
+        }
         children.sort_by(|a, b| {
             b.recursive_storage
                 .abs_net_delta_bytes()
@@ -1091,22 +1113,7 @@ impl TreeDiff {
     /// absolute direct byte delta descending, then by relative path ascending.
     #[must_use]
     pub fn top_folder_storage_changes(&self, limit: usize) -> Vec<FolderStorageStats> {
-        if limit == 0 {
-            return Vec::new();
-        }
-        let mut changed: Vec<FolderStorageStats> = self
-            .folder_storage_stats()
-            .into_iter()
-            .filter(|entry| entry.direct_storage.net_delta_bytes != 0)
-            .collect();
-        changed.sort_by(|a, b| {
-            b.direct_storage
-                .abs_net_delta_bytes()
-                .cmp(&a.direct_storage.abs_net_delta_bytes())
-                .then_with(|| a.relative_path.cmp(&b.relative_path))
-        });
-        changed.truncate(limit);
-        changed
+        compute_top_folder_storage_changes(&self.root, limit)
     }
 
     /// Finds duplicate files within this diff for the requested [`DiffDuplicateScope`] (`Left`,

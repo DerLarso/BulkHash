@@ -9,7 +9,8 @@ use crate::core::io::{
 };
 use crate::core::structs::bulk_hash_file_struct::BulkHashFileStruct;
 use chrono::{DateTime, Utc};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap, HashSet, hash_map};
 use std::fmt;
 use std::path::Path;
 
@@ -459,37 +460,35 @@ impl DuplicateReport {
     /// folders containing duplicates without re-scanning the tree.
     #[must_use]
     pub fn folder_duplicate_summaries(&self) -> BTreeMap<String, FolderDuplicateSummary> {
-        let mut counts: BTreeMap<String, FolderDuplicateSummary> = BTreeMap::new();
-        let mut distinct_per_folder: HashMap<String, HashSet<usize>> = HashMap::new();
+        let mut per_folder: HashMap<&str, (FolderDuplicateSummary, HashSet<usize>)> =
+            HashMap::new();
 
         for group in &self.groups {
             for file in &group.files {
-                let direct_entry = counts.entry(file.parent_path.clone()).or_default();
-                direct_entry.direct_duplicate_files =
-                    direct_entry.direct_duplicate_files.saturating_add(1);
+                let parent = file.parent_path.as_str();
+                let (direct_summary, _) = per_folder.entry(parent).or_default();
+                direct_summary.direct_duplicate_files =
+                    direct_summary.direct_duplicate_files.saturating_add(1);
 
                 let file_bytes = file.size.unwrap_or(0);
-                for ancestor in ancestor_folder_paths(&file.parent_path) {
-                    let entry = counts.entry(ancestor.clone()).or_default();
-                    entry.recursive_duplicate_files =
-                        entry.recursive_duplicate_files.saturating_add(1);
-                    entry.recursive_duplicate_bytes =
-                        entry.recursive_duplicate_bytes.saturating_add(file_bytes);
-                    distinct_per_folder
-                        .entry(ancestor)
-                        .or_default()
-                        .insert(group.group_id);
-                }
+                for_each_ancestor_folder(parent, |ancestor| {
+                    let (summary, group_ids) = per_folder.entry(ancestor).or_default();
+                    summary.recursive_duplicate_files =
+                        summary.recursive_duplicate_files.saturating_add(1);
+                    summary.recursive_duplicate_bytes =
+                        summary.recursive_duplicate_bytes.saturating_add(file_bytes);
+                    group_ids.insert(group.group_id);
+                });
             }
         }
 
-        for (folder, group_ids) in distinct_per_folder {
-            if let Some(summary) = counts.get_mut(&folder) {
+        per_folder
+            .into_iter()
+            .map(|(folder, (mut summary, group_ids))| {
                 summary.distinct_groups = group_ids.len();
-            }
-        }
-
-        counts
+                (folder.to_owned(), summary)
+            })
+            .collect()
     }
 }
 
@@ -672,16 +671,7 @@ pub fn find_duplicates_in_diff_with_options(
             continue;
         };
 
-        let rel_path = diff_entry.relative_path().to_string();
-        let parent_path = parent_rel_path(&rel_path);
-        acc.record(
-            entry,
-            name.to_string(),
-            rel_path,
-            parent_path,
-            Some(diff_entry.presence()),
-            Some(diff_entry.status()),
-        );
+        acc.record(entry, || (name, diff_entry, entry));
     }
 
     let source = DuplicateSource::Diff {
@@ -689,7 +679,18 @@ pub fn find_duplicates_in_diff_with_options(
         left_root_name: diff.left_info().root_name.clone(),
         right_root_name: diff.right_info().root_name.clone(),
     };
-    acc.finish(source)
+    acc.finish(source, |(name, diff_entry, entry)| {
+        let rel_path = diff_entry.relative_path();
+        DuplicateOccurrence {
+            name: name.to_owned(),
+            relative_path: rel_path.to_owned(),
+            parent_path: parent_rel_path(rel_path),
+            size: entry.size(),
+            modified_utc: entry.modified_utc(),
+            presence: Some(diff_entry.presence()),
+            status: Some(diff_entry.status()),
+        }
+    })
 }
 
 fn scan_directory_node_duplicates(
@@ -698,37 +699,73 @@ fn scan_directory_node_duplicates(
     options: &DuplicateOptions,
 ) -> DuplicateReport {
     let mut acc = DuplicateAccumulator::new(options);
-    let mut stack: Vec<(&DirectoryNode, String)> = vec![(root, String::new())];
+    let mut dir_paths: Vec<String> = vec![String::new()];
+    let mut stack: Vec<(&DirectoryNode, usize)> = vec![(root, 0)];
 
-    while let Some((dir, dir_rel)) = stack.pop() {
+    while let Some((dir, dir_idx)) = stack.pop() {
         for (file_name, entry) in &dir.files {
-            let rel_path = join_rel_path(&dir_rel, file_name);
-            acc.record(
-                entry,
-                file_name.clone(),
-                rel_path,
-                dir_rel.clone(),
-                None,
-                None,
-            );
+            acc.record(entry, || (dir_idx, file_name.as_str(), entry));
         }
 
         for (child_name, child_dir) in dir.sub_directories.iter().rev() {
-            let child_rel = join_rel_path(&dir_rel, child_name);
-            stack.push((child_dir, child_rel));
+            let child_rel = join_rel_path(&dir_paths[dir_idx], child_name);
+            let child_idx = dir_paths.len();
+            dir_paths.push(child_rel);
+            stack.push((child_dir, child_idx));
         }
     }
 
-    acc.finish(source)
+    acc.finish(source, |(dir_idx, file_name, entry)| {
+        let dir_rel = &dir_paths[dir_idx];
+        DuplicateOccurrence {
+            name: file_name.to_owned(),
+            relative_path: join_rel_path(dir_rel, file_name),
+            parent_path: dir_rel.clone(),
+            size: entry.size(),
+            modified_utc: entry.modified_utc(),
+            presence: None,
+            status: None,
+        }
+    })
 }
 
-struct DuplicateAccumulator<'a> {
+enum DuplicateBucket<T> {
+    Single(T),
+    Multiple(Vec<T>),
+}
+
+impl<T> DuplicateBucket<T> {
+    fn push(&mut self, item: T) {
+        match self {
+            Self::Single(_) => {
+                let prev = std::mem::replace(self, Self::Multiple(Vec::with_capacity(2)));
+                if let Self::Single(first) = prev
+                    && let Self::Multiple(vec) = self
+                {
+                    vec.push(first);
+                    vec.push(item);
+                }
+            }
+            Self::Multiple(vec) => vec.push(item),
+        }
+    }
+}
+
+fn normalize_hash_key(raw_hash: &str) -> Cow<'_, str> {
+    if raw_hash.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Owned(raw_hash.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(raw_hash)
+    }
+}
+
+struct DuplicateAccumulator<'a, T> {
     options: &'a DuplicateOptions,
     summary: DuplicateSummary,
-    buckets: HashMap<String, Vec<DuplicateOccurrence>>,
+    buckets: HashMap<Cow<'a, str>, DuplicateBucket<T>>,
 }
 
-impl<'a> DuplicateAccumulator<'a> {
+impl<'a, T> DuplicateAccumulator<'a, T> {
     fn new(options: &'a DuplicateOptions) -> Self {
         Self {
             options,
@@ -737,15 +774,7 @@ impl<'a> DuplicateAccumulator<'a> {
         }
     }
 
-    fn record(
-        &mut self,
-        entry: &FileEntry,
-        name: String,
-        relative_path: String,
-        parent_path: String,
-        presence: Option<EntryPresence>,
-        status: Option<FileStatus>,
-    ) {
+    fn record(&mut self, entry: &'a FileEntry, make_candidate: impl FnOnce() -> T) {
         self.summary.total_files_scanned = self.summary.total_files_scanned.saturating_add(1);
 
         let Some(raw_hash) = entry.hash() else {
@@ -771,29 +800,36 @@ impl<'a> DuplicateAccumulator<'a> {
         self.summary.hashed_files_considered =
             self.summary.hashed_files_considered.saturating_add(1);
 
-        let normalized_hash = raw_hash.to_ascii_lowercase();
-        self.buckets
-            .entry(normalized_hash)
-            .or_default()
-            .push(DuplicateOccurrence {
-                name,
-                relative_path,
-                parent_path,
-                size: entry.size(),
-                modified_utc: entry.modified_utc(),
-                presence,
-                status,
-            });
+        let normalized_hash = normalize_hash_key(raw_hash);
+        let candidate = make_candidate();
+        match self.buckets.entry(normalized_hash) {
+            hash_map::Entry::Vacant(slot) => {
+                slot.insert(DuplicateBucket::Single(candidate));
+            }
+            hash_map::Entry::Occupied(mut slot) => {
+                slot.get_mut().push(candidate);
+            }
+        }
     }
 
-    fn finish(mut self, source: DuplicateSource) -> DuplicateReport {
+    fn finish(
+        mut self,
+        source: DuplicateSource,
+        mut materialize: impl FnMut(T) -> DuplicateOccurrence,
+    ) -> DuplicateReport {
         let min_copies = self.options.effective_min_copies();
         let mut groups: Vec<DuplicateGroup> = Vec::new();
 
-        for (hash, mut files) in self.buckets {
-            if files.len() < min_copies {
+        for (hash, bucket) in self.buckets {
+            let DuplicateBucket::Multiple(candidates) = bucket else {
+                continue;
+            };
+            if candidates.len() < min_copies {
                 continue;
             }
+
+            let mut files: Vec<DuplicateOccurrence> =
+                candidates.into_iter().map(&mut materialize).collect();
             files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
 
             let copy_count = files.len();
@@ -827,7 +863,7 @@ impl<'a> DuplicateAccumulator<'a> {
 
             groups.push(DuplicateGroup {
                 group_id: 0,
-                hash,
+                hash: hash.into_owned(),
                 copy_count,
                 file_size,
                 total_bytes,
@@ -958,20 +994,19 @@ fn normalize_rel_path(path: &str) -> String {
         .join("/")
 }
 
-fn ancestor_folder_paths(folder_rel_path: &str) -> Vec<String> {
+fn for_each_ancestor_folder<'a>(folder_rel_path: &'a str, mut visit: impl FnMut(&'a str)) {
     if folder_rel_path.is_empty() {
-        return vec![String::new()];
+        visit("");
+        return;
     }
 
-    let mut ancestors = Vec::new();
     let mut current = folder_rel_path;
     loop {
-        ancestors.push(current.to_string());
+        visit(current);
         let Some((parent, _)) = current.rsplit_once('/') else {
-            ancestors.push(String::new());
+            visit("");
             break;
         };
         current = parent;
     }
-    ancestors
 }

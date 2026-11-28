@@ -439,6 +439,81 @@ pub fn compute_folder_storage_stats(root: &DiffDirectoryNode) -> Vec<FolderStora
     stats
 }
 
+/// Computes up to `limit` directories with non-zero direct storage delta, ordered by largest
+/// absolute direct byte delta descending, then by relative path ascending, without allocating
+/// folder name/path strings for unchanged or out-of-range directories.
+#[must_use]
+pub(crate) fn compute_top_folder_storage_changes(
+    root: &DiffDirectoryNode,
+    limit: usize,
+) -> Vec<FolderStorageStats> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let mut nodes: Vec<(&DiffDirectoryNode, Option<usize>)> = Vec::new();
+    let mut stack: Vec<(&DiffDirectoryNode, Option<usize>)> = vec![(root, None)];
+
+    while let Some((dir, parent_idx)) = stack.pop() {
+        let current_idx = nodes.len();
+        nodes.push((dir, parent_idx));
+        for child in dir.sub_directories().values().rev() {
+            stack.push((child, Some(current_idx)));
+        }
+    }
+
+    let mut direct_files_vec: Vec<FileStatusCounts> = Vec::with_capacity(nodes.len());
+    let mut direct_storage_vec: Vec<StorageStatistics> = Vec::with_capacity(nodes.len());
+    let mut recursive_storage_vec: Vec<StorageStatistics> = Vec::with_capacity(nodes.len());
+
+    for &(dir, _) in &nodes {
+        let mut direct_files = FileStatusCounts::default();
+        let mut direct_storage = StorageStatistics::default();
+        for entry in dir.files().values() {
+            direct_files.increment(entry.status());
+            direct_storage.record_file(entry);
+        }
+        direct_files_vec.push(direct_files);
+        direct_storage_vec.push(direct_storage);
+        recursive_storage_vec.push(direct_storage);
+    }
+
+    for idx in (0..nodes.len()).rev() {
+        if let Some(parent_idx) = nodes[idx].1 {
+            let child_storage = recursive_storage_vec[idx];
+            recursive_storage_vec[parent_idx].merge(&child_storage);
+        }
+    }
+
+    let mut changed_indices: Vec<usize> = (0..nodes.len())
+        .filter(|&idx| direct_storage_vec[idx].net_delta_bytes != 0)
+        .collect();
+    changed_indices.sort_by(|&a, &b| {
+        direct_storage_vec[b]
+            .abs_net_delta_bytes()
+            .cmp(&direct_storage_vec[a].abs_net_delta_bytes())
+            .then_with(|| nodes[a].0.relative_path().cmp(nodes[b].0.relative_path()))
+    });
+    changed_indices.truncate(limit);
+
+    changed_indices
+        .into_iter()
+        .map(|idx| {
+            let dir = nodes[idx].0;
+            FolderStorageStats {
+                name: dir.name().to_string(),
+                relative_path: dir.relative_path().to_string(),
+                depth: dir.depth(),
+                status: dir.status(),
+                direct_files: direct_files_vec[idx],
+                recursive_files: dir.status_counts(),
+                direct_storage: direct_storage_vec[idx],
+                recursive_storage: recursive_storage_vec[idx],
+            }
+        })
+        .collect()
+}
+
 /// Formats an unsigned byte count in binary IEC units (`B`, `KiB`, `MiB`, `GiB`, `TiB`, `PiB`,
 /// `EiB`).
 #[must_use]

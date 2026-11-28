@@ -490,17 +490,18 @@ impl IntegrityReport {
     /// findings (including `""` for root) so GUI tree viewers can highlight corrupted folders.
     #[must_use]
     pub fn folder_integrity_summaries(&self) -> BTreeMap<String, FolderIntegritySummary> {
-        let mut map: HashMap<String, FolderIntegritySummary> = HashMap::new();
+        let mut map: HashMap<&str, FolderIntegritySummary> = HashMap::new();
 
         for finding in &self.findings {
-            let direct = map.entry(finding.parent_path.clone()).or_default();
+            let parent = finding.parent_path.as_str();
+            let direct = map.entry(parent).or_default();
             direct.direct_findings = direct.direct_findings.saturating_add(1);
 
             let bytes = finding.right_size.or(finding.left_size).unwrap_or(0);
             let is_bitrot = finding.is_bitrot_suspect();
             let is_read_err = matches!(finding.kind, IntegrityFindingKind::ReadError);
 
-            for ancestor in ancestor_folder_paths(&finding.parent_path) {
+            for_each_ancestor_folder(parent, |ancestor| {
                 let entry = map.entry(ancestor).or_default();
                 entry.recursive_findings = entry.recursive_findings.saturating_add(1);
                 if is_bitrot {
@@ -512,10 +513,12 @@ impl IntegrityReport {
                 }
                 entry.recursive_affected_bytes =
                     entry.recursive_affected_bytes.saturating_add(bytes);
-            }
+            });
         }
 
-        map.into_iter().collect()
+        map.into_iter()
+            .map(|(folder, summary)| (folder.to_owned(), summary))
+            .collect()
     }
 }
 
@@ -1060,20 +1063,19 @@ fn normalize_rel_path(path: &str) -> String {
         .join("/")
 }
 
-fn ancestor_folder_paths(folder_rel_path: &str) -> Vec<String> {
+fn for_each_ancestor_folder<'a>(folder_rel_path: &'a str, mut visit: impl FnMut(&'a str)) {
     if folder_rel_path.is_empty() {
-        return vec![String::new()];
+        visit("");
+        return;
     }
 
-    let mut ancestors = Vec::new();
     let mut current = folder_rel_path;
     loop {
-        ancestors.push(current.to_string());
+        visit(current);
         let Some((parent, _)) = current.rsplit_once('/') else {
-            ancestors.push(String::new());
+            visit("");
             break;
         };
         current = parent;
     }
-    ancestors
 }

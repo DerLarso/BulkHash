@@ -4,6 +4,7 @@ use serde::{
     de::{self, MapAccess, Visitor},
     ser::SerializeStruct,
 };
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Component, Path};
@@ -282,43 +283,57 @@ impl DirectoryNode {
 
         let mut current = self;
         for &folder in dirs {
-            current = current
-                .sub_directories
-                .entry(folder.to_string())
-                .or_insert_with(|| Self::new(folder.to_string()));
+            current = current.get_or_create_subdir(folder);
         }
 
         current.files.insert(file_name.to_string(), entry.into());
+    }
+
+    fn get_or_create_subdir(&mut self, folder: &str) -> &mut Self {
+        if !self.sub_directories.contains_key(folder) {
+            self.sub_directories
+                .insert(folder.to_owned(), Self::new(folder.to_owned()));
+        }
+        self.sub_directories
+            .get_mut(folder)
+            .expect("subdirectory was just inserted or already existed")
     }
 
     #[must_use]
     pub fn build_tree(start_path: &str, file_list: &[FileInfo]) -> Self {
         let mut root = Self::new(start_path.to_string());
         let base_path = Path::new(start_path);
+        let mut parts_buf: Vec<Cow<'_, str>> = Vec::new();
 
         for file in file_list {
             let full_path = Path::new(file.get_path());
             let relative_path = full_path.strip_prefix(base_path).unwrap_or(full_path);
 
-            let owned_parts: Vec<String> = relative_path
-                .components()
-                .filter_map(|component| match component {
-                    Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
-                    _ => None,
-                })
-                .collect();
+            parts_buf.clear();
+            for component in relative_path.components() {
+                if let Component::Normal(part) = component {
+                    parts_buf.push(part.to_string_lossy());
+                }
+            }
 
-            let owned_parts = if owned_parts.is_empty() {
-                full_path
-                    .file_name()
-                    .map(|name| vec![name.to_string_lossy().into_owned()])
-                    .unwrap_or_default()
-            } else {
-                owned_parts
+            if parts_buf.is_empty()
+                && let Some(name) = full_path.file_name()
+            {
+                parts_buf.push(name.to_string_lossy());
+            }
+
+            let Some((file_name, dirs)) = parts_buf.split_last() else {
+                continue;
             };
 
-            let path_parts: Vec<&str> = owned_parts.iter().map(String::as_str).collect();
-            root.insert_path(&path_parts, FileEntry::from_file_info(file));
+            let mut current = &mut root;
+            for folder in dirs {
+                current = current.get_or_create_subdir(folder.as_ref());
+            }
+
+            current
+                .files
+                .insert(file_name.as_ref().to_owned(), FileEntry::from_file_info(file));
         }
 
         root

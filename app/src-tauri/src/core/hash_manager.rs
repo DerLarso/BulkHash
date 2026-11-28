@@ -14,7 +14,7 @@ use std::hash::Hasher;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Instant, SystemTime};
 use xxhash_rust::xxh3::{Xxh3, xxh3_64, xxh3_128};
 use xxhash_rust::xxh64::{Xxh64, xxh64};
@@ -510,28 +510,76 @@ impl HashManager {
     }
 }
 
+fn run_dynamic_work_queue<T, F>(
+    items: &[T],
+    control: ExecutionControl<'_>,
+    hash_item: F,
+) -> Result<Vec<FileInfo>, BulkHashError>
+where
+    T: Sync,
+    F: Fn(&mut [u8], &T) -> Result<FileInfo, BulkHashError> + Sync,
+{
+    let len = items.len();
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+
+    let worker_count = rayon::current_num_threads().min(len).max(1);
+    let next_idx = AtomicUsize::new(0);
+
+    // Spawn one stealable worker task per pool thread; each worker lazily allocates a single
+    // reusable 64 KiB read buffer and pulls the next available index dynamically so LPT
+    // largest-first scheduling actually keeps every core busy on mixed file sizes.
+    let worker_chunks: Vec<Vec<(usize, FileInfo)>> = (0..worker_count)
+        .into_par_iter()
+        .with_max_len(1)
+        .map(|_| {
+            let mut buffer: Option<Vec<u8>> = None;
+            let mut local = Vec::new();
+            loop {
+                control.checkpoint()?;
+                let idx = next_idx.fetch_add(1, Ordering::Relaxed);
+                let Some(item) = items.get(idx) else {
+                    break;
+                };
+                let buf = buffer.get_or_insert_with(|| vec![0u8; HASH_BUFFER_SIZE]);
+                let info = hash_item(buf, item)?;
+                local.push((idx, info));
+            }
+            Ok(local)
+        })
+        .collect::<Result<Vec<_>, BulkHashError>>()?;
+
+    let mut ordered: Vec<Option<FileInfo>> = Vec::with_capacity(len);
+    ordered.resize_with(len, || None);
+    for chunk in worker_chunks {
+        for (idx, info) in chunk {
+            if let Some(slot) = ordered.get_mut(idx) {
+                *slot = Some(info);
+            }
+        }
+    }
+
+    Ok(ordered.into_iter().flatten().collect())
+}
+
 fn hash_paths_parallel<P>(algorithm: HashAlgorithm, paths: &[P]) -> Vec<FileInfo>
 where
     P: AsRef<Path> + Sync,
 {
-    paths
-        .par_iter()
-        .map_init(
-            || vec![0u8; HASH_BUFFER_SIZE],
-            |buffer, path| {
-                let path_ref = path.as_ref();
-                let path_display = path_ref.to_string_lossy().into_owned();
-                hash_file_info_with_buffer(
-                    algorithm,
-                    buffer,
-                    path_ref,
-                    path_display.clone(),
-                    ExecutionControl::None,
-                )
-                .unwrap_or_else(|err| FileInfo::new(path_display, Err(err)))
-            },
+    run_dynamic_work_queue(paths, ExecutionControl::None, |buffer, path| {
+        let path_ref = path.as_ref();
+        let path_display = path_ref.to_string_lossy().into_owned();
+        Ok(hash_file_info_with_buffer(
+            algorithm,
+            buffer,
+            path_ref,
+            path_display.clone(),
+            ExecutionControl::None,
         )
-        .collect()
+        .unwrap_or_else(|err| FileInfo::new(path_display, Err(err))))
+    })
+    .unwrap_or_default()
 }
 
 fn hash_paths_parallel_controlled<P>(
@@ -542,19 +590,11 @@ fn hash_paths_parallel_controlled<P>(
 where
     P: AsRef<Path> + Sync,
 {
-    paths
-        .par_iter()
-        .map_init(
-            || vec![0u8; HASH_BUFFER_SIZE],
-            |buffer, path| {
-                control.checkpoint()?;
-
-                let path_ref = path.as_ref();
-                let path_display = path_ref.to_string_lossy().into_owned();
-                hash_file_info_with_buffer(algorithm, buffer, path_ref, path_display, control)
-            },
-        )
-        .collect()
+    run_dynamic_work_queue(paths, control, |buffer, path| {
+        let path_ref = path.as_ref();
+        let path_display = path_ref.to_string_lossy().into_owned();
+        hash_file_info_with_buffer(algorithm, buffer, path_ref, path_display, control)
+    })
 }
 
 fn hash_discovered_parallel_controlled(
@@ -562,16 +602,9 @@ fn hash_discovered_parallel_controlled(
     files: &[DiscoveredFile],
     control: ExecutionControl<'_>,
 ) -> Result<Vec<FileInfo>, BulkHashError> {
-    files
-        .par_iter()
-        .map_init(
-            || vec![0u8; HASH_BUFFER_SIZE],
-            |buffer, file| {
-                control.checkpoint()?;
-                hash_discovered_file_with_buffer(algorithm, buffer, file, control)
-            },
-        )
-        .collect()
+    run_dynamic_work_queue(files, control, |buffer, file| {
+        hash_discovered_file_with_buffer(algorithm, buffer, file, control)
+    })
 }
 
 fn hash_discovered_file_with_buffer(
