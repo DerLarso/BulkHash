@@ -1,6 +1,12 @@
+pub mod file_status;
 pub mod tree_diff;
 pub mod warnings;
 
+pub use file_status::{
+    FileStatus, FileStatusCounts, FileStatusDetail, FileStatusFilter, FileStatusInfo,
+    FileStatusPolicy, ParseFileStatusError, classify_file_entry, classify_file_entry_detailed,
+    classify_pair,
+};
 pub use tree_diff::{
     ComparisonOptions, DiffDirIter, DiffDirectoryNode, DiffFileEntry, DiffFileIter, EntryPresence,
     FileComparisonOutcome, NameMatchingMode, TreeComparer, TreeDiff, TreeSideInfo,

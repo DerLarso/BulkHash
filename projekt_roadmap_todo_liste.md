@@ -32,7 +32,7 @@ Backend - Dateiformat & IO (.hashed):
 
 Backend - Diff-Engine & Analyse:
 	[#] Baum-Vergleichsalgorithmus: Rekursiver Abgleich von zwei DirectoryNode-Strukturen ; Rust
-	[X] Datei-Status-Erkennung: Kategorisierung in Unverändert, Geändert, Neu, Gelöscht und Fehler ; Rust
+	[#] Datei-Status-Erkennung: Kategorisierung in Unverändert, Geändert, Neu, Gelöscht und Fehler ; Rust
 	[X] Move- & Rename-Erkennung: Identifizieren verschobener oder umbenannter Dateien anhand gleicher Hashes ; Rust
 	[X] Ordner-Status-Propagation: Markiert übergeordnete Ordner farbig, wenn sich tiefere Dateien geändert haben ; Rust
 	[X] Diff-Statistiken: Berechnung der Gesamtzahl aller Änderungen sowie der Speicherplatz-Differenz ; Rust

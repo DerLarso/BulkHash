@@ -1,8 +1,10 @@
 use bulk_hash_lib::core::{
     diff::{
         ComparisonOptions, ComparisonWarning, DiffDirectoryNode, DiffFileEntry, EntryPresence,
-        FileComparisonOutcome, MAX_WARNING_SAMPLES, NameMatchingMode, PrecheckReport, TreeComparer,
-        TreeDiff, WarningCode, WarningDetails, WarningSeverity, compare_snapshots,
+        FileComparisonOutcome, FileStatus, FileStatusCounts, FileStatusDetail, FileStatusFilter,
+        FileStatusPolicy, MAX_WARNING_SAMPLES, NameMatchingMode, PrecheckReport, TreeComparer,
+        TreeDiff, WarningCode, WarningDetails, WarningSeverity, classify_file_entry,
+        classify_file_entry_detailed, classify_pair, compare_snapshots,
         compare_snapshots_with_options, compare_trees, compare_trees_with_options,
         extract_path_basename, infer_os_from_path, precheck_archive_files, precheck_metadata,
         precheck_snapshots, precheck_trees, precheck_trees_with_metadata,
@@ -1129,4 +1131,363 @@ fn precheck_archive_files_works_passwordlessly_on_encrypted_and_unencrypted_arch
         .expect("same archive precheck");
     assert!(same_enc.has_warning(WarningCode::IdenticalSnapshot));
     assert!(!same_enc.requires_confirmation());
+}
+
+fn build_five_status_sample_diff() -> TreeDiff {
+    let t1 = utc(2026, 7, 1, 10, 0, 0);
+    let t2 = utc(2026, 7, 2, 12, 0, 0);
+
+    let mut left = DirectoryNode::new(String::from("/data/app"));
+    left.insert_path(&["unchanged.txt"], file_entry(hash64('a'), 100, t1));
+    left.insert_path(&["content_mod.txt"], file_entry(hash64('b'), 100, t1));
+    left.insert_path(&["meta_mod.txt"], file_entry(hash64('c'), 200, t1));
+    left.insert_path(&["removed.txt"], file_entry(hash64('d'), 300, t1));
+    left.insert_path(
+        &["err_both.txt"],
+        FileEntry::from_error(String::from("left read failed"), None, None),
+    );
+    left.insert_path(
+        &["err_left_only.txt"],
+        FileEntry::from_error(String::from("locked in baseline"), None, None),
+    );
+    left.insert_path(&["sub", "ok_removed.txt"], file_entry(hash64('e'), 40, t1));
+
+    let mut right = DirectoryNode::new(String::from("/data/app"));
+    right.insert_path(&["unchanged.txt"], file_entry(hash64('A'), 100, t1));
+    right.insert_path(&["content_mod.txt"], file_entry(hash64('f'), 120, t2));
+    right.insert_path(&["meta_mod.txt"], file_entry(hash64('c'), 200, t2));
+    right.insert_path(&["added.txt"], file_entry(hash64('1'), 50, t2));
+    right.insert_path(
+        &["err_both.txt"],
+        FileEntry::from_error(String::from("right read failed"), None, None),
+    );
+    right.insert_path(
+        &["err_right_only.txt"],
+        FileEntry::from_error(String::from("locked in target"), None, None),
+    );
+    right.insert_path(&["sub", "ok_added.txt"], file_entry(hash64('2'), 60, t2));
+
+    compare_trees(&left, &right)
+}
+
+#[test]
+fn file_status_categorizes_all_five_states_and_details_accurately() {
+    let diff = build_five_status_sample_diff();
+
+    // Verify all 5 core categories on individual entries + rich status details.
+    let unchanged = diff.find_file("unchanged.txt").expect("unchanged");
+    assert_eq!(unchanged.status(), FileStatus::Unchanged);
+    assert_eq!(
+        unchanged.status_detail(),
+        FileStatusDetail::Unchanged {
+            name_case_differs: false,
+            metadata_differs: false,
+        }
+    );
+
+    let content_mod = diff.find_file("content_mod.txt").expect("content_mod");
+    assert_eq!(content_mod.status(), FileStatus::Modified);
+    assert!(content_mod.status_detail().is_content_modification());
+    assert!(!content_mod.status_detail().is_metadata_only_modification());
+    assert_eq!(
+        content_mod.status_detail(),
+        FileStatusDetail::Modified {
+            content_changed: true,
+            size_changed: Some(true),
+            modified_changed: Some(true),
+        }
+    );
+
+    let meta_mod = diff.find_file("meta_mod.txt").expect("meta_mod");
+    assert_eq!(meta_mod.status(), FileStatus::Modified);
+    assert!(meta_mod.status_detail().is_metadata_only_modification());
+    assert!(!meta_mod.status_detail().is_content_modification());
+    assert_eq!(
+        meta_mod.status_detail(),
+        FileStatusDetail::Modified {
+            content_changed: false,
+            size_changed: Some(false),
+            modified_changed: Some(true),
+        }
+    );
+
+    let added = diff.find_file("added.txt").expect("added");
+    assert_eq!(added.status(), FileStatus::Added);
+    assert_eq!(
+        added.status_detail(),
+        FileStatusDetail::Added {
+            type_conflict: false,
+            has_error: false,
+        }
+    );
+
+    let removed = diff.find_file("removed.txt").expect("removed");
+    assert_eq!(removed.status(), FileStatus::Removed);
+    assert_eq!(
+        removed.status_detail(),
+        FileStatusDetail::Removed {
+            type_conflict: false,
+            has_error: false,
+        }
+    );
+}
+
+#[test]
+fn file_status_error_cases_counts_and_grouping_cover_root_and_subdirectories() {
+    let diff = build_five_status_sample_diff();
+
+    // Both-side and single-side scan errors all surface under FileStatus::Error by default.
+    let err_both = diff.find_file("err_both.txt").expect("err_both");
+    assert_eq!(err_both.status(), FileStatus::Error);
+    assert_eq!(
+        err_both.status_detail(),
+        FileStatusDetail::Error {
+            presence: EntryPresence::Both,
+            left_error: Some(String::from("left read failed")),
+            right_error: Some(String::from("right read failed")),
+        }
+    );
+
+    let err_left = diff.find_file("err_left_only.txt").expect("err_left");
+    assert_eq!(err_left.status(), FileStatus::Error);
+    assert_eq!(
+        err_left.status_detail(),
+        FileStatusDetail::Error {
+            presence: EntryPresence::OnlyLeft,
+            left_error: Some(String::from("locked in baseline")),
+            right_error: None,
+        }
+    );
+
+    let err_right = diff.find_file("err_right_only.txt").expect("err_right");
+    assert_eq!(err_right.status(), FileStatus::Error);
+    assert_eq!(
+        err_right.status_detail(),
+        FileStatusDetail::Error {
+            presence: EntryPresence::OnlyRight,
+            left_error: None,
+            right_error: Some(String::from("locked in target")),
+        }
+    );
+
+    // Every entry satisfies `entry.status_detail().status() == entry.status()`.
+    for entry in diff.iter_files() {
+        assert_eq!(entry.status_detail().status(), entry.status());
+    }
+
+    // Verify status_counts and files_by_status across the whole tree and subdirectories.
+    let counts = diff.status_counts();
+    assert_eq!(
+        counts,
+        FileStatusCounts {
+            unchanged: 1,
+            modified: 2,
+            added: 2,
+            removed: 2,
+            error: 3,
+        }
+    );
+    assert_eq!(counts.total(), 10);
+    assert_eq!(counts.changed_total(), 9);
+    assert_eq!(counts.count_for(FileStatus::Error), 3);
+
+    let grouped = diff.files_by_status();
+    assert_eq!(grouped[&FileStatus::Unchanged].len(), 1);
+    assert_eq!(grouped[&FileStatus::Modified].len(), 2);
+    assert_eq!(grouped[&FileStatus::Added].len(), 2);
+    assert_eq!(grouped[&FileStatus::Removed].len(), 2);
+    assert_eq!(grouped[&FileStatus::Error].len(), 3);
+
+    let sub_counts = diff
+        .find_directory("sub")
+        .expect("sub dir")
+        .status_counts();
+    assert_eq!(sub_counts.added, 1);
+    assert_eq!(sub_counts.removed, 1);
+    assert_eq!(sub_counts.total(), 2);
+}
+
+#[test]
+fn file_status_policy_and_in_place_reclassification_work_consistently() {
+    let t1 = utc(2026, 7, 1, 10, 0, 0);
+    let t2 = utc(2026, 7, 2, 12, 0, 0);
+
+    let mut left = DirectoryNode::new(String::from("/app"));
+    left.insert_path(&["meta_only.txt"], file_entry(hash64('a'), 100, t1));
+    left.insert_path(
+        &["left_err.txt"],
+        FileEntry::from_error(String::from("boom"), None, None),
+    );
+    left.insert_path(
+        &["both_err.txt"],
+        FileEntry::from_error(String::from("boom"), None, None),
+    );
+
+    let mut right = DirectoryNode::new(String::from("/app"));
+    right.insert_path(&["meta_only.txt"], file_entry(hash64('a'), 100, t2));
+    right.insert_path(
+        &["right_err.txt"],
+        FileEntry::from_error(String::from("denied"), None, None),
+    );
+    right.insert_path(&["both_err.txt"], file_entry(hash64('b'), 10, t2));
+
+    // Content-only policy keeps `outcome = MetadataChanged` while classifying `status = Unchanged`.
+    let content_policy = FileStatusPolicy::content_only();
+    let opts = ComparisonOptions::new().with_status_policy(content_policy);
+    let mut diff = compare_trees_with_options(&left, &right, &opts);
+
+    let meta_only = diff.find_file("meta_only.txt").expect("meta_only");
+    assert_eq!(meta_only.outcome(), FileComparisonOutcome::MetadataChanged);
+    assert_eq!(meta_only.status(), FileStatus::Unchanged);
+    assert_eq!(
+        meta_only.status_detail(),
+        FileStatusDetail::Unchanged {
+            name_case_differs: false,
+            metadata_differs: true,
+        }
+    );
+
+    // Non-mutating policy preview helpers.
+    assert_eq!(
+        meta_only.status_with_policy(FileStatusPolicy::strict()),
+        FileStatus::Modified
+    );
+    assert!(
+        meta_only
+            .status_detail_with_policy(FileStatusPolicy::strict())
+            .is_metadata_only_modification()
+    );
+    assert_eq!(
+        classify_file_entry(meta_only, FileStatusPolicy::strict()),
+        FileStatus::Modified
+    );
+    assert_eq!(
+        classify_file_entry_detailed(meta_only, FileStatusPolicy::content_only()).status,
+        FileStatus::Unchanged
+    );
+
+    // Reclassify in-place with single-side errors kept as Added/Removed (both-side errors stay Error!).
+    let relaxed = FileStatusPolicy::strict().with_classify_single_side_errors_as_error(false);
+    diff.reclassify_statuses(relaxed);
+    assert_eq!(diff.options().status_policy, relaxed);
+    assert_eq!(
+        diff.find_file("meta_only.txt").expect("meta_only").status(),
+        FileStatus::Modified
+    );
+    let left_err = diff.find_file("left_err.txt").expect("left_err");
+    assert_eq!(left_err.status(), FileStatus::Removed);
+    assert_eq!(
+        left_err.status_detail(),
+        FileStatusDetail::Removed {
+            type_conflict: false,
+            has_error: true,
+        }
+    );
+    let right_err = diff.find_file("right_err.txt").expect("right_err");
+    assert_eq!(right_err.status(), FileStatus::Added);
+    assert_eq!(
+        right_err.status_detail(),
+        FileStatusDetail::Added {
+            type_conflict: false,
+            has_error: true,
+        }
+    );
+    assert_eq!(
+        diff.find_file("both_err.txt").expect("both_err").status(),
+        FileStatus::Error
+    );
+
+    // Direct `classify_pair` works cleanly without a DiffFileEntry wrapper.
+    let a = file_entry(hash64('x'), 10, t1);
+    let b = file_entry(hash64('x'), 10, t2);
+    assert_eq!(
+        classify_pair(Some(&a), Some(&b), false, FileStatusPolicy::strict()),
+        FileStatus::Unchanged
+    );
+    assert_eq!(
+        classify_pair(Some(&a), Some(&b), true, FileStatusPolicy::strict()),
+        FileStatus::Modified
+    );
+    assert_eq!(
+        classify_pair(None, None, true, FileStatusPolicy::strict()),
+        FileStatus::Error
+    );
+}
+
+#[test]
+fn file_status_filter_parsing_formatting_and_serde_roundtrip() {
+    let t = utc(2026, 7, 1, 10, 0, 0);
+
+    let mut left = DirectoryNode::new(String::from("/app"));
+    left.insert_path(&["same.txt"], file_entry(hash64('a'), 10, t));
+    left.insert_path(&["changed.txt"], file_entry(hash64('b'), 10, t));
+    left.insert_path(&["deleted.txt"], file_entry(hash64('c'), 10, t));
+
+    let mut right = DirectoryNode::new(String::from("/app"));
+    right.insert_path(&["same.txt"], file_entry(hash64('a'), 10, t));
+    right.insert_path(&["changed.txt"], file_entry(hash64('d'), 20, t));
+    right.insert_path(&["new.txt"], file_entry(hash64('e'), 30, t));
+    right.insert_path(
+        &["broken.txt"],
+        FileEntry::from_error(String::from("io error"), None, None),
+    );
+
+    let diff = compare_trees(&left, &right);
+
+    // Quick-toggle filter: hide unchanged files.
+    let changes_only = FileStatusFilter::changes_only();
+    assert!(!changes_only.matches(FileStatus::Unchanged));
+    assert!(changes_only.matches(FileStatus::Modified));
+    assert!(changes_only.matches(FileStatus::Added));
+    assert!(changes_only.matches(FileStatus::Removed));
+    assert!(changes_only.matches(FileStatus::Error));
+    assert_eq!(changes_only.len(), 4);
+
+    let changed_paths: Vec<&str> = diff
+        .iter_files_matching_filter(changes_only)
+        .map(DiffFileEntry::relative_path)
+        .collect();
+    assert_eq!(
+        changed_paths,
+        vec!["broken.txt", "changed.txt", "deleted.txt", "new.txt"]
+    );
+
+    // Single-status iterator & custom filter builders.
+    let only_added: Vec<&str> = diff
+        .iter_files_with_status(FileStatus::Added)
+        .map(DiffFileEntry::relative_path)
+        .collect();
+    assert_eq!(only_added, vec!["new.txt"]);
+
+    let custom = FileStatusFilter::only(FileStatus::Added)
+        .include(FileStatus::Removed)
+        .with_status(FileStatus::Error, true)
+        .exclude(FileStatus::Removed);
+    assert_eq!(custom.statuses(), vec![FileStatus::Added, FileStatus::Error]);
+
+    // Filter JSON serialization is a clean array of status strings.
+    let filter_json = serde_json::to_string(&custom).expect("serialize filter");
+    assert_eq!(filter_json, r#"["added","error"]"#);
+    let filter_decoded: FileStatusFilter =
+        serde_json::from_str(&filter_json).expect("deserialize filter");
+    assert_eq!(filter_decoded, custom);
+
+    // Enum parsing, symbols, display names, and predicates.
+    for status in FileStatus::ALL {
+        let parsed: FileStatus = status.as_str().parse().expect("parse canonical");
+        assert_eq!(parsed, status);
+        let parsed_sym: FileStatus = status.symbol().parse().expect("parse symbol");
+        assert_eq!(parsed_sym, status);
+        assert_eq!(status.to_string(), status.as_str());
+        assert!(!status.display_name().is_empty());
+    }
+    assert_eq!("new".parse::<FileStatus>(), Ok(FileStatus::Added));
+    assert_eq!("deleted".parse::<FileStatus>(), Ok(FileStatus::Removed));
+    assert_eq!("equal".parse::<FileStatus>(), Ok(FileStatus::Unchanged));
+    assert_eq!("changed".parse::<FileStatus>(), Ok(FileStatus::Modified));
+    assert_eq!("failed".parse::<FileStatus>(), Ok(FileStatus::Error));
+
+    let bad = "nonsense".parse::<FileStatus>().expect_err("invalid status");
+    assert_eq!(bad.input(), "nonsense");
+    assert!(bad.to_string().contains("nonsense"));
 }

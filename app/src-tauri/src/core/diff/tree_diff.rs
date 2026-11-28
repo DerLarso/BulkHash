@@ -1,3 +1,7 @@
+use crate::core::diff::file_status::{
+    FileStatus, FileStatusCounts, FileStatusDetail, FileStatusFilter, FileStatusPolicy,
+    classify_entry_with_options, classify_file_entry, classify_file_entry_detailed, classify_pair,
+};
 use crate::core::diff::warnings::{
     ComparisonDiagnostics, ComparisonWarning, PrecheckContext, PrecheckReport, WarningCode,
     WarningContext, WarningSeverity, collect_warnings, evaluate_precheck,
@@ -79,6 +83,9 @@ pub struct ComparisonOptions {
     /// Depth `0` compares files in the root directory only without descending into subdirectories.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_depth: Option<usize>,
+    /// Policy controlling edge-case rules when assigning semantic [`FileStatus`] values.
+    #[serde(default)]
+    pub status_policy: FileStatusPolicy,
 }
 
 impl Default for ComparisonOptions {
@@ -89,7 +96,7 @@ impl Default for ComparisonOptions {
 
 impl ComparisonOptions {
     /// Creates default comparison options (exact matching, warnings enabled, metadata comparison
-    /// enabled, unlimited depth).
+    /// enabled, unlimited depth, default strict status policy).
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -97,6 +104,7 @@ impl ComparisonOptions {
             collect_warnings: true,
             compare_metadata: true,
             max_depth: None,
+            status_policy: FileStatusPolicy::new(),
         }
     }
 
@@ -138,6 +146,13 @@ impl ComparisonOptions {
     #[must_use]
     pub const fn with_max_depth(mut self, max_depth: Option<usize>) -> Self {
         self.max_depth = max_depth;
+        self
+    }
+
+    /// Configures the [`FileStatusPolicy`] used to categorize compared files into [`FileStatus`].
+    #[must_use]
+    pub const fn with_status_policy(mut self, status_policy: FileStatusPolicy) -> Self {
+        self.status_policy = status_policy;
         self
     }
 }
@@ -256,6 +271,8 @@ pub struct DiffFileEntry {
     pub presence: EntryPresence,
     /// Structural comparison outcome for this file position.
     pub outcome: FileComparisonOutcome,
+    /// Semantic file status (`unchanged`, `modified`, `added`, `removed`, or `error`).
+    pub status: FileStatus,
     /// File entry from the left (baseline) tree, if present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub left: Option<FileEntry>,
@@ -312,6 +329,37 @@ impl DiffFileEntry {
     #[must_use]
     pub const fn outcome(&self) -> FileComparisonOutcome {
         self.outcome
+    }
+
+    /// Returns the semantic [`FileStatus`] assigned to this file (`Unchanged`, `Modified`,
+    /// `Added`, `Removed`, or `Error`).
+    #[must_use]
+    pub const fn status(&self) -> FileStatus {
+        self.status
+    }
+
+    /// Returns structured [`FileStatusDetail`] explaining [`Self::status`].
+    #[must_use]
+    pub fn status_detail(&self) -> FileStatusDetail {
+        let policy = FileStatusPolicy {
+            treat_metadata_only_as_modified: matches!(self.status, FileStatus::Modified),
+            classify_single_side_errors_as_error: matches!(self.status, FileStatus::Error),
+        };
+        classify_entry_with_options(self, true, policy).detail
+    }
+
+    /// Evaluates what [`FileStatus`] this entry would receive under an arbitrary
+    /// [`FileStatusPolicy`] without mutating the entry.
+    #[must_use]
+    pub fn status_with_policy(&self, policy: FileStatusPolicy) -> FileStatus {
+        classify_file_entry(self, policy)
+    }
+
+    /// Evaluates structured [`FileStatusDetail`] for this entry under an arbitrary
+    /// [`FileStatusPolicy`] without mutating the entry.
+    #[must_use]
+    pub fn status_detail_with_policy(&self, policy: FileStatusPolicy) -> FileStatusDetail {
+        classify_file_entry_detailed(self, policy).detail
     }
 
     /// Returns the left [`FileEntry`], if present.
@@ -599,6 +647,44 @@ impl DiffDirectoryNode {
     pub fn directory_count(&self) -> usize {
         self.iter_directories().count().saturating_sub(1)
     }
+
+    /// Iterates over all files in this subtree matching a specific [`FileStatus`].
+    pub fn iter_files_with_status(
+        &self,
+        status: FileStatus,
+    ) -> impl Iterator<Item = &DiffFileEntry> {
+        self.iter_files()
+            .filter(move |entry| entry.status() == status)
+    }
+
+    /// Iterates over all files in this subtree matching a [`FileStatusFilter`].
+    pub fn iter_files_matching_filter(
+        &self,
+        filter: FileStatusFilter,
+    ) -> impl Iterator<Item = &DiffFileEntry> {
+        self.iter_files()
+            .filter(move |entry| filter.matches(entry.status()))
+    }
+
+    /// Groups all files in this subtree by their [`FileStatus`] in deterministic tree order.
+    #[must_use]
+    pub fn files_by_status(&self) -> BTreeMap<FileStatus, Vec<&DiffFileEntry>> {
+        let mut grouped: BTreeMap<FileStatus, Vec<&DiffFileEntry>> = BTreeMap::new();
+        for entry in self.iter_files() {
+            grouped.entry(entry.status()).or_default().push(entry);
+        }
+        grouped
+    }
+
+    /// Counts all files in this subtree grouped by [`FileStatus`].
+    #[must_use]
+    pub fn status_counts(&self) -> FileStatusCounts {
+        let mut counts = FileStatusCounts::default();
+        for entry in self.iter_files() {
+            counts.increment(entry.status());
+        }
+        counts
+    }
 }
 
 /// Stack-safe depth-first pre-order iterator over `&DiffDirectoryNode` entries.
@@ -792,6 +878,54 @@ impl TreeDiff {
     /// Iterates over all compared files whose outcome is not [`FileComparisonOutcome::Identical`].
     pub fn iter_changed_files(&self) -> impl Iterator<Item = &DiffFileEntry> {
         self.iter_files().filter(|entry| entry.is_changed())
+    }
+
+    /// Iterates over all files in this diff matching a specific [`FileStatus`].
+    pub fn iter_files_with_status(
+        &self,
+        status: FileStatus,
+    ) -> impl Iterator<Item = &DiffFileEntry> {
+        self.root.iter_files_with_status(status)
+    }
+
+    /// Iterates over all files in this diff matching a [`FileStatusFilter`] (for example
+    /// [`FileStatusFilter::changes_only`] to hide unchanged files).
+    pub fn iter_files_matching_filter(
+        &self,
+        filter: FileStatusFilter,
+    ) -> impl Iterator<Item = &DiffFileEntry> {
+        self.root.iter_files_matching_filter(filter)
+    }
+
+    /// Groups all files in this diff by their [`FileStatus`] in deterministic tree order.
+    #[must_use]
+    pub fn files_by_status(&self) -> BTreeMap<FileStatus, Vec<&DiffFileEntry>> {
+        self.root.files_by_status()
+    }
+
+    /// Counts all files in this diff grouped by [`FileStatus`].
+    #[must_use]
+    pub fn status_counts(&self) -> FileStatusCounts {
+        self.root.status_counts()
+    }
+
+    /// Iteratively (stack-safe) recomputes [`DiffFileEntry::status`] across the entire diff tree
+    /// using `policy` and updates [`ComparisonOptions::status_policy`].
+    pub fn reclassify_statuses(&mut self, policy: FileStatusPolicy) {
+        self.options.status_policy = policy;
+        let compare_metadata = self.options.compare_metadata;
+        let mut stack = vec![&mut self.root];
+        while let Some(dir) = stack.pop() {
+            for entry in dir.files.values_mut() {
+                entry.status = classify_pair(
+                    entry.left.as_ref(),
+                    entry.right.as_ref(),
+                    compare_metadata,
+                    policy,
+                );
+            }
+            stack.extend(dir.sub_directories.values_mut());
+        }
     }
 }
 
@@ -1645,6 +1779,12 @@ fn compare_files_in_dir(
         }
 
         let outcome = evaluate_file_outcome(pair.left, pair.right, options.compare_metadata);
+        let status = classify_pair(
+            pair.left,
+            pair.right,
+            options.compare_metadata,
+            options.status_policy,
+        );
         let key = pair.name.clone();
         result.insert(
             key,
@@ -1654,6 +1794,7 @@ fn compare_files_in_dir(
                 relative_path,
                 presence: pair.presence,
                 outcome,
+                status,
                 left: pair.left.cloned(),
                 right: pair.right.cloned(),
                 name_case_differs: pair.name_case_differs,
