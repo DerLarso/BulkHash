@@ -10,6 +10,10 @@ use crate::core::diff::folder_status::{
     FolderStatus, FolderStatusCounts, FolderStatusFilter, FolderStatusSummary,
     derive_folder_status, propagate_folder_statuses,
 };
+use crate::core::diff::integrity::{
+    IntegrityCheckOptions, IntegrityReport, check_diff_integrity,
+    check_diff_integrity_with_options,
+};
 use crate::core::diff::statistics::{
     DiffStatistics, FolderStorageStats, StorageStatistics, compute_diff_statistics,
     compute_folder_storage_stats, compute_storage_statistics, compute_subtree_statistics,
@@ -1121,6 +1125,20 @@ impl TreeDiff {
         options: &DuplicateOptions,
     ) -> DuplicateReport {
         find_duplicates_in_diff_with_options(self, scope, options)
+    }
+
+    /// Runs a bitrot and file integrity check on this diff using default
+    /// [`IntegrityCheckOptions`].
+    #[must_use]
+    pub fn check_integrity(&self) -> IntegrityReport {
+        check_diff_integrity(self)
+    }
+
+    /// Runs a bitrot and file integrity check on this diff using custom
+    /// [`IntegrityCheckOptions`].
+    #[must_use]
+    pub fn check_integrity_with_options(&self, options: &IntegrityCheckOptions) -> IntegrityReport {
+        check_diff_integrity_with_options(self, options)
     }
 
     /// Iteratively (stack-safe) recomputes [`DiffFileEntry::status`] across the entire diff tree

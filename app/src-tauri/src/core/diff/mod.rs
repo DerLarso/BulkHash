@@ -1,6 +1,7 @@
 pub mod duplicates;
 pub mod file_status;
 pub mod folder_status;
+pub mod integrity;
 pub mod live_compare;
 pub mod statistics;
 pub mod tree_diff;
@@ -8,9 +9,9 @@ pub mod warnings;
 
 pub use duplicates::{
     DiffDuplicateScope, DuplicateFinder, DuplicateGroup, DuplicateOccurrence, DuplicateOptions,
-    DuplicateReport, DuplicateSortOrder, DuplicateSource, DuplicateSummary, FolderDuplicateSummary,
-    find_duplicates_in_archive, find_duplicates_in_archive_with_password, find_duplicates_in_diff,
-    find_duplicates_in_diff_with_options, find_duplicates_in_snapshot,
+    DuplicateReport, DuplicateSortOrder, DuplicateSource, DuplicateSummary,
+    FolderDuplicateSummary, find_duplicates_in_archive, find_duplicates_in_archive_with_password,
+    find_duplicates_in_diff, find_duplicates_in_diff_with_options, find_duplicates_in_snapshot,
     find_duplicates_in_snapshot_with_options, find_duplicates_in_tree,
     find_duplicates_in_tree_with_options,
 };
@@ -22,6 +23,12 @@ pub use file_status::{
 pub use folder_status::{
     FolderStatus, FolderStatusCounts, FolderStatusFilter, FolderStatusSummary,
     ParseFolderStatusError, derive_folder_status, propagate_folder_statuses,
+};
+pub use integrity::{
+    BitrotConfidence, FolderIntegritySummary, IntegrityCheckOptions, IntegrityChecker,
+    IntegrityFinding, IntegrityFindingKind, IntegrityReport, IntegrityStatus, IntegritySummary,
+    LiveIntegrityReport, check_archive_integrity_live, check_archives_integrity,
+    check_diff_integrity, check_diff_integrity_with_options, check_snapshot_integrity_live,
 };
 pub use live_compare::{
     LiveComparer, LiveComparisonOptions, LiveComparisonResult, compare_archive_with_folder,

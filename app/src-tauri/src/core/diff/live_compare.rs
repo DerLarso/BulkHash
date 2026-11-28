@@ -1,4 +1,5 @@
 use crate::core::diff::file_status::FileStatusPolicy;
+use crate::core::diff::integrity::{IntegrityCheckOptions, IntegrityReport};
 use crate::core::diff::statistics::DiffStatistics;
 use crate::core::diff::tree_diff::{ComparisonOptions, TreeComparer, TreeDiff};
 use crate::core::diff::warnings::{PrecheckContext, PrecheckReport, evaluate_precheck};
@@ -296,6 +297,20 @@ impl LiveComparisonResult {
     pub fn reclassify_statuses(&mut self, policy: FileStatusPolicy) {
         self.diff.reclassify_statuses(policy);
         self.statistics = self.diff.statistics();
+    }
+
+    /// Runs a bitrot and file integrity check on this live comparison using default
+    /// [`IntegrityCheckOptions`].
+    #[must_use]
+    pub fn check_integrity(&self) -> IntegrityReport {
+        self.diff.check_integrity()
+    }
+
+    /// Runs a bitrot and file integrity check on this live comparison using custom
+    /// [`IntegrityCheckOptions`].
+    #[must_use]
+    pub fn check_integrity_with_options(&self, options: &IntegrityCheckOptions) -> IntegrityReport {
+        self.diff.check_integrity_with_options(options)
     }
 }
 

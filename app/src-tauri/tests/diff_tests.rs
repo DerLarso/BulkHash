@@ -1,12 +1,16 @@
 use bulk_hash_lib::core::{
     diff::{
-        ComparisonOptions, ComparisonWarning, DiffDirectoryNode, DiffDuplicateScope, DiffFileEntry,
-        DiffStatistics, DuplicateFinder, DuplicateOccurrence, DuplicateOptions, DuplicateReport,
-        DuplicateSortOrder, DuplicateSource, EntryPresence, FileComparisonOutcome, FileStatus, FileStatusCounts,
-        FileStatusDetail, FileStatusFilter, FileStatusPolicy, FolderDuplicateSummary, FolderStatus,
-        FolderStatusCounts, FolderStatusFilter, LiveComparer, LiveComparisonOptions,
-        LiveComparisonResult, MAX_WARNING_SAMPLES, NameMatchingMode, PrecheckReport,
-        StorageStatistics, TreeComparer, TreeDiff, WarningCode, WarningDetails, WarningSeverity,
+        BitrotConfidence, ComparisonOptions, ComparisonWarning, DiffDirectoryNode,
+        DiffDuplicateScope, DiffFileEntry, DiffStatistics, DuplicateFinder, DuplicateOccurrence,
+        DuplicateOptions, DuplicateReport, DuplicateSortOrder, DuplicateSource, EntryPresence,
+        FileComparisonOutcome, FileStatus, FileStatusCounts, FileStatusDetail, FileStatusFilter,
+        FileStatusPolicy, FolderDuplicateSummary, FolderIntegritySummary, FolderStatus,
+        FolderStatusCounts, FolderStatusFilter, IntegrityCheckOptions, IntegrityChecker,
+        IntegrityFindingKind, IntegrityReport, IntegrityStatus, LiveComparer,
+        LiveComparisonOptions, LiveComparisonResult, MAX_WARNING_SAMPLES, NameMatchingMode,
+        PrecheckReport, StorageStatistics, TreeComparer, TreeDiff, WarningCode, WarningDetails,
+        WarningSeverity, check_archive_integrity_live, check_archives_integrity,
+        check_diff_integrity, check_diff_integrity_with_options, check_snapshot_integrity_live,
         classify_file_entry, classify_file_entry_detailed, classify_pair,
         compare_archive_with_folder, compare_archive_with_folder_with_options,
         compare_snapshot_with_folder, compare_snapshot_with_folder_with_options,
@@ -2674,4 +2678,275 @@ fn duplicate_finder_supports_snapshots_encrypted_archives_and_deep_trees() {
     while let Some(mut node) = drain.pop() {
         drain.extend(std::mem::take(&mut node.sub_directories).into_values());
     }
+}
+
+#[test]
+fn integrity_check_detects_bitrot_read_errors_anomalies_and_ignores_legitimate_edits() {
+    let t_old = utc(2026, 10, 1, 9, 0, 0);
+    let t_base = utc(2026, 10, 1, 10, 0, 0);
+    let t_new = utc(2026, 10, 2, 10, 0, 0);
+
+    let mut left = DirectoryNode::new(String::from("/archive"));
+    left.insert_path(&["ok.bin"], file_entry(hash64('a'), 500, t_base));
+    left.insert_path(&["edited.txt"], file_entry(hash64('b'), 100, t_base));
+    left.insert_path(&["photos", "corrupted.jpg"], file_entry(hash64('c'), 2_000, t_base));
+    left.insert_path(&["photos", "truncated.jpg"], file_entry(hash64('d'), 1_500, t_base));
+    left.insert_path(&["regressed.dat"], file_entry(hash64('e'), 400, t_base));
+    left.insert_path(&["bad_sector.bin"], file_entry(hash64('f'), 1_000, t_base));
+    left.insert_path(&["collision.bin"], file_entry(hash64('g'), 300, t_base));
+    left.insert_path(&["legacy_no_mtime.bin"], FileEntry::from_hash(hash64('h'), Some(50), None));
+    left.insert_path(
+        &["baseline_err.bin"],
+        FileEntry::from_error(String::from("baseline locked"), None, None),
+    );
+    left.insert_path(&["removed.txt"], file_entry(hash64('r'), 80, t_base));
+
+    let mut right = DirectoryNode::new(String::from("/archive"));
+    right.insert_path(&["ok.bin"], file_entry(hash64('a'), 500, t_base));
+    // Legitimate write: hash changed AND mtime advanced -> NOT bitrot!
+    right.insert_path(&["edited.txt"], file_entry(hash64('1'), 120, t_new));
+    // Classic bitrot: hash changed, SAME mtime, SAME size -> High confidence SilentCorruption!
+    right.insert_path(&["photos", "corrupted.jpg"], file_entry(hash64('2'), 2_000, t_base));
+    // Hash changed, SAME mtime, DIFFERENT size -> Medium confidence UnchangedTimestampContentMismatch!
+    right.insert_path(&["photos", "truncated.jpg"], file_entry(hash64('3'), 1_200, t_base));
+    // Hash changed, mtime moved BACKWARDS -> Medium confidence TimestampRegressedContentMismatch!
+    right.insert_path(&["regressed.dat"], file_entry(hash64('4'), 400, t_old));
+    // Previously readable file now fails to read -> High confidence ReadError!
+    right.insert_path(
+        &["bad_sector.bin"],
+        FileEntry::from_error(String::from("Input/output error"), Some(1_000), Some(t_base)),
+    );
+    // Same hash, conflicting size -> High confidence SizeHashInconsistency!
+    right.insert_path(&["collision.bin"], file_entry(hash64('g'), 301, t_base));
+    // Missing timestamp -> unverifiable, NOT falsely flagged as bitrot!
+    right.insert_path(&["legacy_no_mtime.bin"], file_entry(hash64('9'), 50, t_new));
+    right.insert_path(&["baseline_err.bin"], file_entry(hash64('8'), 20, t_new));
+    right.insert_path(&["added.txt"], file_entry(hash64('z'), 90, t_new));
+
+    let diff = compare_trees(&left, &right);
+    let report = diff.check_integrity();
+
+    assert_eq!(report.status(), IntegrityStatus::IssuesDetected);
+    assert!(!report.is_healthy());
+    assert!(report.is_algorithm_compatible());
+    assert!(report.has_findings());
+    assert!(report.has_bitrot_suspects());
+
+    let s = report.summary();
+    assert_eq!(s.total_common_files, 9);
+    assert_eq!(s.verified_intact_files, 1);
+    assert_eq!(s.expected_modified_files, 1);
+    assert_eq!(s.silent_corruption_files, 1);
+    assert_eq!(s.unchanged_timestamp_mismatch_files, 1);
+    assert_eq!(s.timestamp_regressed_files, 1);
+    assert_eq!(s.read_error_files, 1);
+    assert_eq!(s.size_hash_inconsistency_files, 1);
+    assert_eq!(s.total_findings, 5);
+    assert_eq!(s.suspected_bitrot_files(), 3);
+    assert_eq!(s.high_confidence_findings(), 3);
+    assert_eq!(s.unverifiable_missing_timestamp_files, 1);
+    assert_eq!(s.unverifiable_baseline_error_files, 1);
+    assert_eq!(s.removed_files, 1);
+    assert_eq!(s.added_files, 1);
+
+    // Legitimate edit is NOT in findings.
+    assert!(report.finding_for_path("edited.txt").is_none());
+
+    // High confidence findings are sorted ahead of Medium confidence findings.
+    assert_eq!(report.findings()[0].confidence, BitrotConfidence::High);
+    assert_eq!(
+        report.finding_for_path("photos\\corrupted.jpg").expect("corrupted").kind,
+        IntegrityFindingKind::SilentCorruption
+    );
+    assert_eq!(
+        report.finding_for_path("photos/truncated.jpg").expect("truncated").kind,
+        IntegrityFindingKind::UnchangedTimestampContentMismatch
+    );
+    assert_eq!(
+        report.finding_for_path("regressed.dat").expect("regressed").kind,
+        IntegrityFindingKind::TimestampRegressedContentMismatch
+    );
+    assert_eq!(
+        report.finding_for_path("bad_sector.bin").expect("bad sector").kind,
+        IntegrityFindingKind::ReadError
+    );
+    assert_eq!(
+        report.finding_for_path("collision.bin").expect("collision").kind,
+        IntegrityFindingKind::SizeHashInconsistency
+    );
+
+    // Tree-viewer overlay lookup & per-folder integrity summaries.
+    let idx = report.path_to_finding_index();
+    assert_eq!(idx.len(), 5);
+    let folders = report.folder_integrity_summaries();
+    assert_eq!(
+        folders.get("photos"),
+        Some(&FolderIntegritySummary {
+            direct_findings: 2,
+            recursive_findings: 2,
+            recursive_bitrot_suspects: 2,
+            recursive_read_errors: 0,
+            recursive_affected_bytes: 3_200,
+        })
+    );
+    assert_eq!(folders.get("").expect("root").recursive_findings, 5);
+    assert_eq!(folders.get("").expect("root").recursive_read_errors, 1);
+
+    // Lossless JSON serde roundtrip.
+    let json = serde_json::to_string(&report).expect("serialize IntegrityReport");
+    let decoded: IntegrityReport =
+        serde_json::from_str(&json).expect("deserialize IntegrityReport");
+    assert_eq!(decoded, report);
+}
+
+#[test]
+fn integrity_check_timestamp_tolerance_subsec_algorithm_guard_and_options() {
+    let t_base = DateTime::parse_from_rfc3339("2026-10-01T10:00:00.250Z")
+        .expect("valid")
+        .with_timezone(&Utc);
+    let t_subsec = DateTime::parse_from_rfc3339("2026-10-01T10:00:00.900Z")
+        .expect("valid")
+        .with_timezone(&Utc);
+    let t_fat32 = DateTime::parse_from_rfc3339("2026-10-01T10:00:02.000Z")
+        .expect("valid")
+        .with_timezone(&Utc);
+
+    let mut left = DirectoryNode::new(String::from("/vol"));
+    left.insert_path(&["subsec.bin"], file_entry(hash64('a'), 100, t_base));
+    left.insert_path(&["fat32.bin"], file_entry(hash64('b'), 100, t_base));
+
+    let mut right = DirectoryNode::new(String::from("/vol"));
+    right.insert_path(&["subsec.bin"], file_entry(hash64('x'), 100, t_subsec));
+    right.insert_path(&["fat32.bin"], file_entry(hash64('y'), 100, t_fat32));
+
+    let diff = compare_trees(&left, &right);
+
+    // Strict zero-tolerance: both timestamps advanced, so neither is flagged.
+    let strict = check_diff_integrity(&diff);
+    assert!(strict.is_healthy());
+    assert_eq!(strict.summary().expected_modified_files, 2);
+
+    // Ignoring subsecond nanoseconds flags `subsec.bin` (same whole second 10:00:00) while leaving `fat32.bin` clean.
+    let subsec_opts = IntegrityCheckOptions::new().with_ignore_subsec_timestamps(true);
+    let subsec_report = check_diff_integrity_with_options(&diff, &subsec_opts);
+    assert_eq!(subsec_report.summary().silent_corruption_files, 1);
+    assert!(subsec_report.finding_for_path("subsec.bin").is_some());
+    assert!(subsec_report.finding_for_path("fat32.bin").is_none());
+
+    // 2-second FAT32 tolerance flags both files; max_findings caps list while preserving exact summary!
+    let tol_opts = IntegrityCheckOptions::new()
+        .with_timestamp_tolerance(Duration::from_secs(2))
+        .with_max_findings(Some(1));
+    let tol_report = diff.check_integrity_with_options(&tol_opts);
+    assert!(tol_report.is_truncated());
+    assert_eq!(tol_report.status(), IntegrityStatus::IssuesDetected);
+    assert_eq!(tol_report.summary().total_findings, 2);
+    assert_eq!(tol_report.findings().len(), 1);
+
+    // Safety guard: incompatible hash algorithms mark IntegrityStatus::Unreliable!
+    let meta_b3 = sample_meta("linux", HashAlgorithm::Blake3, t_base);
+    let meta_sha = sample_meta("linux", HashAlgorithm::Sha256, t_fat32);
+    let bad_diff = TreeComparer::new().compare_trees_with_metadata(
+        &left,
+        Some(&meta_b3),
+        &right,
+        Some(&meta_sha),
+    );
+    let unreliable = IntegrityChecker::new().check_diff(&bad_diff);
+    assert_eq!(unreliable.status(), IntegrityStatus::Unreliable);
+    assert!(!unreliable.is_algorithm_compatible());
+    assert!(!unreliable.is_healthy());
+    assert!(!unreliable.reliability_notes().is_empty());
+}
+
+fn set_file_mtime(path: &Path, mtime: SystemTime) {
+    fs::File::options()
+        .write(true)
+        .open(path)
+        .expect("open file for mtime")
+        .set_modified(mtime)
+        .expect("set mtime");
+}
+
+#[test]
+fn live_integrity_check_catches_real_silent_bitrot_on_disk() {
+    let data_dir = TempDir::new("bitrot_live_data");
+    let archive_dir = TempDir::new("bitrot_live_arch");
+    let intact_path = data_dir.path().join("intact.bin");
+    let victim_path = data_dir.path().join("victim.bin");
+    let normal_edit_path = data_dir.path().join("normal.txt");
+
+    fs::write(&intact_path, b"untouched bytes 1234567890").expect("write intact");
+    fs::write(&victim_path, b"ORIGINAL_DATA_BLOCK_000001").expect("write victim");
+    fs::write(&normal_edit_path, b"initial text").expect("write normal");
+
+    let original_victim_mtime = fs::metadata(&victim_path)
+        .expect("victim meta")
+        .modified()
+        .expect("victim mtime");
+
+    let archive_path = scan_and_save_snapshot(
+        data_dir.path(),
+        archive_dir.path(),
+        HashAlgorithm::Blake3,
+        IgnoreList::new(),
+        HiddenFileFilter::include_all(),
+        None,
+    );
+
+    let live_opts = LiveComparisonOptions::new();
+    let int_opts = IntegrityCheckOptions::new();
+
+    // 1. Clean folder verifies Healthy via live integrity check.
+    let healthy = check_archive_integrity_live(&archive_path, None, data_dir.path(), &live_opts, &int_opts)
+        .expect("healthy live check");
+    assert!(healthy.is_healthy());
+    assert!(!healthy.has_bitrot_suspects());
+    assert_eq!(healthy.integrity().summary().verified_intact_files, 3);
+
+    // 2. Simulate silent bitrot (same size + restored original mtime) + legitimate edit (+10s mtime).
+    fs::write(&victim_path, b"ORIGINAL_DATA_BLOCK_000002").expect("corrupt victim");
+    set_file_mtime(&victim_path, original_victim_mtime);
+    fs::write(&normal_edit_path, b"legitimately updated text").expect("update normal");
+    set_file_mtime(&normal_edit_path, original_victim_mtime + Duration::from_secs(10));
+
+    let live_report =
+        check_archive_integrity_live(&archive_path, None, data_dir.path(), &live_opts, &int_opts)
+            .expect("bitrot live check");
+
+    assert!(!live_report.is_healthy());
+    assert!(live_report.has_bitrot_suspects());
+    assert_eq!(live_report.integrity().status(), IntegrityStatus::IssuesDetected);
+    assert_eq!(live_report.integrity().summary().verified_intact_files, 1);
+    assert_eq!(live_report.integrity().summary().expected_modified_files, 1);
+    assert_eq!(live_report.integrity().summary().silent_corruption_files, 1);
+    assert_eq!(live_report.integrity().findings().len(), 1);
+    let victim_finding = live_report
+        .integrity()
+        .finding_for_path("victim.bin")
+        .expect("victim finding");
+    assert_eq!(victim_finding.kind, IntegrityFindingKind::SilentCorruption);
+    assert_eq!(victim_finding.confidence, BitrotConfidence::High);
+
+    // Verify convenience wrappers produce the exact same verdict.
+    let loaded_snap = FileManager::open_file(&archive_path).expect("open archive");
+    let via_snap = check_snapshot_integrity_live(&loaded_snap, data_dir.path(), &live_opts, &int_opts)
+        .expect("snapshot live check");
+    assert_eq!(via_snap.integrity(), live_report.integrity());
+    assert_eq!(live_report.live_comparison().check_integrity(), *live_report.integrity());
+
+    let archive_dir2 = TempDir::new("bitrot_arch2");
+    let archive2_path = scan_and_save_snapshot(
+        data_dir.path(),
+        archive_dir2.path(),
+        HashAlgorithm::Blake3,
+        IgnoreList::new(),
+        HiddenFileFilter::include_all(),
+        None,
+    );
+    let via_archives =
+        check_archives_integrity(&archive_path, None, &archive2_path, None, &int_opts)
+            .expect("archives integrity check");
+    assert_eq!(via_archives.summary().silent_corruption_files, 1);
+    assert!(via_archives.finding_for_path("victim.bin").is_some());
 }

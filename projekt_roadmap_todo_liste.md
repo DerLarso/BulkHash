@@ -38,7 +38,7 @@ Backend - Diff-Engine & Analyse:
 	[#] Diff-Statistiken: Berechnung der Gesamtzahl aller Änderungen sowie der Speicherplatz-Differenz ; Rust
 	[#] Live-Ordner-Vergleich: Direktes Prüfen einer .hashed-Datei gegen einen echten Ordner auf der Festplatte ; Rust
 	[#] Duplikat-Finder: Aufspüren identischer Dateien (gleicher Hash) innerhalb eines einzelnen Snapshots ; Rust
-	[X] Bitrot- / Integritäts-Check: Prüfung auf beschädigte Dateien bei unverändertem Änderungsdatum ; Rust
+	[#] Bitrot- / Integritäts-Check: Prüfung auf beschädigte Dateien bei unverändertem Änderungsdatum ; Rust
 
 Backend - Tauri, IPC & System-Integration:
 	[O] Tauri-App-Setup: Grundgerüst der Desktop-App (temporäre CLI-Testfunktion muss noch ersetzt werden) ; Rust
