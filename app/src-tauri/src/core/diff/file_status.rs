@@ -519,6 +519,15 @@ impl FileStatusCounts {
         }
     }
 
+    /// Adds all counts from `other` into `self` using saturating arithmetic.
+    pub const fn merge(&mut self, other: &Self) {
+        self.unchanged = self.unchanged.saturating_add(other.unchanged);
+        self.modified = self.modified.saturating_add(other.modified);
+        self.added = self.added.saturating_add(other.added);
+        self.removed = self.removed.saturating_add(other.removed);
+        self.error = self.error.saturating_add(other.error);
+    }
+
     /// Returns the count for a specific [`FileStatus`].
     #[must_use]
     pub const fn count_for(&self, status: FileStatus) -> usize {

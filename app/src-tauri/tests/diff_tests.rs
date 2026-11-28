@@ -2,12 +2,13 @@ use bulk_hash_lib::core::{
     diff::{
         ComparisonOptions, ComparisonWarning, DiffDirectoryNode, DiffFileEntry, EntryPresence,
         FileComparisonOutcome, FileStatus, FileStatusCounts, FileStatusDetail, FileStatusFilter,
-        FileStatusPolicy, MAX_WARNING_SAMPLES, NameMatchingMode, PrecheckReport, TreeComparer,
-        TreeDiff, WarningCode, WarningDetails, WarningSeverity, classify_file_entry,
-        classify_file_entry_detailed, classify_pair, compare_snapshots,
-        compare_snapshots_with_options, compare_trees, compare_trees_with_options,
-        extract_path_basename, infer_os_from_path, precheck_archive_files, precheck_metadata,
-        precheck_snapshots, precheck_trees, precheck_trees_with_metadata,
+        FileStatusPolicy, FolderStatus, FolderStatusCounts, FolderStatusFilter,
+        MAX_WARNING_SAMPLES, NameMatchingMode, PrecheckReport, TreeComparer, TreeDiff, WarningCode,
+        WarningDetails, WarningSeverity, classify_file_entry, classify_file_entry_detailed,
+        classify_pair, compare_snapshots, compare_snapshots_with_options, compare_trees,
+        compare_trees_with_options, extract_path_basename, infer_os_from_path,
+        precheck_archive_files, precheck_metadata, precheck_snapshots, precheck_trees,
+        precheck_trees_with_metadata,
     },
     hash_manager::HashAlgorithm,
     hidden_filter::HiddenFileFilter,
@@ -1490,4 +1491,311 @@ fn file_status_filter_parsing_formatting_and_serde_roundtrip() {
     let bad = "nonsense".parse::<FileStatus>().expect_err("invalid status");
     assert_eq!(bad.input(), "nonsense");
     assert!(bad.to_string().contains("nonsense"));
+}
+
+fn build_folder_propagation_sample_diff() -> TreeDiff {
+    let t1 = utc(2026, 8, 1, 10, 0, 0);
+    let t2 = utc(2026, 8, 2, 10, 0, 0);
+
+    let mut left = DirectoryNode::new(String::from("/repo"));
+    left.insert_path(&["clean", "nested", "same.txt"], file_entry(hash64('a'), 10, t1));
+    left.insert_path(&["deep", "a", "b", "file.txt"], file_entry(hash64('b'), 20, t1));
+    left.insert_path(&["old_module", "sub", "gone.rs"], file_entry(hash64('c'), 30, t1));
+    left.insert_path(&["only_added_files", "base.txt"], file_entry(hash64('d'), 40, t1));
+    left.insert_path(&["only_removed_files", "stay.txt"], file_entry(hash64('e'), 50, t1));
+    left.insert_path(&["only_removed_files", "drop.txt"], file_entry(hash64('f'), 60, t1));
+
+    let mut right = DirectoryNode::new(String::from("/repo"));
+    right.insert_path(&["clean", "nested", "same.txt"], file_entry(hash64('a'), 10, t1));
+    right.insert_path(&["deep", "a", "b", "file.txt"], file_entry(hash64('9'), 25, t2));
+    right.insert_path(&["new_module", "sub", "fresh.rs"], file_entry(hash64('1'), 35, t2));
+    right.insert_path(&["only_added_files", "base.txt"], file_entry(hash64('d'), 40, t1));
+    right.insert_path(&["only_added_files", "extra.txt"], file_entry(hash64('2'), 45, t2));
+    right.insert_path(&["only_removed_files", "stay.txt"], file_entry(hash64('e'), 50, t1));
+    right
+        .sub_directories
+        .entry(String::from("empty_parent"))
+        .or_insert_with(|| DirectoryNode::new(String::from("empty_parent")))
+        .sub_directories
+        .insert(
+            String::from("empty_new"),
+            DirectoryNode::new(String::from("empty_new")),
+        );
+    left.sub_directories.insert(
+        String::from("empty_parent"),
+        DirectoryNode::new(String::from("empty_parent")),
+    );
+
+    compare_trees(&left, &right)
+}
+
+#[test]
+fn folder_status_propagates_bottom_up_for_modified_added_removed_and_unchanged_branches() {
+    let diff = build_folder_propagation_sample_diff();
+
+    // Unchanged subtree remains strictly Unchanged at every level.
+    assert_eq!(
+        diff.find_directory("clean").expect("clean").status(),
+        FolderStatus::Unchanged
+    );
+    assert_eq!(
+        diff.find_directory("clean/nested").expect("nested").status(),
+        FolderStatus::Unchanged
+    );
+    assert_eq!(
+        diff.find_directory("clean")
+            .expect("clean")
+            .status_summary()
+            .dominant_change_status(),
+        None
+    );
+
+    // Deep modification propagates upward through every ancestor up to root.
+    assert_eq!(
+        diff.find_directory("deep/a/b").expect("deep/a/b").status(),
+        FolderStatus::Modified
+    );
+    assert_eq!(
+        diff.find_directory("deep/a").expect("deep/a").status(),
+        FolderStatus::Modified
+    );
+    assert_eq!(
+        diff.find_directory("deep").expect("deep").status(),
+        FolderStatus::Modified
+    );
+    assert_eq!(diff.root_status(), FolderStatus::Modified);
+
+    // Added & removed subtrees carry Added / Removed at every level.
+    assert_eq!(
+        diff.find_directory("new_module").expect("new_module").status(),
+        FolderStatus::Added
+    );
+    assert_eq!(
+        diff.find_directory("new_module/sub").expect("new_module/sub").status(),
+        FolderStatus::Added
+    );
+    assert_eq!(
+        diff.find_directory("old_module").expect("old_module").status(),
+        FolderStatus::Removed
+    );
+    assert_eq!(
+        diff.find_directory("old_module/sub").expect("old_module/sub").status(),
+        FolderStatus::Removed
+    );
+
+    // Empty added directory propagates Modified to its existing `Both` parent.
+    assert_eq!(
+        diff.find_directory("empty_parent/empty_new")
+            .expect("empty_new")
+            .status(),
+        FolderStatus::Added
+    );
+    assert_eq!(
+        diff.find_directory("empty_parent")
+            .expect("empty_parent")
+            .status(),
+        FolderStatus::Modified
+    );
+
+    // Dominant change status distinguishes purely added vs purely removed vs mixed folders.
+    let only_added_dir = diff.find_directory("only_added_files").expect("only_added");
+    assert_eq!(only_added_dir.status(), FolderStatus::Modified);
+    assert_eq!(
+        only_added_dir.status_summary().dominant_change_status(),
+        Some(FileStatus::Added)
+    );
+    assert!(!only_added_dir.status_summary().has_mixed_file_changes());
+
+    let only_removed_dir = diff
+        .find_directory("only_removed_files")
+        .expect("only_removed");
+    assert_eq!(only_removed_dir.status(), FolderStatus::Modified);
+    assert_eq!(
+        only_removed_dir.status_summary().dominant_change_status(),
+        Some(FileStatus::Removed)
+    );
+
+    // Root contains mixed changes (Modified + Added + Removed).
+    assert!(diff.root().status_summary().has_mixed_file_changes());
+    assert_eq!(
+        diff.root().status_summary().dominant_change_status(),
+        Some(FileStatus::Modified)
+    );
+    assert_eq!(
+        diff.directory_status_counts(),
+        FolderStatusCounts {
+            unchanged: 2, // clean, clean/nested
+            modified: 6,  // deep, deep/a, deep/a/b, only_added_files, only_removed_files, empty_parent
+            added: 3,     // new_module, new_module/sub, empty_parent/empty_new
+            removed: 2,   // old_module, old_module/sub
+            error: 0,
+        }
+    );
+    assert_eq!(diff.directory_status_counts().total(), 13);
+    assert_eq!(diff.directory_status_counts().changed_total(), 11);
+}
+
+#[test]
+fn folder_status_error_propagation_reclassification_and_deep_trees() {
+    const DEPTH: usize = 2_000;
+    let t1 = utc(2026, 8, 1, 10, 0, 0);
+    let t2 = utc(2026, 8, 2, 10, 0, 0);
+
+    let mut left = DirectoryNode::new(String::from("/app"));
+    left.insert_path(&["meta_dir", "sub", "note.txt"], file_entry(hash64('a'), 100, t1));
+    left.insert_path(&["ok_dir", "same.txt"], file_entry(hash64('b'), 100, t1));
+
+    let mut right = DirectoryNode::new(String::from("/app"));
+    right.insert_path(&["meta_dir", "sub", "note.txt"], file_entry(hash64('a'), 100, t2));
+    right.insert_path(&["ok_dir", "same.txt"], file_entry(hash64('b'), 100, t1));
+    right.insert_path(
+        &["new_dir", "inner", "locked.bin"],
+        FileEntry::from_error(String::from("Permission denied"), None, None),
+    );
+
+    // Under default strict policy:
+    // - `new_dir/inner/locked.bin` is `Error` -> propagates monotonically up `new_dir/inner`,
+    //   `new_dir`, and `root` so the UI always has an unbroken error trail!
+    // - `meta_dir/sub/note.txt` is `Modified` (mtime changed) -> `meta_dir/sub` and `meta_dir` are `Modified`.
+    let mut diff = compare_trees(&left, &right);
+    assert_eq!(diff.root_status(), FolderStatus::Error);
+    assert_eq!(
+        diff.find_directory("new_dir").expect("new_dir").status(),
+        FolderStatus::Error
+    );
+    assert_eq!(
+        diff.find_directory("new_dir").expect("new_dir").presence(),
+        EntryPresence::OnlyRight
+    );
+    assert_eq!(
+        diff.find_directory("new_dir/inner").expect("inner").status(),
+        FolderStatus::Error
+    );
+    assert_eq!(
+        diff.find_directory("meta_dir").expect("meta_dir").status(),
+        FolderStatus::Modified
+    );
+    assert_eq!(
+        diff.find_directory("ok_dir").expect("ok_dir").status(),
+        FolderStatus::Unchanged
+    );
+
+    // Reclassifying with content-only + single-side errors as Added updates ALL ancestor folders!
+    let relaxed = FileStatusPolicy::content_only().with_classify_single_side_errors_as_error(false);
+    diff.reclassify_statuses(relaxed);
+    assert_eq!(
+        diff.find_directory("meta_dir/sub").expect("sub").status(),
+        FolderStatus::Unchanged
+    );
+    assert_eq!(
+        diff.find_directory("meta_dir").expect("meta_dir").status(),
+        FolderStatus::Unchanged
+    );
+    assert_eq!(
+        diff.find_directory("new_dir/inner").expect("inner").status(),
+        FolderStatus::Added
+    );
+    assert_eq!(
+        diff.find_directory("new_dir").expect("new_dir").status(),
+        FolderStatus::Added
+    );
+    assert_eq!(diff.root_status(), FolderStatus::Modified);
+
+    // Repropagating manually on a 2,000-level deep tree stays completely stack-safe.
+    let mut deep_l = DirectoryNode::new(String::from("/deep"));
+    let mut deep_r = DirectoryNode::new(String::from("/deep"));
+    let (mut cur_l, mut cur_r) = (&mut deep_l, &mut deep_r);
+    for level in 0..DEPTH {
+        let name = format!("d{level}");
+        cur_l = cur_l
+            .sub_directories
+            .entry(name.clone())
+            .or_insert_with(|| DirectoryNode::new(name.clone()));
+        cur_r = cur_r
+            .sub_directories
+            .entry(name.clone())
+            .or_insert_with(|| DirectoryNode::new(name));
+    }
+    cur_l
+        .files
+        .insert(String::from("leaf.txt"), file_entry(hash64('a'), 10, t1));
+    cur_r
+        .files
+        .insert(String::from("leaf.txt"), file_entry(hash64('b'), 10, t2));
+
+    let mut deep_diff = compare_trees(&deep_l, &deep_r);
+    assert_eq!(deep_diff.root_status(), FolderStatus::Modified);
+    assert_eq!(deep_diff.directory_status_counts().modified, DEPTH);
+    deep_diff.repropagate_folder_statuses();
+    assert_eq!(deep_diff.root_status(), FolderStatus::Modified);
+    assert_eq!(deep_diff.directory_status_counts().modified, DEPTH);
+
+    drop(deep_diff);
+    let mut drain = vec![deep_l, deep_r];
+    while let Some(mut node) = drain.pop() {
+        drain.extend(std::mem::take(&mut node.sub_directories).into_values());
+    }
+}
+
+#[test]
+fn folder_status_filter_queries_parsing_and_serde_roundtrip() {
+    let t1 = utc(2026, 8, 1, 10, 0, 0);
+    let t2 = utc(2026, 8, 2, 10, 0, 0);
+
+    let mut left = DirectoryNode::new(String::from("/app"));
+    left.insert_path(&["same_dir", "a.txt"], file_entry(hash64('a'), 10, t1));
+    left.insert_path(&["mod_dir", "b.txt"], file_entry(hash64('b'), 10, t1));
+    left.insert_path(&["del_dir", "c.txt"], file_entry(hash64('c'), 10, t1));
+
+    let mut right = DirectoryNode::new(String::from("/app"));
+    right.insert_path(&["same_dir", "a.txt"], file_entry(hash64('a'), 10, t1));
+    right.insert_path(&["mod_dir", "b.txt"], file_entry(hash64('x'), 20, t2));
+    right.insert_path(&["add_dir", "d.txt"], file_entry(hash64('d'), 30, t2));
+
+    let diff = compare_trees(&left, &right);
+
+    let changed_dirs: Vec<&str> = diff
+        .iter_directories_matching_filter(FolderStatusFilter::changes_only())
+        .map(DiffDirectoryNode::relative_path)
+        .collect();
+    assert_eq!(changed_dirs, vec!["", "add_dir", "del_dir", "mod_dir"]);
+
+    let unchanged_dirs: Vec<&str> = diff
+        .iter_directories_with_status(FolderStatus::Unchanged)
+        .map(DiffDirectoryNode::relative_path)
+        .collect();
+    assert_eq!(unchanged_dirs, vec!["same_dir"]);
+
+    let grouped = diff.directories_by_status();
+    assert_eq!(grouped[&FolderStatus::Unchanged].len(), 1);
+    assert_eq!(grouped[&FolderStatus::Modified].len(), 2); // root + mod_dir
+    assert_eq!(grouped[&FolderStatus::Added].len(), 1);
+    assert_eq!(grouped[&FolderStatus::Removed].len(), 1);
+
+    // Filter builders & JSON roundtrip.
+    let filter = FolderStatusFilter::only(FolderStatus::Modified)
+        .include(FolderStatus::Error)
+        .with_status(FolderStatus::Added, true)
+        .exclude(FolderStatus::Modified);
+    assert_eq!(filter.statuses(), vec![FolderStatus::Added, FolderStatus::Error]);
+    let json = serde_json::to_string(&filter).expect("serialize filter");
+    assert_eq!(json, r#"["added","error"]"#);
+    let decoded: FolderStatusFilter = serde_json::from_str(&json).expect("deserialize filter");
+    assert_eq!(decoded, filter);
+
+    // Enum parsing & formatting.
+    for status in FolderStatus::ALL {
+        assert_eq!(status.as_str().parse::<FolderStatus>(), Ok(status));
+        assert_eq!(status.symbol().parse::<FolderStatus>(), Ok(status));
+        assert_eq!(status.to_string(), status.as_str());
+        assert!(!status.display_name().is_empty());
+    }
+    let bad = "bogus".parse::<FolderStatus>().expect_err("invalid");
+    assert_eq!(bad.input(), "bogus");
+    assert!(bad.to_string().contains("bogus"));
+
+    // TreeDiff JSON roundtrip preserves folder status and status_summary faithfully.
+    let diff_json = serde_json::to_string(&diff).expect("serialize diff");
+    let diff_decoded: TreeDiff = serde_json::from_str(&diff_json).expect("deserialize diff");
+    assert_eq!(diff_decoded, diff);
 }

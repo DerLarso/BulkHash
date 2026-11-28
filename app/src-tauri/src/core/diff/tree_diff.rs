@@ -2,6 +2,10 @@ use crate::core::diff::file_status::{
     FileStatus, FileStatusCounts, FileStatusDetail, FileStatusFilter, FileStatusPolicy,
     classify_entry_with_options, classify_file_entry, classify_file_entry_detailed, classify_pair,
 };
+use crate::core::diff::folder_status::{
+    FolderStatus, FolderStatusCounts, FolderStatusFilter, FolderStatusSummary,
+    derive_folder_status, propagate_folder_statuses,
+};
 use crate::core::diff::warnings::{
     ComparisonDiagnostics, ComparisonWarning, PrecheckContext, PrecheckReport, WarningCode,
     WarningContext, WarningSeverity, collect_warnings, evaluate_precheck,
@@ -480,6 +484,11 @@ pub struct DiffDirectoryNode {
     pub depth: usize,
     /// Side presence (`only_left`, `only_right`, or `both`).
     pub presence: EntryPresence,
+    /// Propagated semantic folder status (`unchanged`, `modified`, `added`, `removed`, or `error`).
+    pub status: FolderStatus,
+    /// Precomputed bottom-up status summary of all files and descendant subdirectories beneath
+    /// this directory.
+    pub status_summary: FolderStatusSummary,
     /// Whether the left and right directory names differed in letter case.
     #[serde(default, skip_serializing_if = "is_false")]
     pub name_case_differs: bool,
@@ -546,6 +555,20 @@ impl DiffDirectoryNode {
     #[must_use]
     pub const fn presence(&self) -> EntryPresence {
         self.presence
+    }
+
+    /// Returns the propagated semantic [`FolderStatus`] of this directory (`Unchanged`,
+    /// `Modified`, `Added`, `Removed`, or `Error`).
+    #[must_use]
+    pub const fn status(&self) -> FolderStatus {
+        self.status
+    }
+
+    /// Returns the precomputed bottom-up [`FolderStatusSummary`] covering this directory and all
+    /// of its descendants.
+    #[must_use]
+    pub const fn status_summary(&self) -> &FolderStatusSummary {
+        &self.status_summary
     }
 
     /// Returns `true` if matched case-insensitively across differing letter case.
@@ -676,14 +699,49 @@ impl DiffDirectoryNode {
         grouped
     }
 
-    /// Counts all files in this subtree grouped by [`FileStatus`].
+    /// Counts all files in this subtree grouped by [`FileStatus`] in $O(1)$ time from the
+    /// propagated [`FolderStatusSummary`].
     #[must_use]
-    pub fn status_counts(&self) -> FileStatusCounts {
-        let mut counts = FileStatusCounts::default();
-        for entry in self.iter_files() {
-            counts.increment(entry.status());
+    pub const fn status_counts(&self) -> FileStatusCounts {
+        self.status_summary.files
+    }
+
+    /// Counts all descendant subdirectories beneath this directory (excluding `self`) grouped by
+    /// [`FolderStatus`] in $O(1)$ time from the propagated [`FolderStatusSummary`].
+    #[must_use]
+    pub const fn directory_status_counts(&self) -> FolderStatusCounts {
+        self.status_summary.directories
+    }
+
+    /// Iterates over all directories in this subtree (including `self`) matching a specific
+    /// [`FolderStatus`].
+    pub fn iter_directories_with_status(
+        &self,
+        status: FolderStatus,
+    ) -> impl Iterator<Item = &Self> {
+        self.iter_directories()
+            .filter(move |dir| dir.status() == status)
+    }
+
+    /// Iterates over all directories in this subtree (including `self`) matching a
+    /// [`FolderStatusFilter`].
+    pub fn iter_directories_matching_filter(
+        &self,
+        filter: FolderStatusFilter,
+    ) -> impl Iterator<Item = &Self> {
+        self.iter_directories()
+            .filter(move |dir| filter.matches(dir.status()))
+    }
+
+    /// Groups all directories in this subtree (including `self`) by their [`FolderStatus`] in
+    /// deterministic tree order.
+    #[must_use]
+    pub fn directories_by_status(&self) -> BTreeMap<FolderStatus, Vec<&Self>> {
+        let mut grouped: BTreeMap<FolderStatus, Vec<&Self>> = BTreeMap::new();
+        for dir in self.iter_directories() {
+            grouped.entry(dir.status()).or_default().push(dir);
         }
-        counts
+        grouped
     }
 }
 
@@ -903,14 +961,59 @@ impl TreeDiff {
         self.root.files_by_status()
     }
 
-    /// Counts all files in this diff grouped by [`FileStatus`].
+    /// Counts all files in this diff grouped by [`FileStatus`] in $O(1)$ time.
     #[must_use]
-    pub fn status_counts(&self) -> FileStatusCounts {
+    pub const fn status_counts(&self) -> FileStatusCounts {
         self.root.status_counts()
     }
 
+    /// Returns the propagated [`FolderStatus`] of the root directory.
+    #[must_use]
+    pub const fn root_status(&self) -> FolderStatus {
+        self.root.status()
+    }
+
+    /// Counts all subdirectories in this diff (excluding root) grouped by [`FolderStatus`] in
+    /// $O(1)$ time.
+    #[must_use]
+    pub const fn directory_status_counts(&self) -> FolderStatusCounts {
+        self.root.directory_status_counts()
+    }
+
+    /// Iterates over all directories in this diff (including root) matching a specific
+    /// [`FolderStatus`].
+    pub fn iter_directories_with_status(
+        &self,
+        status: FolderStatus,
+    ) -> impl Iterator<Item = &DiffDirectoryNode> {
+        self.root.iter_directories_with_status(status)
+    }
+
+    /// Iterates over all directories in this diff (including root) matching a
+    /// [`FolderStatusFilter`].
+    pub fn iter_directories_matching_filter(
+        &self,
+        filter: FolderStatusFilter,
+    ) -> impl Iterator<Item = &DiffDirectoryNode> {
+        self.root.iter_directories_matching_filter(filter)
+    }
+
+    /// Groups all directories in this diff (including root) by their [`FolderStatus`] in
+    /// deterministic tree order.
+    #[must_use]
+    pub fn directories_by_status(&self) -> BTreeMap<FolderStatus, Vec<&DiffDirectoryNode>> {
+        self.root.directories_by_status()
+    }
+
+    /// Recomputes [`DiffDirectoryNode::status`] and [`DiffDirectoryNode::status_summary`]
+    /// bottom-up across the entire diff tree iteratively (stack-safe).
+    pub fn repropagate_folder_statuses(&mut self) {
+        propagate_folder_statuses(&mut self.root);
+    }
+
     /// Iteratively (stack-safe) recomputes [`DiffFileEntry::status`] across the entire diff tree
-    /// using `policy` and updates [`ComparisonOptions::status_policy`].
+    /// using `policy`, re-propagates every directory's [`FolderStatus`] and
+    /// [`FolderStatusSummary`] bottom-up, and updates [`ComparisonOptions::status_policy`].
     pub fn reclassify_statuses(&mut self, policy: FileStatusPolicy) {
         self.options.status_policy = policy;
         let compare_metadata = self.options.compare_metadata;
@@ -926,6 +1029,7 @@ impl TreeDiff {
             }
             stack.extend(dir.sub_directories.values_mut());
         }
+        propagate_folder_statuses(&mut self.root);
     }
 }
 
@@ -1408,6 +1512,7 @@ struct DirBuildFrame<'a> {
     relative_path: String,
     depth: usize,
     presence: EntryPresence,
+    status_summary: FolderStatusSummary,
     name_case_differs: bool,
     type_conflict: bool,
     files: BTreeMap<String, DiffFileEntry>,
@@ -1417,12 +1522,15 @@ struct DirBuildFrame<'a> {
 
 impl DirBuildFrame<'_> {
     fn into_node(self) -> DiffDirectoryNode {
+        let status = derive_folder_status(self.presence, &self.status_summary);
         DiffDirectoryNode {
             name: self.name,
             left_name: self.left_name,
             relative_path: self.relative_path,
             depth: self.depth,
             presence: self.presence,
+            status,
+            status_summary: self.status_summary,
             name_case_differs: self.name_case_differs,
             type_conflict: self.type_conflict,
             files: self.files,
@@ -1481,6 +1589,9 @@ fn compare_nodes_iterative(
         let node = completed.into_node();
 
         if let Some(parent) = stack.last_mut() {
+            parent
+                .status_summary
+                .merge_child_directory(node.status, &node.status_summary);
             parent.sub_directories.insert(node.name.clone(), node);
         } else {
             return node;
@@ -1554,12 +1665,15 @@ fn build_frame<'a>(
         children
     };
 
+    let status_summary = FolderStatusSummary::from_files(files.values());
+
     DirBuildFrame {
         name: spec.name,
         left_name: spec.left_name,
         relative_path: spec.relative_path,
         depth: spec.depth,
         presence: spec.presence,
+        status_summary,
         name_case_differs: spec.name_case_differs,
         type_conflict: spec.type_conflict,
         files,
