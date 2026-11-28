@@ -463,6 +463,7 @@ fn app_state_snapshot_store_manages_plain_and_encrypted_snapshots() {
         .expect("encrypted snapshot summary");
     assert!(enc_summary.encrypted);
     assert_eq!(enc_summary.files_hashed, 2);
+    assert_eq!(enc_summary.tree_hash, plain_summary.tree_hash);
 
     let arc_plain = state.get_snapshot(plain_id).expect("get plain Arc");
     assert_eq!(arc_plain.get_meta().get_files_hashed(), 2);

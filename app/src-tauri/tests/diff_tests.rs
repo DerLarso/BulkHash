@@ -2950,3 +2950,65 @@ fn live_integrity_check_catches_real_silent_bitrot_on_disk() {
     assert_eq!(via_archives.summary().silent_corruption_files, 1);
     assert!(via_archives.finding_for_path("victim.bin").is_some());
 }
+
+#[test]
+fn integrity_check_detects_incompatible_algorithms_even_when_warnings_disabled() {
+    let t = utc(2026, 11, 1, 12, 0, 0);
+    let mut left_tree = DirectoryNode::new(String::from("/data"));
+    let mut right_tree = DirectoryNode::new(String::from("/data"));
+    left_tree
+        .files
+        .insert(String::from("a.bin"), file_entry(hash64('a'), 100, t));
+    right_tree
+        .files
+        .insert(String::from("a.bin"), file_entry(hash64('b'), 100, t));
+
+    let left_meta = MetaData::new(1, Duration::from_millis(1), t)
+        .with_os("linux")
+        .with_algorithm(HashAlgorithm::Sha256);
+    let right_meta = MetaData::new(1, Duration::from_millis(1), t)
+        .with_os("windows")
+        .with_algorithm(HashAlgorithm::Blake3);
+
+    // 1. Metadata algorithm mismatch with collect_warnings = false
+    let no_warn_comparer =
+        TreeComparer::with_options(ComparisonOptions::new().with_collect_warnings(false));
+    let diff_algo = no_warn_comparer.compare_trees_with_metadata(
+        &left_tree,
+        Some(&left_meta),
+        &right_tree,
+        Some(&right_meta),
+    );
+    assert!(diff_algo.warnings().is_empty());
+    let report_algo = diff_algo.check_integrity();
+    assert_eq!(report_algo.status(), IntegrityStatus::Unreliable);
+    assert!(!report_algo.is_algorithm_compatible());
+    assert!(
+        report_algo
+            .reliability_notes()
+            .iter()
+            .any(|note| note.contains("incompatible hash algorithms"))
+    );
+    assert!(
+        report_algo
+            .reliability_notes()
+            .iter()
+            .any(|note| note.contains("different operating systems"))
+    );
+
+    // 2. Disjoint observed hash lengths without metadata and with collect_warnings = false
+    let mut left_short = DirectoryNode::new(String::from("/data"));
+    let mut right_long = DirectoryNode::new(String::from("/data"));
+    left_short
+        .files
+        .insert(String::from("a.bin"), file_entry(hash32('a'), 100, t));
+    right_long
+        .files
+        .insert(String::from("a.bin"), file_entry(hash64('b'), 100, t));
+
+    let diff_len = no_warn_comparer.compare_trees(&left_short, &right_long);
+    assert!(diff_len.warnings().is_empty());
+    let report_len = diff_len.check_integrity();
+    assert_eq!(report_len.status(), IntegrityStatus::Unreliable);
+    assert!(!report_len.is_algorithm_compatible());
+}

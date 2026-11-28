@@ -291,6 +291,69 @@ impl FileManager {
         )
     }
 
+    /// Saves an unencrypted snapshot atomically to the exact `.hashed` file path `destination`
+    /// using default balanced ZIP compression ([`CompressionLevel::BALANCED`]).
+    ///
+    /// Designed for explicit "Save As…" workflows where the caller picks the target file path.
+    /// If `destination` already exists as a file, it is atomically replaced only after the new
+    /// archive has been completely written and flushed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BulkHashError::InvalidEnding`] if `destination` does not end with `.hashed`,
+    /// [`BulkHashError::PathNotFound`] / [`BulkHashError::NotADirectory`] if the parent folder is
+    /// missing or invalid, [`BulkHashError::NotAFile`] if `destination` is an existing directory,
+    /// [`BulkHashError::UnsupportedVersion`], or I/O / serialization errors.
+    pub fn save_file_to_path(
+        destination: impl AsRef<Path>,
+        json: &DirectoryNode,
+        meta: &MetaData,
+    ) -> Result<PathBuf, BulkHashError> {
+        Self::save_file_to_path_with_options(destination, json, meta, &SaveOptions::new())
+    }
+
+    /// Saves a snapshot atomically to the exact `.hashed` file path `destination` using unified
+    /// [`SaveOptions`] (combining ZIP/payload compression level and optional AES-256-GCM
+    /// encryption).
+    ///
+    /// If `destination` already exists as a file, it is atomically replaced only after the new
+    /// archive has been completely written and flushed; on error, any pre-existing file remains
+    /// untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BulkHashError::InvalidEnding`], [`BulkHashError::PathNotFound`],
+    /// [`BulkHashError::NotADirectory`], [`BulkHashError::NotAFile`],
+    /// [`BulkHashError::UnsupportedVersion`], encryption errors, or I/O / serialization errors.
+    pub fn save_file_to_path_with_options(
+        destination: impl AsRef<Path>,
+        json: &DirectoryNode,
+        meta: &MetaData,
+        options: &SaveOptions,
+    ) -> Result<PathBuf, BulkHashError> {
+        options.validate()?;
+        if meta.get_version() != CURRENT_FORMAT_VERSION {
+            return Err(BulkHashError::UnsupportedVersion(meta.get_version()));
+        }
+
+        let dest_ref = destination.as_ref();
+        let (dest_parent, dest_display) = Self::validate_destination_path(dest_ref)?;
+
+        let staged_path = Self::write_archive_staged(
+            dest_parent,
+            json,
+            meta,
+            options.compression(),
+            options.encryption(),
+        )?;
+        if let Err(err) = Self::replace_file_from_staged(&staged_path, dest_ref, &dest_display) {
+            let _ = fs::remove_file(&staged_path);
+            return Err(err);
+        }
+
+        Ok(dest_ref.to_path_buf())
+    }
+
     fn save_file_internal(
         folder_path: &Path,
         json: &DirectoryNode,
@@ -320,20 +383,21 @@ impl FileManager {
             opts.validate()?;
         }
 
-        let file_name = format!(
-            "{}-{}.hashed",
-            meta.get_current_os(),
+        let staged_path =
+            Self::write_archive_staged(folder_path, json, meta, compression, encryption)?;
+        let base_stem = format!(
+            "{}-{}",
+            Self::sanitize_filename_component(meta.get_current_os()),
             meta.get_filename_timestamp()
         );
-        let output_path = folder_path.join(file_name);
 
-        let write_result = Self::write_archive(&output_path, json, meta, compression, encryption);
-        if let Err(err) = write_result {
-            let _ = fs::remove_file(&output_path);
-            return Err(err);
+        match Self::place_staged_archive_unique(folder_path, &base_stem, &staged_path) {
+            Ok(output_path) => Ok(output_path),
+            Err(err) => {
+                let _ = fs::remove_file(&staged_path);
+                Err(err)
+            }
         }
-
-        Ok(output_path)
     }
 
     /// Inspects a `.hashed` archive's format version, encryption status, compression metadata,
@@ -1273,17 +1337,68 @@ impl FileManager {
         Ok(())
     }
 
-    fn write_archive(
-        output_path: &Path,
-        json: &DirectoryNode,
-        meta: &MetaData,
-        compression: CompressionLevel,
-        encryption: Option<&EncryptionOptions>,
-    ) -> Result<(), BulkHashError> {
-        let output_display = output_path.to_string_lossy().into_owned();
-        let file = File::create(output_path)
-            .map_err(|err| BulkHashError::from_io(err, output_display.clone()))?;
-        Self::write_archive_to_file(file, json, meta, compression, encryption, &output_display)
+    fn sanitize_filename_component(raw: &str) -> String {
+        let sanitized: String = raw
+            .trim()
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        if sanitized.is_empty() {
+            String::from("snapshot")
+        } else {
+            sanitized
+        }
+    }
+
+    fn place_staged_archive_unique(
+        folder_path: &Path,
+        base_stem: &str,
+        staged_path: &Path,
+    ) -> Result<PathBuf, BulkHashError> {
+        for attempt in 0..MAX_UNIQUE_PATH_ATTEMPTS {
+            let file_name = if attempt == 0 {
+                format!("{base_stem}.hashed")
+            } else {
+                format!("{base_stem}-{attempt}.hashed")
+            };
+            let candidate = folder_path.join(file_name);
+
+            match fs::hard_link(staged_path, &candidate) {
+                Ok(()) => {
+                    let _ = fs::remove_file(staged_path);
+                    return Ok(candidate);
+                }
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(_) => {
+                    // Fallback for filesystems without hard-link support (e.g. FAT32/exFAT/FUSE):
+                    // verify the target does not exist before renaming into place.
+                    let candidate_display = candidate.to_string_lossy().into_owned();
+                    let exists = candidate
+                        .try_exists()
+                        .map_err(|err| BulkHashError::from_io(err, candidate_display.clone()))?;
+                    if exists {
+                        continue;
+                    }
+                    fs::rename(staged_path, &candidate)
+                        .map_err(|err| BulkHashError::from_io(err, candidate_display))?;
+                    return Ok(candidate);
+                }
+            }
+        }
+
+        Err(BulkHashError::Io {
+            path: Some(folder_path.to_string_lossy().into_owned()),
+            source: io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "could not allocate a unique .hashed filename in target directory",
+            ),
+        })
     }
 
     fn write_archive_staged(

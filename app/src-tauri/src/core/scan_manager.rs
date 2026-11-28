@@ -339,11 +339,27 @@ impl ScanManager {
         let has_hidden_filter = self.hidden_filter.is_active();
 
         if !has_ignore_rules && !has_hidden_filter {
-            self.file_list = self.hasher.hash_files_with_threads_controlled(
-                paths,
-                self.thread_count,
-                &self.control,
-            )?;
+            let has_excluded_system = paths
+                .iter()
+                .any(|path| Self::is_excluded_system_path(path.as_ref()));
+            if has_excluded_system {
+                let filtered_paths: Vec<&Path> = paths
+                    .iter()
+                    .map(AsRef::as_ref)
+                    .filter(|path| !Self::is_excluded_system_path(path))
+                    .collect();
+                self.file_list = self.hasher.hash_files_with_threads_controlled(
+                    &filtered_paths,
+                    self.thread_count,
+                    &self.control,
+                )?;
+            } else {
+                self.file_list = self.hasher.hash_files_with_threads_controlled(
+                    paths,
+                    self.thread_count,
+                    &self.control,
+                )?;
+            }
         } else {
             let mut filtered_paths: Vec<&Path> = Vec::with_capacity(paths.len());
             let mut ignored_count = 0usize;

@@ -266,6 +266,20 @@ pub struct DirectoryNode {
     pub sub_directories: BTreeMap<String, DirectoryNode>,
 }
 
+impl Drop for DirectoryNode {
+    fn drop(&mut self) {
+        if self.sub_directories.is_empty() {
+            return;
+        }
+        let mut stack: Vec<Self> = std::mem::take(&mut self.sub_directories)
+            .into_values()
+            .collect();
+        while let Some(mut node) = stack.pop() {
+            stack.extend(std::mem::take(&mut node.sub_directories).into_values());
+        }
+    }
+}
+
 impl DirectoryNode {
     #[must_use]
     pub const fn new(name: String) -> Self {

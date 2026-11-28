@@ -73,7 +73,8 @@ pub struct LoadedSnapshotSummary {
     pub encrypted: bool,
     pub version: usize,
     pub was_migrated: bool,
-    pub archive_hash: String,
+    /// Hex SHA-256 digest of the snapshot's plaintext `tree.json` payload.
+    pub tree_hash: String,
 }
 
 #[derive(Debug)]
@@ -138,7 +139,7 @@ impl LoadedSnapshotRecord {
             encrypted: self.snapshot.is_encrypted(),
             version: meta.get_version(),
             was_migrated: self.snapshot.was_migrated(),
-            archive_hash: self.snapshot.get_hash().to_owned(),
+            tree_hash: self.snapshot.get_hash().to_owned(),
         }
     }
 }

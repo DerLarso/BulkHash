@@ -6394,3 +6394,135 @@ fn compression_backwards_compatibility_corruption_and_future_version_resilience(
         FileManager::inspect_compression(&future_path).expect("inspect_compression future v99");
     assert_eq!(future_comp.declared, None);
 }
+
+#[test]
+fn directory_node_iterative_drop_handles_very_deep_tree_without_stack_overflow() {
+    const DEPTH: usize = 5_000;
+    let mut root = DirectoryNode::new(String::from("/very_deep"));
+    let mut cursor = &mut root;
+    for level in 0..DEPTH {
+        let name = format!("lvl_{level}");
+        cursor = cursor
+            .sub_directories
+            .entry(name.clone())
+            .or_insert_with(|| DirectoryNode::new(name));
+    }
+    cursor.files.insert(
+        String::from("leaf.txt"),
+        FileEntry::from_hash(String::from("abcd"), Some(4), None),
+    );
+    assert_eq!(root.hashed_file_count(), 1);
+    // Dropping directly must use DirectoryNode's iterative Drop without overflowing the stack.
+    drop(root);
+}
+
+#[test]
+fn save_file_is_atomic_non_clobbering_and_save_file_to_path_replaces_safely() {
+    let dir = TempDir::new("atomic_save_and_to_path");
+    let ts = Utc::now();
+
+    let mut tree_a = DirectoryNode::new(String::from("/root_a"));
+    tree_a.files.insert(
+        String::from("a.txt"),
+        FileEntry::from_hash(String::from("aaaa"), Some(10), Some(ts)),
+    );
+    let mut tree_b = DirectoryNode::new(String::from("/root_b"));
+    tree_b.files.insert(
+        String::from("b.txt"),
+        FileEntry::from_hash(String::from("bbbb"), Some(20), Some(ts)),
+    );
+
+    let meta_a = MetaData::new(1, Duration::from_millis(5), ts).with_algorithm(HashAlgorithm::Blake3);
+    let meta_b = MetaData::new(1, Duration::from_millis(5), ts).with_algorithm(HashAlgorithm::Blake3);
+
+    // 1. Two saves in the exact same second and directory must NOT overwrite each other.
+    let path_1 = FileManager::save_file(dir.path(), &tree_a, &meta_a).expect("first save");
+    let path_2 = FileManager::save_file(dir.path(), &tree_b, &meta_b).expect("second save");
+    assert_ne!(path_1, path_2, "same-second saves must get unique filenames");
+    assert!(path_1.is_file());
+    assert!(path_2.is_file());
+    assert_eq!(
+        FileManager::open_file(&path_1).expect("open 1").get_tree(),
+        &tree_a
+    );
+    assert_eq!(
+        FileManager::open_file(&path_2).expect("open 2").get_tree(),
+        &tree_b
+    );
+
+    // 2. Explicit save_file_to_path writes to the exact chosen path and validates extension/target.
+    let bad_ext = dir.path().join("snapshot.zip");
+    assert!(matches!(
+        FileManager::save_file_to_path(&bad_ext, &tree_a, &meta_a),
+        Err(BulkHashError::InvalidEnding(_))
+    ));
+    assert!(matches!(
+        FileManager::save_file_to_path(dir.path().join("missing/out.hashed"), &tree_a, &meta_a),
+        Err(BulkHashError::PathNotFound(_))
+    ));
+
+    let custom_path = dir.path().join("my_backup.hashed");
+    let saved_custom =
+        FileManager::save_file_to_path(&custom_path, &tree_a, &meta_a).expect("save_file_to_path");
+    assert_eq!(saved_custom, custom_path);
+    assert_eq!(
+        FileManager::open_file(&custom_path)
+            .expect("open custom")
+            .get_tree(),
+        &tree_a
+    );
+
+    // 3. Failed save_file_to_path_with_options must preserve any existing destination file.
+    let stale_meta: MetaData = serde_json::from_str(&format!(
+        r#"{{"version":1,"files_hashed":1,"hash_time":{{"secs":0,"nanos":1}},"date_utc":"{}","local_time":"2026-01-01T00:00:00Z","os":"linux"}}"#,
+        ts.to_rfc3339()
+    ))
+    .expect("stale meta");
+    assert!(matches!(
+        FileManager::save_file_to_path(&custom_path, &tree_b, &stale_meta),
+        Err(BulkHashError::UnsupportedVersion(1))
+    ));
+    assert_eq!(
+        FileManager::open_file(&custom_path)
+            .expect("existing file preserved")
+            .get_tree(),
+        &tree_a
+    );
+
+    // 4. Atomic replacement with encryption + custom compression succeeds cleanly.
+    let fast_kdf = KdfParams::new(8 * 1024, 1, 1).expect("fast kdf");
+    let enc_opts = EncryptionOptions::new("to-path-secret")
+        .expect("password")
+        .with_kdf_params(fast_kdf)
+        .expect("apply kdf");
+    let save_opts = SaveOptions::new()
+        .with_compression(CompressionLevel::FAST)
+        .with_encryption(enc_opts);
+    FileManager::save_file_to_path_with_options(&custom_path, &tree_b, &meta_b, &save_opts)
+        .expect("replace custom path with encrypted archive");
+    let reloaded = FileManager::open_file_with_password(&custom_path, "to-path-secret")
+        .expect("reopen encrypted custom archive");
+    assert!(reloaded.is_encrypted());
+    assert_eq!(reloaded.get_compression_level(), Some(CompressionLevel::FAST));
+    assert_eq!(reloaded.get_tree(), &tree_b);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn scan_manager_hash_files_excludes_system_paths_without_user_filters() {
+    let dir = TempDir::new("hash_files_sys_excl");
+    let normal = dir.path().join("normal.txt");
+    fs::write(&normal, b"regular content").expect("write normal file");
+
+    let mut scanner = ScanManager::new(HashAlgorithm::Blake3);
+    scanner
+        .hash_files(&[PathBuf::from("/proc/version"), normal.clone()])
+        .expect("hash_files should skip excluded system paths");
+
+    assert_eq!(scanner.get_list().len(), 1);
+    assert_eq!(
+        scanner.get_list()[0].get_path(),
+        normal.to_string_lossy().as_ref()
+    );
+    assert!(scanner.get_list()[0].get_result().is_ok());
+}

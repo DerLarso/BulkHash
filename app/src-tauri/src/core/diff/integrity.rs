@@ -8,7 +8,7 @@ use crate::core::diff::warnings::WarningCode;
 use crate::core::io::{bulk_hash_error::BulkHashError, directory_node::FileEntry};
 use crate::core::structs::bulk_hash_file_struct::BulkHashFileStruct;
 use chrono::{DateTime, TimeDelta, Utc};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::path::Path;
 use std::time::Duration;
@@ -665,17 +665,40 @@ pub fn check_diff_integrity_with_options(
     diff: &TreeDiff,
     options: &IntegrityCheckOptions,
 ) -> IntegrityReport {
-    let algorithm_compatible = !diff.has_warning(WarningCode::DifferentHashAlgorithm)
-        && !diff.has_warning(WarningCode::InconsistentHashLengths);
-
-    let mut reliability_notes = collect_reliability_notes(diff, algorithm_compatible);
     let mut summary = IntegritySummary::default();
     let mut findings: Vec<IntegrityFinding> = Vec::new();
+    let mut left_hash_lengths: BTreeSet<usize> = BTreeSet::new();
+    let mut right_hash_lengths: BTreeSet<usize> = BTreeSet::new();
     let tolerance = TimeDelta::from_std(options.timestamp_tolerance).unwrap_or(TimeDelta::MAX);
 
     for entry in diff.iter_files() {
+        if let Some(lh) = entry.left_hash() {
+            left_hash_lengths.insert(lh.len());
+        }
+        if let Some(rh) = entry.right_hash() {
+            right_hash_lengths.insert(rh.len());
+        }
         inspect_diff_file(entry, options, tolerance, &mut summary, &mut findings);
     }
+
+    let metadata_algo_mismatch = matches!(
+        (diff.left_info().algorithm, diff.right_info().algorithm),
+        (Some(left_algo), Some(right_algo)) if left_algo != right_algo
+    );
+    let disjoint_hash_lengths = !left_hash_lengths.is_empty()
+        && !right_hash_lengths.is_empty()
+        && left_hash_lengths.is_disjoint(&right_hash_lengths);
+    let algorithm_compatible = !diff.has_warning(WarningCode::DifferentHashAlgorithm)
+        && !diff.has_warning(WarningCode::InconsistentHashLengths)
+        && !metadata_algo_mismatch
+        && !disjoint_hash_lengths;
+
+    let mut reliability_notes = collect_reliability_notes(
+        diff,
+        algorithm_compatible,
+        &left_hash_lengths,
+        &right_hash_lengths,
+    );
 
     if summary.unverifiable_missing_timestamp_files > 0 {
         reliability_notes.push(format!(
@@ -795,28 +818,56 @@ pub fn check_archive_integrity_live(
     })
 }
 
-fn collect_reliability_notes(diff: &TreeDiff, algorithm_compatible: bool) -> Vec<String> {
+fn collect_reliability_notes(
+    diff: &TreeDiff,
+    algorithm_compatible: bool,
+    left_hash_lengths: &BTreeSet<usize>,
+    right_hash_lengths: &BTreeSet<usize>,
+) -> Vec<String> {
     let mut notes = Vec::new();
     if !algorithm_compatible {
         notes.push(String::from(
             "Baseline and target used incompatible hash algorithms or disjoint hash lengths; bitrot findings are not reliable.",
         ));
     }
-    if diff.has_warning(WarningCode::UnknownHashAlgorithm) {
+
+    let any_hashed_files = !left_hash_lengths.is_empty() || !right_hash_lengths.is_empty();
+    let has_any_metadata = diff.left_info().format_version.is_some()
+        || diff.right_info().format_version.is_some()
+        || diff.left_info().os.is_some()
+        || diff.right_info().os.is_some()
+        || diff.left_info().algorithm.is_some()
+        || diff.right_info().algorithm.is_some();
+    let unknown_algorithm = algorithm_compatible
+        && any_hashed_files
+        && has_any_metadata
+        && (diff.left_info().algorithm.is_none() || diff.right_info().algorithm.is_none());
+    if diff.has_warning(WarningCode::UnknownHashAlgorithm) || unknown_algorithm {
         notes.push(String::from(
             "Hash algorithm metadata is missing for at least one side; ensure both sides were hashed with the same algorithm.",
         ));
     }
-    if diff.has_warning(WarningCode::DifferentOperatingSystem) {
+
+    let os_mismatch = matches!(
+        (&diff.left_info().os, &diff.right_info().os),
+        (Some(left_os), Some(right_os)) if !left_os.trim().eq_ignore_ascii_case(right_os.trim())
+    );
+    if diff.has_warning(WarningCode::DifferentOperatingSystem) || os_mismatch {
         notes.push(String::from(
             "Snapshots originate from different operating systems; timestamp precision and line-ending differences may affect bitrot heuristics.",
         ));
     }
-    if diff.has_warning(WarningCode::ReversedChronologicalOrder) {
+
+    let reversed_order = matches!(
+        (diff.left_info().date_utc, diff.right_info().date_utc),
+        (Some(left_date), Some(right_date)) if left_date > right_date
+    );
+    if diff.has_warning(WarningCode::ReversedChronologicalOrder) || reversed_order {
         notes.push(String::from(
             "Baseline snapshot timestamp is newer than target snapshot; timestamp-based bitrot checks may be inverted.",
         ));
     }
+
     if diff.is_truncated() {
         notes.push(String::from(
             "Diff traversal was truncated by max_depth; deeper subdirectories were not verified.",
