@@ -1,3 +1,4 @@
+pub mod diff;
 pub mod hash_manager;
 pub mod hidden_filter;
 pub mod ignore_list;

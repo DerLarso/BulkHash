@@ -4,6 +4,7 @@ Legende:
 [X] = Feature fehlt
 [O] = Feature ist in Arbeit
 [#] = Feature ist gut und ohne Bugs implementiert
+[/] = Feature wird erstmal nicht implementiert
 
 Backend - Core & Hashing:
 	[#] Datei-Hashing (Blake3 & SHA256): Speichereffizientes Hashen mit 64KB-Buffer ; Rust
@@ -27,10 +28,10 @@ Backend - Dateiformat & IO (.hashed):
 	[#] Versions-Migration: Abwärtskompatibilität für zukünftige Versionen des .hashed-Formats ; Rust
 	[#] Snapshot-Verschlüsselung: Optionaler Passwortschutz (AES-GCM) für sensible Dateibäume ; Rust
 	[#] Snapshot-Komprimierungsgrad: Einstellbare ZIP-Kompressionsstärke (Schnell vs. Kleine Datei) ; Rust
-	[X] Die tree.json segmentieren für schnelleren zugriff und weniger ram Auslastung, wenn nicht der ganze Baum gebraucht wird ; Rust
+	[/] Die tree.json segmentieren für schnelleren zugriff und weniger ram Auslastung, wenn nicht der ganze Baum gebraucht wird ; Rust
 
 Backend - Diff-Engine & Analyse:
-	[X] Baum-Vergleichsalgorithmus: Rekursiver Abgleich von zwei DirectoryNode-Strukturen ; Rust
+	[#] Baum-Vergleichsalgorithmus: Rekursiver Abgleich von zwei DirectoryNode-Strukturen ; Rust
 	[X] Datei-Status-Erkennung: Kategorisierung in Unverändert, Geändert, Neu, Gelöscht und Fehler ; Rust
 	[X] Move- & Rename-Erkennung: Identifizieren verschobener oder umbenannter Dateien anhand gleicher Hashes ; Rust
 	[X] Ordner-Status-Propagation: Markiert übergeordnete Ordner farbig, wenn sich tiefere Dateien geändert haben ; Rust

@@ -6,6 +6,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use chrono::{DateTime, Local, SecondsFormat, Utc};
 use serde_json::Value;
 use zeroize::Zeroizing;
 use zip::{CompressionMethod, ZipArchive, ZipWriter, write::SimpleFileOptions};
@@ -52,6 +53,22 @@ struct ProbedArchive {
     version: usize,
     encrypted: bool,
     path_display: String,
+}
+
+/// Lightweight metadata probe returned by [`FileManager::inspect_metadata`] without reading,
+/// decompressing, or decrypting `tree.json` / `tree.enc`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ArchiveMetadataInfo {
+    /// Parsed snapshot metadata from `meta.json`.
+    pub meta: MetaData,
+    /// Hex SHA-256 digest stored in `hash.sha256` (hashes `tree.json` or `tree.enc`).
+    pub archive_hash: String,
+    /// On-disk `.hashed` format version recorded in `meta.json`.
+    pub version: usize,
+    /// Whether the archive uses password encryption (`tree.enc`).
+    pub encrypted: bool,
+    /// Whether opening this archive will migrate it to [`CURRENT_FORMAT_VERSION`].
+    pub needs_migration: bool,
 }
 
 /// Builder-style configuration for saving `.hashed` snapshot archives.
@@ -399,6 +416,91 @@ impl FileManager {
     /// Propagates inspection errors from [`Self::inspect_version`].
     pub fn is_encrypted(path: impl AsRef<Path>) -> Result<bool, BulkHashError> {
         Ok(Self::inspect_version(path)?.is_encrypted())
+    }
+
+    /// Reads and validates a `.hashed` archive's `meta.json` and `hash.sha256` without reading,
+    /// decompressing, or decrypting `tree.json` / `tree.enc`.
+    ///
+    /// Works on unencrypted v1/v2/v3 archives as well as password-encrypted v3 archives without
+    /// requiring a password, making it ideal for fast pre-comparison compatibility checks.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BulkHashError::UnsupportedVersion`] if the archive version is outside the
+    /// supported range, [`BulkHashError::FileIsCorrupted`] if required archive entries are missing
+    /// or malformed, or I/O / ZIP / JSON errors.
+    pub fn inspect_metadata(path: impl AsRef<Path>) -> Result<ArchiveMetadataInfo, BulkHashError> {
+        let mut probed = Self::open_and_probe_archive(path.as_ref())?;
+        let registry = MigrationRegistry::with_builtin_migrations();
+
+        if probed.version < registry.min_supported_version()
+            || probed.version > registry.target_version()
+        {
+            return Err(BulkHashError::UnsupportedVersion(probed.version));
+        }
+
+        let required_entries =
+            required_entries_for_archive(probed.version, probed.encrypted).ok_or_else(|| {
+                BulkHashError::FileIsCorrupted(format!(
+                    "{}: encryption is not supported in format version {}",
+                    probed.path_display, probed.version
+                ))
+            })?;
+        Self::validate_required_entries(&probed.entries, required_entries, &probed.path_display)?;
+
+        if probed.encrypted && probed.entries.iter().any(|name| name == "tree.json") {
+            return Err(BulkHashError::FileIsCorrupted(format!(
+                "{}: encrypted archive must not contain plaintext 'tree.json'",
+                probed.path_display
+            )));
+        }
+        if !probed.encrypted && probed.entries.iter().any(|name| name == ENCRYPTED_TREE_ENTRY) {
+            return Err(BulkHashError::FileIsCorrupted(format!(
+                "{}: unencrypted archive must not contain '{ENCRYPTED_TREE_ENTRY}'",
+                probed.path_display
+            )));
+        }
+
+        let _ = Self::extract_compression_metadata(&probed.meta_value, true)?;
+        if probed.encrypted {
+            let enc_val = probed.meta_value.get("encryption").ok_or_else(|| {
+                BulkHashError::InvalidEncryptionParameters(format!(
+                    "{}: encrypted snapshot is missing 'encryption' metadata",
+                    probed.path_display
+                ))
+            })?;
+            let _ = parse_encryption_metadata(enc_val)?;
+        }
+
+        let archive_hash = Self::read_expected_hash(&mut probed.archive, &probed.path_display)?;
+
+        // Normalize minimal legacy v1 metadata where `local_time` may be omitted or null.
+        if let Some(meta_obj) = probed.meta_value.as_object_mut() {
+            let needs_local_time = meta_obj
+                .get("local_time")
+                .is_none_or(|val| val.is_null() || val.as_str().is_some_and(str::is_empty));
+            if needs_local_time
+                && let Some(date_str) = meta_obj.get("date_utc").and_then(Value::as_str)
+                && let Ok(parsed) = DateTime::parse_from_rfc3339(date_str)
+            {
+                let derived = parsed
+                    .with_timezone(&Utc)
+                    .with_timezone(&Local)
+                    .to_rfc3339_opts(SecondsFormat::Secs, true);
+                meta_obj.insert(String::from("local_time"), Value::String(derived));
+            }
+        }
+
+        let meta: MetaData = serde_json::from_value(probed.meta_value)?;
+        let needs_migration = probed.version < CURRENT_FORMAT_VERSION;
+
+        Ok(ArchiveMetadataInfo {
+            meta,
+            archive_hash,
+            version: probed.version,
+            encrypted: probed.encrypted,
+            needs_migration,
+        })
     }
 
     /// Opens an unencrypted `.hashed` snapshot, verifying integrity and transparently migrating

@@ -52,6 +52,12 @@ impl MetaData {
         }
     }
 
+    #[must_use]
+    pub fn with_os(mut self, os: impl Into<String>) -> Self {
+        self.os = os.into();
+        self
+    }
+
     pub fn with_algorithm(mut self, algorithm: HashAlgorithm) -> Self {
         self.algorithm = Some(algorithm);
         self
