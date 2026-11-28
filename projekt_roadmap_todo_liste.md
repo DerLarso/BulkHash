@@ -41,7 +41,7 @@ Backend - Diff-Engine & Analyse:
 	[#] Bitrot- / Integritäts-Check: Prüfung auf beschädigte Dateien bei unverändertem Änderungsdatum ; Rust
 
 Backend - Tauri, IPC & System-Integration:
-	[O] Tauri-App-Setup: Grundgerüst der Desktop-App (temporäre CLI-Testfunktion muss noch ersetzt werden) ; Rust
+	[#] Tauri-App-Setup: Grundgerüst der Desktop-App (temporäre CLI-Testfunktion muss noch ersetzt werden) ; Rust
 	[X] Tauri-Commands (IPC): Schnittstellen-Funktionen für Scan, Datei-Laden und Diff-Vergleich ; Rust
 	[X] Live-Fortschritts-Events: Senden von aktueller Datei, Prozentstand und MB/s an das Frontend ; Rust
 	[X] Native Dateidialoge: Öffnen des System-Explorers zur Ordner- und Dateiauswahl ; Rust / TypeScript

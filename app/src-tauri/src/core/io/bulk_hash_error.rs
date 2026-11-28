@@ -35,6 +35,9 @@ pub enum BulkHashError {
     SnapshotNotEncrypted(String),
     FileIsCorrupted(String),
     ScanCancelled,
+    AppShuttingDown,
+    ScanJobNotFound(u64),
+    SnapshotNotFound(u64),
     Io {
         path: Option<String>,
         source: io::Error,
@@ -80,6 +83,9 @@ impl BulkHashError {
             Self::SnapshotNotEncrypted(_) => "SnapshotNotEncrypted",
             Self::FileIsCorrupted(_) => "FileIsCorrupted",
             Self::ScanCancelled => "ScanCancelled",
+            Self::AppShuttingDown => "AppShuttingDown",
+            Self::ScanJobNotFound(_) => "ScanJobNotFound",
+            Self::SnapshotNotFound(_) => "SnapshotNotFound",
             Self::Io { .. } => "Io",
             Self::JsonError(_) => "JsonError",
             Self::ZipError(_) => "ZipError",
@@ -94,6 +100,11 @@ impl BulkHashError {
 
     pub const fn is_password_required(&self) -> bool {
         matches!(self, Self::PasswordRequired(_))
+    }
+
+    #[must_use]
+    pub const fn is_shutting_down(&self) -> bool {
+        matches!(self, Self::AppShuttingDown)
     }
 }
 
@@ -151,6 +162,9 @@ impl fmt::Display for BulkHashError {
             Self::SnapshotNotEncrypted(path) => write!(f, "Snapshot is not encrypted: {path}"),
             Self::FileIsCorrupted(file) => write!(f, "File is corrupted: {file}"),
             Self::ScanCancelled => write!(f, "Scan was cancelled"),
+            Self::AppShuttingDown => write!(f, "Application is shutting down"),
+            Self::ScanJobNotFound(id) => write!(f, "Scan job not found: {id}"),
+            Self::SnapshotNotFound(id) => write!(f, "Loaded snapshot not found: {id}"),
             Self::Io {
                 path: Some(path),
                 source,

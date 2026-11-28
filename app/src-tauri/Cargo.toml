@@ -37,3 +37,6 @@ flate2 = "1.1"
 getrandom = "0.4"
 zeroize = "1.9"
 
+[dev-dependencies]
+tauri = { version = "2", features = ["test"] }
+

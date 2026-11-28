@@ -12,9 +12,14 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "BulkHash",
         "width": 1200,
-        "height": 600
+        "height": 720,
+        "minWidth": 800,
+        "minHeight": 540,
+        "resizable": true,
+        "center": true
       }
     ],
     "security": {
