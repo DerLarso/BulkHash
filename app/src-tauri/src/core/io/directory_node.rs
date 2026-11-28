@@ -396,4 +396,33 @@ impl DirectoryNode {
         }
         count
     }
+
+    /// Looks up a file entry by canonical relative path (accepting both `/` and `\` separators).
+    #[must_use]
+    pub fn find_file(&self, relative_path: &str) -> Option<&FileEntry> {
+        let parts: Vec<&str> = relative_path
+            .split(['/', '\\'])
+            .filter(|segment| !segment.is_empty() && *segment != ".")
+            .collect();
+        let (&file_name, dirs) = parts.split_last()?;
+        let mut current = self;
+        for &dir in dirs {
+            current = current.sub_directories.get(dir)?;
+        }
+        current.files.get(file_name)
+    }
+
+    /// Looks up a subdirectory by relative path (accepting both `/` and `\` separators).
+    /// Returns `Some(self)` for `""`, `"."`, or `"/"`.
+    #[must_use]
+    pub fn find_directory(&self, relative_path: &str) -> Option<&Self> {
+        let mut current = self;
+        for dir in relative_path
+            .split(['/', '\\'])
+            .filter(|segment| !segment.is_empty() && *segment != ".")
+        {
+            current = current.sub_directories.get(dir)?;
+        }
+        Some(current)
+    }
 }

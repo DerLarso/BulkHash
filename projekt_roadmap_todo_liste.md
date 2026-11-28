@@ -37,7 +37,7 @@ Backend - Diff-Engine & Analyse:
 	[#] Ordner-Status-Propagation: Markiert übergeordnete Ordner farbig, wenn sich tiefere Dateien geändert haben ; Rust
 	[#] Diff-Statistiken: Berechnung der Gesamtzahl aller Änderungen sowie der Speicherplatz-Differenz ; Rust
 	[#] Live-Ordner-Vergleich: Direktes Prüfen einer .hashed-Datei gegen einen echten Ordner auf der Festplatte ; Rust
-	[X] Duplikat-Finder: Aufspüren identischer Dateien (gleicher Hash) innerhalb eines einzelnen Snapshots ; Rust
+	[#] Duplikat-Finder: Aufspüren identischer Dateien (gleicher Hash) innerhalb eines einzelnen Snapshots ; Rust
 	[X] Bitrot- / Integritäts-Check: Prüfung auf beschädigte Dateien bei unverändertem Änderungsdatum ; Rust
 
 Backend - Tauri, IPC & System-Integration:

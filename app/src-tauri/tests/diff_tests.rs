@@ -1,15 +1,20 @@
 use bulk_hash_lib::core::{
     diff::{
-        ComparisonOptions, ComparisonWarning, DiffDirectoryNode, DiffFileEntry, DiffStatistics,
-        EntryPresence, FileComparisonOutcome, FileStatus, FileStatusCounts, FileStatusDetail,
-        FileStatusFilter, FileStatusPolicy, FolderStatus, FolderStatusCounts, FolderStatusFilter,
-        LiveComparer, LiveComparisonOptions, LiveComparisonResult, MAX_WARNING_SAMPLES,
-        NameMatchingMode, PrecheckReport, StorageStatistics, TreeComparer, TreeDiff, WarningCode,
-        WarningDetails, WarningSeverity, classify_file_entry, classify_file_entry_detailed,
-        classify_pair, compare_archive_with_folder, compare_archive_with_folder_with_options,
+        ComparisonOptions, ComparisonWarning, DiffDirectoryNode, DiffDuplicateScope, DiffFileEntry,
+        DiffStatistics, DuplicateFinder, DuplicateOccurrence, DuplicateOptions, DuplicateReport,
+        DuplicateSortOrder, DuplicateSource, EntryPresence, FileComparisonOutcome, FileStatus, FileStatusCounts,
+        FileStatusDetail, FileStatusFilter, FileStatusPolicy, FolderDuplicateSummary, FolderStatus,
+        FolderStatusCounts, FolderStatusFilter, LiveComparer, LiveComparisonOptions,
+        LiveComparisonResult, MAX_WARNING_SAMPLES, NameMatchingMode, PrecheckReport,
+        StorageStatistics, TreeComparer, TreeDiff, WarningCode, WarningDetails, WarningSeverity,
+        classify_file_entry, classify_file_entry_detailed, classify_pair,
+        compare_archive_with_folder, compare_archive_with_folder_with_options,
         compare_snapshot_with_folder, compare_snapshot_with_folder_with_options,
         compare_snapshots, compare_snapshots_with_options, compare_trees,
-        compare_trees_with_options, extract_path_basename, format_bytes, format_signed_bytes,
+        compare_trees_with_options, extract_path_basename, find_duplicates_in_archive,
+        find_duplicates_in_archive_with_password, find_duplicates_in_diff,
+        find_duplicates_in_diff_with_options, find_duplicates_in_snapshot, find_duplicates_in_tree,
+        find_duplicates_in_tree_with_options, format_bytes, format_signed_bytes,
         infer_os_from_path, precheck_archive_files, precheck_archive_with_folder,
         precheck_metadata, precheck_snapshot_with_folder, precheck_snapshots, precheck_trees,
         precheck_trees_with_metadata,
@@ -2354,4 +2359,319 @@ fn live_compare_supports_encrypted_archives_passwordless_precheck_cross_os_and_c
     let not_found = compare_snapshot_with_folder(&win_snap, &missing_dir)
         .expect_err("expected PathNotFound");
     assert!(matches!(not_found, BulkHashError::PathNotFound(_)));
+}
+
+#[test]
+fn duplicate_finder_detects_groups_in_single_tree_and_builds_viewer_overlays() {
+    let t = utc(2026, 10, 1, 10, 0, 0);
+
+    let mut tree = DirectoryNode::new(String::from("/media/library"));
+    // Group A (largest wasted space: 3 copies * 1000 B -> 2000 B wasted, mixed hex case!)
+    tree.insert_path(&["photos", "a.jpg"], file_entry(hash64('a'), 1_000, t));
+    tree.insert_path(&["photos", "backup", "a_copy.jpg"], file_entry(hash64('A'), 1_000, t));
+    tree.insert_path(&["exports", "a_export.jpg"], file_entry(hash64('a'), 1_000, t));
+    // Group B (2 copies * 400 B -> 400 B wasted)
+    tree.insert_path(&["docs", "manual.pdf"], file_entry(hash64('b'), 400, t));
+    tree.insert_path(&["manual_copy.pdf"], file_entry(hash64('b'), 400, t));
+    // Unique file (not duplicate)
+    tree.insert_path(&["unique.txt"], file_entry(hash64('u'), 500, t));
+    // Two errored files with same error text must NEVER be grouped as duplicates!
+    tree.insert_path(
+        &["err1.bin"],
+        FileEntry::from_error(String::from("Permission denied"), None, None),
+    );
+    tree.insert_path(
+        &["err2.bin"],
+        FileEntry::from_error(String::from("Permission denied"), None, None),
+    );
+
+    let report = find_duplicates_in_tree(&tree);
+    assert!(report.has_duplicates());
+    assert!(!report.is_truncated());
+    assert_eq!(
+        report.source(),
+        &DuplicateSource::Tree {
+            root_name: String::from("/media/library")
+        }
+    );
+    assert_eq!(report.summary().total_files_scanned, 8);
+    assert_eq!(report.summary().hashed_files_considered, 6);
+    assert_eq!(report.summary().errored_files_skipped, 2);
+    assert_eq!(report.summary().duplicate_group_count, 2);
+    assert_eq!(report.summary().duplicate_file_count, 5);
+    assert_eq!(report.summary().redundant_file_count, 3);
+    assert_eq!(report.summary().total_duplicate_bytes, 3_800);
+    assert_eq!(report.summary().total_wasted_bytes, 2_400);
+    assert!(report.summary().is_size_complete());
+
+    // Default sorting: largest wasted bytes first (Group A = 2000 B, Group B = 400 B).
+    assert_eq!(report.groups().len(), 2);
+    assert_eq!(report.groups()[0].group_id, 0);
+    assert_eq!(report.groups()[0].hash, hash64('a'));
+    assert_eq!(report.groups()[0].copy_count, 3);
+    assert_eq!(report.groups()[0].redundant_copies(), 2);
+    assert_eq!(report.groups()[0].wasted_bytes, Some(2_000));
+    let group_a_paths: Vec<&str> = report.groups()[0]
+        .files
+        .iter()
+        .map(DuplicateOccurrence::relative_path)
+        .collect();
+    assert_eq!(
+        group_a_paths,
+        vec!["exports/a_export.jpg", "photos/a.jpg", "photos/backup/a_copy.jpg"]
+    );
+
+    // Tree-viewer overlay lookup & symmetric DirectoryNode::find_file / find_directory navigation.
+    let path_idx = report.path_to_group_index();
+    assert_eq!(path_idx.get("photos/a.jpg"), Some(&0));
+    assert_eq!(path_idx.get("docs/manual.pdf"), Some(&1));
+    assert_eq!(path_idx.get("unique.txt"), None);
+    assert!(report.is_duplicate_path("photos\\backup\\a_copy.jpg"));
+    assert!(!report.is_duplicate_path("unique.txt"));
+
+    for occ in &report.groups()[0].files {
+        assert!(tree.find_file(occ.relative_path()).is_some());
+        assert!(tree.find_directory(occ.parent_path()).is_some());
+    }
+    assert_eq!(tree.find_directory("").expect("root").name, "/media/library");
+
+    // Folder duplicate summary propagates bottom-up to ancestor folders (ready for tree viewer badges).
+    let folder_overlays = report.folder_duplicate_summaries();
+    assert_eq!(
+        folder_overlays.get("photos"),
+        Some(&FolderDuplicateSummary {
+            direct_duplicate_files: 1,
+            recursive_duplicate_files: 2,
+            distinct_groups: 1,
+            recursive_duplicate_bytes: 2_000,
+        })
+    );
+    assert_eq!(
+        folder_overlays.get(""),
+        Some(&FolderDuplicateSummary {
+            direct_duplicate_files: 1,
+            recursive_duplicate_files: 5,
+            distinct_groups: 2,
+            recursive_duplicate_bytes: 3_800,
+        })
+    );
+}
+
+#[test]
+fn duplicate_finder_options_filtering_sorting_truncation_and_size_mismatch() {
+    let t = utc(2026, 10, 1, 10, 0, 0);
+
+    let mut tree = DirectoryNode::new(String::from("/opts"));
+    // Empty file duplicates (2 copies, 0 bytes)
+    tree.insert_path(&["empty1.txt"], file_entry(hash64('0'), 0, t));
+    tree.insert_path(&["empty2.txt"], file_entry(hash64('0'), 0, t));
+    // Small 3-copy group (3 * 50 B -> 100 B wasted)
+    tree.insert_path(&["s1.bin"], file_entry(hash64('1'), 50, t));
+    tree.insert_path(&["s2.bin"], file_entry(hash64('1'), 50, t));
+    tree.insert_path(&["s3.bin"], file_entry(hash64('1'), 50, t));
+    // Large 2-copy group (2 * 500 B -> 500 B wasted)
+    tree.insert_path(&["big1.bin"], file_entry(hash64('2'), 500, t));
+    tree.insert_path(&["big2.bin"], file_entry(hash64('2'), 500, t));
+    // Size-mismatch group (same hash, conflicting sizes 200 vs 250)
+    tree.insert_path(&["weird1.bin"], file_entry(hash64('3'), 200, t));
+    tree.insert_path(&["weird2.bin"], file_entry(hash64('3'), 250, t));
+
+    // Ignore empty files + require min_file_size >= 100 + sort by FileSizeDesc + cap max_groups = 1.
+    let opts = DuplicateOptions::new()
+        .with_ignore_empty_files(true)
+        .with_min_file_size(Some(100))
+        .with_sort_order(DuplicateSortOrder::FileSizeDesc)
+        .with_max_groups(Some(1));
+    let report = find_duplicates_in_tree_with_options(&tree, &opts);
+
+    assert!(report.is_truncated());
+    assert_eq!(report.summary().empty_files_skipped, 2);
+    assert_eq!(report.summary().below_min_size_skipped, 3);
+    assert_eq!(report.summary().duplicate_group_count, 2); // big + weird (summary keeps full totals!)
+    assert_eq!(report.summary().groups_with_size_mismatch, 1);
+    assert_eq!(report.groups().len(), 1); // capped to 1
+    assert_eq!(report.groups()[0].hash, hash64('2'));
+    assert_eq!(report.groups()[0].file_size, Some(500));
+
+    // Sort by CopyCountDesc with min_copies = 3 finds ONLY the 3-copy group.
+    let copy_opts = DuplicateOptions::new()
+        .with_min_copies(3)
+        .with_sort_order(DuplicateSortOrder::CopyCountDesc);
+    let copy_report = find_duplicates_in_tree_with_options(&tree, &copy_opts);
+    assert_eq!(copy_report.groups().len(), 1);
+    assert_eq!(copy_report.groups()[0].hash, hash64('1'));
+    assert_eq!(copy_report.groups()[0].copy_count, 3);
+
+    // Check size_mismatch flag explicitly.
+    let full = find_duplicates_in_tree(&tree);
+    let weird = full
+        .groups()
+        .iter()
+        .find(|g| g.hash == hash64('3'))
+        .expect("weird group");
+    assert!(weird.size_mismatch);
+    assert_eq!(weird.wasted_bytes, Some(200)); // 450 - 250
+}
+
+#[test]
+fn duplicate_finder_works_on_tree_diff_left_right_and_unified_scopes() {
+    let t1 = utc(2026, 10, 1, 10, 0, 0);
+    let t2 = utc(2026, 10, 2, 10, 0, 0);
+
+    let mut left = DirectoryNode::new(String::from("/app/v1"));
+    left.insert_path(&["keep.bin"], file_entry(hash64('a'), 1_000, t1));
+    left.insert_path(&["old_dup.bin"], file_entry(hash64('b'), 600, t1));
+    left.insert_path(&["old_dup_copy.bin"], file_entry(hash64('b'), 600, t1));
+    left.insert_path(&["moved_from.bin"], file_entry(hash64('m'), 800, t1));
+
+    let mut right = DirectoryNode::new(String::from("/app/v2"));
+    right.insert_path(&["keep.bin"], file_entry(hash64('a'), 1_000, t1));
+    // Newly added duplicate of `keep.bin` in v2!
+    right.insert_path(&["sub", "keep_copy.bin"], file_entry(hash64('a'), 1_000, t2));
+    // Old duplicate was cleaned up in v2 (only one copy left).
+    right.insert_path(&["old_dup.bin"], file_entry(hash64('b'), 600, t1));
+    // Same hash as removed `moved_from.bin` appears at new path `moved_to.bin`.
+    right.insert_path(&["moved_to.bin"], file_entry(hash64('m'), 800, t2));
+
+    let diff = compare_trees(&left, &right);
+
+    // 1. Left scope: finds `old_dup.bin` + `old_dup_copy.bin` (baseline duplicates).
+    let left_dups = diff.find_duplicates(DiffDuplicateScope::Left);
+    assert_eq!(left_dups.groups().len(), 1);
+    assert_eq!(left_dups.groups()[0].hash, hash64('b'));
+    assert!(left_dups.groups()[0].has_any_status(FileStatus::Unchanged));
+    assert!(left_dups.groups()[0].has_any_status(FileStatus::Removed));
+    assert_eq!(
+        left_dups.source(),
+        &DuplicateSource::Diff {
+            scope: DiffDuplicateScope::Left,
+            left_root_name: String::from("/app/v1"),
+            right_root_name: String::from("/app/v2"),
+        }
+    );
+
+    // 2. Right scope: finds `keep.bin` (Unchanged) + `sub/keep_copy.bin` (Added).
+    let right_dups = find_duplicates_in_diff(&diff, DiffDuplicateScope::Right);
+    assert_eq!(right_dups.groups().len(), 1);
+    assert_eq!(right_dups.groups()[0].hash, hash64('a'));
+    assert!(right_dups.groups()[0].has_any_status(FileStatus::Added));
+    assert!(right_dups.groups()[0].has_any_status(FileStatus::Unchanged));
+    assert_eq!(
+        right_dups
+            .groups_matching_status_filter(FileStatusFilter::only(FileStatus::Added))
+            .count(),
+        1
+    );
+
+    // 3. Unified scope: finds all 3 duplicate hash groups across distinct diff rows (`a`, `b`, `m`)
+    //    without ever duplicating an unchanged file against itself!
+    let unified_dups =
+        find_duplicates_in_diff_with_options(&diff, DiffDuplicateScope::Unified, &DuplicateOptions::new());
+    assert_eq!(unified_dups.groups().len(), 3);
+    assert_eq!(unified_dups.summary().duplicate_file_count, 6);
+    assert!(unified_dups.group_for_path("moved_from.bin").is_some());
+    assert_eq!(
+        unified_dups
+            .group_for_path("moved_from.bin")
+            .expect("m group")
+            .group_id,
+        unified_dups
+            .group_for_path("moved_to.bin")
+            .expect("m group")
+            .group_id
+    );
+
+    // Lossless JSON serde roundtrip of DuplicateReport.
+    let json = serde_json::to_string(&unified_dups).expect("serialize DuplicateReport");
+    let decoded: DuplicateReport =
+        serde_json::from_str(&json).expect("deserialize DuplicateReport");
+    assert_eq!(decoded, unified_dups);
+}
+
+#[test]
+fn duplicate_finder_supports_snapshots_encrypted_archives_and_deep_trees() {
+    const DEPTH: usize = 2_000;
+    let data_dir = TempDir::new("dup_arch_data");
+    let archive_dir = TempDir::new("dup_arch_out");
+
+    fs::write(data_dir.path().join("orig.bin"), b"identical payload 123456").expect("write orig");
+    fs::write(data_dir.path().join("copy.bin"), b"identical payload 123456").expect("write copy");
+    fs::write(data_dir.path().join("other.bin"), b"something else").expect("write other");
+
+    let plain_archive = scan_and_save_snapshot(
+        data_dir.path(),
+        archive_dir.path(),
+        HashAlgorithm::Blake3,
+        IgnoreList::new(),
+        HiddenFileFilter::include_all(),
+        None,
+    );
+
+    let plain_report = find_duplicates_in_archive(&plain_archive).expect("plain archive dups");
+    assert_eq!(plain_report.summary().duplicate_group_count, 1);
+    assert_eq!(plain_report.summary().total_wasted_bytes, 24);
+    assert!(matches!(
+        plain_report.source(),
+        DuplicateSource::Snapshot {
+            algorithm: Some(HashAlgorithm::Blake3),
+            ..
+        }
+    ));
+
+    // Snapshot helper matches archive helper.
+    let loaded = FileManager::open_file(&plain_archive).expect("open plain");
+    assert_eq!(find_duplicates_in_snapshot(&loaded), plain_report);
+
+    // Encrypted archive duplicate search.
+    let fast_kdf = KdfParams::new(8 * 1024, 1, 1).expect("fast kdf");
+    let enc_opts = EncryptionOptions::new("dup-secret")
+        .expect("enc opts")
+        .with_kdf_params(fast_kdf)
+        .expect("kdf");
+    let enc_dir = TempDir::new("dup_enc_out");
+    let enc_archive = scan_and_save_snapshot(
+        data_dir.path(),
+        enc_dir.path(),
+        HashAlgorithm::Sha256,
+        IgnoreList::new(),
+        HiddenFileFilter::include_all(),
+        Some(&enc_opts),
+    );
+    assert!(matches!(
+        DuplicateFinder::new().find_in_archive(&enc_archive),
+        Err(BulkHashError::PasswordRequired(_))
+    ));
+    let enc_report = find_duplicates_in_archive_with_password(
+        &enc_archive,
+        Some("dup-secret"),
+        &DuplicateOptions::new(),
+    )
+    .expect("encrypted archive dups");
+    assert_eq!(enc_report.summary().duplicate_group_count, 1);
+    assert_eq!(enc_report.summary().total_wasted_bytes, 24);
+
+    // Stack-safe iterative duplicate scan on a 2,000-level deep tree.
+    let t = utc(2026, 10, 1, 10, 0, 0);
+    let mut deep = DirectoryNode::new(String::from("/deep"));
+    deep.files
+        .insert(String::from("root_copy.bin"), file_entry(hash64('d'), 128, t));
+    let mut cur = &mut deep;
+    for level in 0..DEPTH {
+        let name = format!("d{level}");
+        cur = cur
+            .sub_directories
+            .entry(name.clone())
+            .or_insert_with(|| DirectoryNode::new(name));
+    }
+    cur.files
+        .insert(String::from("leaf_copy.bin"), file_entry(hash64('d'), 128, t));
+
+    let deep_report = find_duplicates_in_tree(&deep);
+    assert_eq!(deep_report.summary().duplicate_group_count, 1);
+    assert_eq!(deep_report.summary().total_wasted_bytes, 128);
+
+    let mut drain = vec![deep];
+    while let Some(mut node) = drain.pop() {
+        drain.extend(std::mem::take(&mut node.sub_directories).into_values());
+    }
 }

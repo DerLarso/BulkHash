@@ -1,3 +1,7 @@
+use crate::core::diff::duplicates::{
+    DiffDuplicateScope, DuplicateOptions, DuplicateReport, find_duplicates_in_diff,
+    find_duplicates_in_diff_with_options,
+};
 use crate::core::diff::file_status::{
     FileStatus, FileStatusCounts, FileStatusDetail, FileStatusFilter, FileStatusPolicy,
     classify_entry_with_options, classify_file_entry, classify_file_entry_detailed, classify_pair,
@@ -1101,6 +1105,24 @@ impl TreeDiff {
         changed
     }
 
+    /// Finds duplicate files within this diff for the requested [`DiffDuplicateScope`] (`Left`,
+    /// `Right`, or `Unified`) using default [`DuplicateOptions`].
+    #[must_use]
+    pub fn find_duplicates(&self, scope: DiffDuplicateScope) -> DuplicateReport {
+        find_duplicates_in_diff(self, scope)
+    }
+
+    /// Finds duplicate files within this diff for the requested [`DiffDuplicateScope`] (`Left`,
+    /// `Right`, or `Unified`) using custom [`DuplicateOptions`].
+    #[must_use]
+    pub fn find_duplicates_with_options(
+        &self,
+        scope: DiffDuplicateScope,
+        options: &DuplicateOptions,
+    ) -> DuplicateReport {
+        find_duplicates_in_diff_with_options(self, scope, options)
+    }
+
     /// Iteratively (stack-safe) recomputes [`DiffFileEntry::status`] across the entire diff tree
     /// using `policy`, re-propagates every directory's [`FolderStatus`] and
     /// [`FolderStatusSummary`] bottom-up, and updates [`ComparisonOptions::status_policy`].
@@ -1450,10 +1472,7 @@ pub fn precheck_trees_with_metadata(
 /// Fast, $O(1)$ pre-comparison compatibility check on two loaded [`BulkHashFileStruct`] snapshots
 /// without traversing their file trees, returning one consolidated [`PrecheckReport`].
 #[must_use]
-pub fn precheck_snapshots(
-    left: &BulkHashFileStruct,
-    right: &BulkHashFileStruct,
-) -> PrecheckReport {
+pub fn precheck_snapshots(left: &BulkHashFileStruct, right: &BulkHashFileStruct) -> PrecheckReport {
     let left_migrated = left
         .get_meta()
         .get_migrated_from()

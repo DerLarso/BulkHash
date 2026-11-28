@@ -1,3 +1,4 @@
+pub mod duplicates;
 pub mod file_status;
 pub mod folder_status;
 pub mod live_compare;
@@ -5,6 +6,14 @@ pub mod statistics;
 pub mod tree_diff;
 pub mod warnings;
 
+pub use duplicates::{
+    DiffDuplicateScope, DuplicateFinder, DuplicateGroup, DuplicateOccurrence, DuplicateOptions,
+    DuplicateReport, DuplicateSortOrder, DuplicateSource, DuplicateSummary, FolderDuplicateSummary,
+    find_duplicates_in_archive, find_duplicates_in_archive_with_password, find_duplicates_in_diff,
+    find_duplicates_in_diff_with_options, find_duplicates_in_snapshot,
+    find_duplicates_in_snapshot_with_options, find_duplicates_in_tree,
+    find_duplicates_in_tree_with_options,
+};
 pub use file_status::{
     FileStatus, FileStatusCounts, FileStatusDetail, FileStatusFilter, FileStatusInfo,
     FileStatusPolicy, ParseFileStatusError, classify_file_entry, classify_file_entry_detailed,
