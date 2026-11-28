@@ -3,12 +3,15 @@ use bulk_hash_lib::core::{
         ComparisonOptions, ComparisonWarning, DiffDirectoryNode, DiffFileEntry, DiffStatistics,
         EntryPresence, FileComparisonOutcome, FileStatus, FileStatusCounts, FileStatusDetail,
         FileStatusFilter, FileStatusPolicy, FolderStatus, FolderStatusCounts, FolderStatusFilter,
-        MAX_WARNING_SAMPLES, NameMatchingMode, PrecheckReport, StorageStatistics, TreeComparer,
-        TreeDiff, WarningCode, WarningDetails, WarningSeverity, classify_file_entry,
-        classify_file_entry_detailed, classify_pair, compare_snapshots,
-        compare_snapshots_with_options, compare_trees, compare_trees_with_options,
-        extract_path_basename, format_bytes, format_signed_bytes, infer_os_from_path,
-        precheck_archive_files, precheck_metadata, precheck_snapshots, precheck_trees,
+        LiveComparer, LiveComparisonOptions, LiveComparisonResult, MAX_WARNING_SAMPLES,
+        NameMatchingMode, PrecheckReport, StorageStatistics, TreeComparer, TreeDiff, WarningCode,
+        WarningDetails, WarningSeverity, classify_file_entry, classify_file_entry_detailed,
+        classify_pair, compare_archive_with_folder, compare_archive_with_folder_with_options,
+        compare_snapshot_with_folder, compare_snapshot_with_folder_with_options,
+        compare_snapshots, compare_snapshots_with_options, compare_trees,
+        compare_trees_with_options, extract_path_basename, format_bytes, format_signed_bytes,
+        infer_os_from_path, precheck_archive_files, precheck_archive_with_folder,
+        precheck_metadata, precheck_snapshot_with_folder, precheck_snapshots, precheck_trees,
         precheck_trees_with_metadata,
     },
     hash_manager::HashAlgorithm,
@@ -21,7 +24,7 @@ use bulk_hash_lib::core::{
         file_manager::FileManager,
         meta_data::MetaData,
     },
-    scan_manager::ScanManager,
+    scan_manager::{ScanControl, ScanManager},
     structs::bulk_hash_file_struct::BulkHashFileStruct,
 };
 use chrono::{DateTime, TimeZone, Utc};
@@ -2055,4 +2058,300 @@ fn per_folder_storage_stats_drilldown_top_changes_deep_trees_and_formatting() {
     while let Some(mut node) = drain.pop() {
         drain.extend(std::mem::take(&mut node.sub_directories).into_values());
     }
+}
+
+fn scan_and_save_snapshot(
+    data_dir: &Path,
+    archive_dir: &Path,
+    algorithm: HashAlgorithm,
+    ignore_list: IgnoreList,
+    hidden_filter: HiddenFileFilter,
+    encryption: Option<&EncryptionOptions>,
+) -> PathBuf {
+    let mut scan = ScanManager::new(algorithm)
+        .with_ignore_list(ignore_list.clone())
+        .with_hidden_filter(hidden_filter);
+    scan.start_hash(data_dir.to_string_lossy().into_owned())
+        .expect("baseline scan");
+
+    let tree = DirectoryNode::build_tree(scan.get_path(), scan.get_list());
+    let mut meta = MetaData::new(
+        scan.get_hash_manager().get_files_counted(),
+        scan.get_hash_time(),
+        utc(2026, 9, 1, 10, 0, 0),
+    )
+    .with_algorithm(algorithm)
+    .with_total_size(scan.get_total_size())
+    .with_hidden_filter(hidden_filter);
+    if !ignore_list.is_empty() {
+        meta = meta.with_ignore_list(ignore_list);
+    }
+
+    FileManager::save_file_with_encryption(archive_dir, &tree, &meta, encryption)
+        .expect("save baseline snapshot")
+}
+
+#[test]
+fn live_compare_detects_clean_match_and_disk_changes_with_stats_and_propagation() {
+    let data_dir = TempDir::new("live_basic_data");
+    let archive_dir = TempDir::new("live_basic_arch");
+    let sub = data_dir.path().join("src");
+    fs::create_dir_all(&sub).expect("create src");
+
+    fs::write(data_dir.path().join("readme.md"), b"hello world").expect("write readme");
+    fs::write(sub.join("main.rs"), b"fn main() {}").expect("write main");
+    fs::write(sub.join("old.rs"), b"deprecated").expect("write old");
+
+    let archive_path = scan_and_save_snapshot(
+        data_dir.path(),
+        archive_dir.path(),
+        HashAlgorithm::Blake3,
+        IgnoreList::new(),
+        HiddenFileFilter::include_all(),
+        None,
+    );
+
+    // 1. Unmodified folder matches snapshot cleanly with zero warnings and zero changes.
+    let clean = compare_archive_with_folder(&archive_path, data_dir.path()).expect("live clean");
+    assert!(clean.is_clean_match());
+    assert!(!clean.has_changes());
+    assert!(!clean.has_warnings());
+    assert!(!clean.has_errors());
+    assert!(clean.inherited_algorithm);
+    assert_eq!(clean.effective_algorithm(), HashAlgorithm::Blake3);
+    assert_eq!(clean.statistics().total_file_changes(), 0);
+    assert_eq!(clean.statistics().net_size_delta(), 0);
+    assert_eq!(clean.diff().root_status(), FolderStatus::Unchanged);
+
+    // 2. Modify, delete, and add files on disk, then live-compare again.
+    fs::write(sub.join("main.rs"), b"fn main() { println!(\"v2\"); }").expect("modify main");
+    fs::remove_file(sub.join("old.rs")).expect("remove old");
+    let new_dir = data_dir.path().join("assets");
+    fs::create_dir_all(&new_dir).expect("create assets");
+    fs::write(new_dir.join("logo.bin"), vec![42u8; 256]).expect("write logo");
+
+    let live = compare_archive_with_folder(&archive_path, data_dir.path()).expect("live changed");
+    assert!(!live.is_clean_match());
+    assert!(live.has_changes());
+    assert!(!live.has_warnings());
+
+    assert_eq!(
+        live.diff().find_file("readme.md").expect("readme").status(),
+        FileStatus::Unchanged
+    );
+    assert_eq!(
+        live.diff().find_file("src/main.rs").expect("main").status(),
+        FileStatus::Modified
+    );
+    assert_eq!(
+        live.diff().find_file("src/old.rs").expect("old").status(),
+        FileStatus::Removed
+    );
+    assert_eq!(
+        live.diff()
+            .find_file("assets/logo.bin")
+            .expect("logo")
+            .status(),
+        FileStatus::Added
+    );
+    assert_eq!(
+        live.diff().find_directory("src").expect("src").status(),
+        FolderStatus::Modified
+    );
+    assert_eq!(
+        live.diff()
+            .find_directory("assets")
+            .expect("assets")
+            .status(),
+        FolderStatus::Added
+    );
+    assert_eq!(live.diff().root_status(), FolderStatus::Modified);
+
+    // Net delta: +17 bytes in main.rs (12 -> 29), -10 bytes in old.rs, +256 bytes in logo.bin = +263 bytes.
+    assert_eq!(live.statistics().total_file_changes(), 3);
+    assert_eq!(live.statistics().net_size_delta(), 263);
+
+    // JSON serde roundtrip of LiveComparisonResult for Tauri IPC.
+    let json = serde_json::to_string(&live).expect("serialize LiveComparisonResult");
+    let decoded: LiveComparisonResult =
+        serde_json::from_str(&json).expect("deserialize LiveComparisonResult");
+    assert_eq!(decoded.diff, live.diff);
+    assert_eq!(decoded.statistics, live.statistics);
+    assert_eq!(decoded.effective_algorithm, live.effective_algorithm);
+}
+
+#[test]
+fn live_compare_inherits_algorithm_ignore_list_and_hidden_filter_and_supports_overrides() {
+    let data_dir = TempDir::new("live_inherit_data");
+    let archive_dir = TempDir::new("live_inherit_arch");
+
+    fs::write(data_dir.path().join("app.rs"), b"pub fn run() {}").expect("write app");
+    fs::write(data_dir.path().join("debug.log"), b"ignored log").expect("write log");
+    fs::write(data_dir.path().join(".env"), b"SECRET=1").expect("write dotfile");
+
+    let ignore_list = IgnoreList::from_patterns(["*.log"]).expect("valid ignore");
+    let hidden_filter = HiddenFileFilter::exclude_dotfiles();
+
+    // Baseline saved with SHA-256 + ignore list + hidden filter!
+    let archive_path = scan_and_save_snapshot(
+        data_dir.path(),
+        archive_dir.path(),
+        HashAlgorithm::Sha256,
+        ignore_list,
+        hidden_filter,
+        None,
+    );
+
+    // Default live comparison inherits SHA-256, `*.log` ignore list, and dotfile filter -> clean match!
+    let inherited =
+        compare_archive_with_folder(&archive_path, data_dir.path()).expect("live inherited");
+    assert!(inherited.is_clean_match());
+    assert!(!inherited.has_warnings());
+    assert_eq!(inherited.effective_algorithm(), HashAlgorithm::Sha256);
+    assert!(inherited.inherited_algorithm);
+    assert!(inherited.inherited_ignore_list);
+    assert!(inherited.inherited_hidden_filter);
+    assert_eq!(inherited.live_ignored_count, 1);
+    assert_eq!(inherited.live_hidden_skipped_count, 1);
+
+    // Overriding algorithm, ignore list, and hidden filter surfaces all 3 mismatch warnings!
+    let override_opts = LiveComparisonOptions::new()
+        .with_algorithm(HashAlgorithm::XxHash3)
+        .with_inherit_ignore_list(false)
+        .with_hidden_filter(HiddenFileFilter::include_all())
+        .with_thread_count(2);
+
+    let precheck = precheck_archive_with_folder(&archive_path, data_dir.path(), &override_opts)
+        .expect("precheck overrides");
+    assert!(precheck.has_critical_warnings());
+    assert!(precheck.has_warning(WarningCode::DifferentHashAlgorithm));
+    assert!(precheck.has_warning(WarningCode::DifferentIgnoreLists));
+    assert!(precheck.has_warning(WarningCode::DifferentHiddenFileFilter));
+
+    let overridden =
+        compare_archive_with_folder_with_options(&archive_path, None, data_dir.path(), &override_opts)
+            .expect("live overridden");
+    assert!(overridden.has_critical_warnings());
+    assert!(!overridden.inherited_algorithm);
+    assert!(!overridden.inherited_ignore_list);
+    assert!(!overridden.inherited_hidden_filter);
+    assert_eq!(overridden.effective_algorithm(), HashAlgorithm::XxHash3);
+    assert!(overridden.diff().has_warning(WarningCode::DifferentHashAlgorithm));
+    assert!(overridden.diff().has_warning(WarningCode::DifferentIgnoreLists));
+    assert!(overridden.diff().has_warning(WarningCode::DifferentHiddenFileFilter));
+    // `.env` and `debug.log` now show up as Added because filters were disabled.
+    assert_eq!(
+        overridden.diff().find_file("debug.log").expect("log").status(),
+        FileStatus::Added
+    );
+    assert_eq!(
+        overridden.diff().find_file(".env").expect("env").status(),
+        FileStatus::Added
+    );
+}
+
+#[test]
+fn live_compare_supports_encrypted_archives_passwordless_precheck_cross_os_and_cancellation() {
+    let data_dir = TempDir::new("live_enc_data");
+    let archive_dir = TempDir::new("live_enc_arch");
+    fs::write(data_dir.path().join("readme.md"), b"cross platform").expect("write readme");
+
+    // 1. Encrypted archive live comparison + passwordless precheck.
+    let fast_kdf = KdfParams::new(8 * 1024, 1, 1).expect("fast test kdf");
+    let enc_opts = EncryptionOptions::new("live-secret")
+        .expect("enc opts")
+        .with_kdf_params(fast_kdf)
+        .expect("kdf");
+    let enc_archive = scan_and_save_snapshot(
+        data_dir.path(),
+        archive_dir.path(),
+        HashAlgorithm::XxHash3,
+        IgnoreList::new(),
+        HiddenFileFilter::include_all(),
+        Some(&enc_opts),
+    );
+
+    // Precheck works WITHOUT a password!
+    let pre = precheck_archive_with_folder(&enc_archive, data_dir.path(), &LiveComparisonOptions::new())
+        .expect("passwordless live precheck");
+    assert!(pre.left().encrypted);
+    assert!(!pre.right().encrypted);
+    assert!(pre.is_clean());
+
+    // Full live comparison without password returns PasswordRequired.
+    let missing_pwd = compare_archive_with_folder(&enc_archive, data_dir.path())
+        .expect_err("expected PasswordRequired");
+    assert!(matches!(missing_pwd, BulkHashError::PasswordRequired(_)));
+
+    // With password, full live comparison succeeds cleanly with inherited XxHash3.
+    let comparer = LiveComparer::new();
+    let unlocked = comparer
+        .compare_archive(&enc_archive, Some("live-secret"), data_dir.path())
+        .expect("unlocked live compare");
+    assert!(unlocked.is_clean_match());
+    assert_eq!(unlocked.effective_algorithm(), HashAlgorithm::XxHash3);
+
+    // 2. Cross-OS baseline snapshot (e.g. Windows) compared against live folder with case-insensitive matching.
+    let mut win_tree = DirectoryNode::new(String::from(r"C:\Users\Lars\OtherFolder"));
+    win_tree.insert_path(
+        &["README.md"],
+        file_entry(
+            HashAlgorithm::Blake3.get_hash_from_bytes(b"cross platform"),
+            14,
+            utc(2026, 9, 1, 10, 0, 0),
+        ),
+    );
+    let win_meta = MetaData::new(1, Duration::from_millis(5), utc(2026, 9, 1, 10, 0, 0))
+        .with_os("windows")
+        .with_algorithm(HashAlgorithm::Blake3);
+    let win_snap = BulkHashFileStruct::new(win_meta, win_tree, hash64('w'));
+
+    let ci_opts = LiveComparisonOptions::new()
+        .with_case_insensitive(true)
+        .with_status_policy(FileStatusPolicy::content_only());
+
+    let win_pre = precheck_snapshot_with_folder(&win_snap, data_dir.path(), &ci_opts)
+        .expect("cross-os live precheck");
+    if std::env::consts::OS != "windows" {
+        assert!(win_pre.has_warning(WarningCode::DifferentOperatingSystem));
+    }
+    assert!(win_pre.has_warning(WarningCode::DifferentRootName));
+
+    let mut win_live =
+        compare_snapshot_with_folder_with_options(&win_snap, data_dir.path(), &ci_opts)
+            .expect("cross-os live compare");
+    assert_eq!(
+        win_live
+            .diff()
+            .find_file("readme.md")
+            .expect("case-matched readme")
+            .status(),
+        FileStatus::Unchanged
+    );
+    assert_eq!(win_live.statistics().total_file_changes(), 0);
+
+    // Reclassifying to strict mode picks up the live mtime difference and syncs statistics!
+    win_live.reclassify_statuses(FileStatusPolicy::strict());
+    assert_eq!(
+        win_live
+            .diff()
+            .find_file("readme.md")
+            .expect("readme")
+            .status(),
+        FileStatus::Modified
+    );
+    assert_eq!(win_live.statistics().total_file_changes(), 1);
+
+    // 3. Pre-cancelled ScanControl aborts immediately with ScanCancelled, missing path returns PathNotFound.
+    let control = ScanControl::new();
+    control.cancel();
+    let cancel_opts = LiveComparisonOptions::new().with_control(control);
+    let cancelled = compare_snapshot_with_folder_with_options(&win_snap, data_dir.path(), &cancel_opts)
+        .expect_err("expected ScanCancelled");
+    assert!(matches!(cancelled, BulkHashError::ScanCancelled));
+
+    let missing_dir = data_dir.path().join("does_not_exist");
+    let not_found = compare_snapshot_with_folder(&win_snap, &missing_dir)
+        .expect_err("expected PathNotFound");
+    assert!(matches!(not_found, BulkHashError::PathNotFound(_)));
 }

@@ -1,5 +1,6 @@
 pub mod file_status;
 pub mod folder_status;
+pub mod live_compare;
 pub mod statistics;
 pub mod tree_diff;
 pub mod warnings;
@@ -12,6 +13,12 @@ pub use file_status::{
 pub use folder_status::{
     FolderStatus, FolderStatusCounts, FolderStatusFilter, FolderStatusSummary,
     ParseFolderStatusError, derive_folder_status, propagate_folder_statuses,
+};
+pub use live_compare::{
+    LiveComparer, LiveComparisonOptions, LiveComparisonResult, compare_archive_with_folder,
+    compare_archive_with_folder_with_options, compare_snapshot_with_folder,
+    compare_snapshot_with_folder_with_options, precheck_archive_with_folder,
+    precheck_snapshot_with_folder,
 };
 pub use statistics::{
     DiffStatistics, FolderStorageStats, StorageStatistics, compute_diff_statistics,
