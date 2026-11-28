@@ -31,6 +31,7 @@ pub enum BulkHashError {
     DecryptionFailed(String),
     EncryptionFailed(String),
     InvalidEncryptionParameters(String),
+    InvalidCompressionLevel(String),
     SnapshotNotEncrypted(String),
     FileIsCorrupted(String),
     ScanCancelled,
@@ -75,6 +76,7 @@ impl BulkHashError {
             Self::DecryptionFailed(_) => "DecryptionFailed",
             Self::EncryptionFailed(_) => "EncryptionFailed",
             Self::InvalidEncryptionParameters(_) => "InvalidEncryptionParameters",
+            Self::InvalidCompressionLevel(_) => "InvalidCompressionLevel",
             Self::SnapshotNotEncrypted(_) => "SnapshotNotEncrypted",
             Self::FileIsCorrupted(_) => "FileIsCorrupted",
             Self::ScanCancelled => "ScanCancelled",
@@ -142,6 +144,9 @@ impl fmt::Display for BulkHashError {
             Self::EncryptionFailed(reason) => write!(f, "Failed to encrypt snapshot: {reason}"),
             Self::InvalidEncryptionParameters(reason) => {
                 write!(f, "Invalid encryption parameters: {reason}")
+            }
+            Self::InvalidCompressionLevel(reason) => {
+                write!(f, "Invalid compression level: {reason}")
             }
             Self::SnapshotNotEncrypted(path) => write!(f, "Snapshot is not encrypted: {path}"),
             Self::FileIsCorrupted(file) => write!(f, "File is corrupted: {file}"),

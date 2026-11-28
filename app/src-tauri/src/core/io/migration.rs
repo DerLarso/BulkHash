@@ -6,6 +6,7 @@ use serde_json::{Map, Value};
 
 use crate::core::io::{
     bulk_hash_error::BulkHashError,
+    compression::CompressionMetadata,
     encryption::{ENCRYPTED_TREE_ENTRY, EncryptionMetadata},
 };
 
@@ -141,6 +142,8 @@ pub struct ArchiveVersionInfo {
     pub encrypted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encryption: Option<EncryptionMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression: Option<CompressionMetadata>,
     pub entries: Vec<String>,
 }
 
@@ -168,6 +171,11 @@ impl ArchiveVersionInfo {
     #[must_use]
     pub const fn encryption(&self) -> Option<&EncryptionMetadata> {
         self.encryption.as_ref()
+    }
+
+    #[must_use]
+    pub const fn compression(&self) -> Option<CompressionMetadata> {
+        self.compression
     }
 }
 

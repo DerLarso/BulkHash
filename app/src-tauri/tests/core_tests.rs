@@ -7,6 +7,11 @@ use bulk_hash_lib::core::{
     ignore_list::IgnoreList,
     io::{
         bulk_hash_error::BulkHashError,
+        compression::{
+            ArchiveCompressionMethod, CompressionLevel, CompressionMetadata, CompressionPreset,
+            DEFAULT_COMPRESSION_LEVEL, FAST_COMPRESSION_LEVEL, MAX_COMPRESSION_LEVEL,
+            MIN_COMPRESSION_LEVEL,
+        },
         directory_node::{DirectoryNode, FileEntry},
         encryption::{
             ENCRYPTED_TREE_ENTRY, EncryptionCipher, EncryptionOptions, KdfParams,
@@ -14,7 +19,7 @@ use bulk_hash_lib::core::{
             MIN_KDF_MEMORY_KIB, PayloadCompression, build_tree_aad, decrypt_tree_payload,
             encrypt_tree_payload, prepare_encryption_metadata,
         },
-        file_manager::FileManager,
+        file_manager::{FileManager, SaveOptions},
         meta_data::MetaData,
         migration::{
             CURRENT_FORMAT_VERSION, FORMAT_VERSION_V1, FORMAT_VERSION_V2, FORMAT_VERSION_V3,
@@ -5563,4 +5568,829 @@ fn v2_to_v3_migration_and_encryption_error_gui_serialization() {
             "error message for {expected_kind} must be non-empty"
         );
     }
+}
+
+fn build_compressible_test_tree(ts: DateTime<Utc>) -> (DirectoryNode, usize, u64) {
+    let mut tree = DirectoryNode::new(String::from("/workspace/compressible_project"));
+    let mut count = 0usize;
+    let mut total_size = 0u64;
+
+    // Generate a realistic multi-directory tree (~100 KiB JSON) with repeating path prefixes,
+    // structured metadata, and varied pseudo-hashes so Fast (1), Balanced (6), and Best (9)
+    // produce measurably different compressed sizes.
+    for dir_idx in 0..16u32 {
+        let module = format!("module_alpha_beta_{:02}", dir_idx % 4);
+        let sub = format!("subcomponent_archive_layer_{dir_idx:02}");
+        for file_idx in 0..40u32 {
+            let file_name = format!(
+                "asset_resource_document_entry_{:02}_{:03}.json",
+                dir_idx, file_idx
+            );
+            let hash_seed = format!("payload-{dir_idx}-{file_idx}-repeat-{}", file_idx % 5);
+            let hash = HashAlgorithm::Sha256.get_hash_from_bytes(hash_seed.as_bytes());
+            let size = u64::from((dir_idx * 100 + file_idx) * 64 + 128);
+            let modified = ts + chrono::Duration::seconds(i64::from(file_idx % 12) * 60);
+            tree.insert_path(
+                &[module.as_str(), sub.as_str(), file_name.as_str()],
+                FileEntry::from_hash(hash, Some(size), Some(modified)),
+            );
+            count += 1;
+            total_size += size;
+        }
+    }
+
+    (tree, count, total_size)
+}
+
+fn inspect_zip_entry_method(path: &Path, entry_name: &str) -> zip::CompressionMethod {
+    let file = File::open(path).expect("open zip for method inspection");
+    let mut archive = zip::ZipArchive::new(file).expect("parse zip");
+    let entry = archive.by_name(entry_name).expect("find entry");
+    entry.compression()
+}
+
+#[test]
+fn compression_level_presets_parsing_validation_and_serde() {
+    // 1. Constants, constructors, canonical equality, and natural ordering
+    assert_eq!(CompressionLevel::NONE.level(), MIN_COMPRESSION_LEVEL);
+    assert_eq!(CompressionLevel::FAST.level(), FAST_COMPRESSION_LEVEL);
+    assert_eq!(CompressionLevel::BALANCED.level(), DEFAULT_COMPRESSION_LEVEL);
+    assert_eq!(CompressionLevel::BEST.level(), MAX_COMPRESSION_LEVEL);
+    assert_eq!(CompressionLevel::default(), CompressionLevel::BALANCED);
+
+    assert_eq!(CompressionLevel::none(), CompressionLevel::NONE);
+    assert_eq!(CompressionLevel::fast(), CompressionLevel::FAST);
+    assert_eq!(CompressionLevel::balanced(), CompressionLevel::BALANCED);
+    assert_eq!(CompressionLevel::best(), CompressionLevel::BEST);
+
+    assert!(CompressionLevel::NONE < CompressionLevel::FAST);
+    assert!(CompressionLevel::FAST < CompressionLevel::BALANCED);
+    assert!(CompressionLevel::BALANCED < CompressionLevel::BEST);
+
+    assert!(CompressionLevel::NONE.is_uncompressed());
+    assert!(!CompressionLevel::NONE.is_compressed());
+    assert_eq!(
+        CompressionLevel::NONE.method(),
+        ArchiveCompressionMethod::Stored
+    );
+
+    for raw in MIN_COMPRESSION_LEVEL..=MAX_COMPRESSION_LEVEL {
+        let lvl = CompressionLevel::new(raw).expect("0..=9 must be valid");
+        assert_eq!(lvl.level(), raw);
+        assert_eq!(u8::from(lvl), raw);
+        assert_eq!(CompressionLevel::try_from(raw).expect("try_from"), lvl);
+
+        // Display <-> FromStr must roundtrip cleanly for every level 0..=9
+        let displayed = lvl.to_string();
+        let reparsed: CompressionLevel = displayed.parse().expect("reparse Display output");
+        assert_eq!(reparsed, lvl);
+
+        if raw == 0 {
+            assert_eq!(lvl.method(), ArchiveCompressionMethod::Stored);
+        } else {
+            assert_eq!(lvl.method(), ArchiveCompressionMethod::Deflate);
+            assert!(lvl.is_compressed());
+        }
+    }
+
+    assert_eq!(CompressionLevel::NONE.preset(), Some(CompressionPreset::None));
+    assert_eq!(CompressionLevel::FAST.preset(), Some(CompressionPreset::Fast));
+    assert_eq!(
+        CompressionLevel::BALANCED.preset(),
+        Some(CompressionPreset::Balanced)
+    );
+    assert_eq!(CompressionLevel::BEST.preset(), Some(CompressionPreset::Best));
+    assert_eq!(
+        CompressionLevel::new(4).expect("level 4").preset(),
+        None
+    );
+    assert_eq!(CompressionLevel::presets(), &CompressionPreset::ALL);
+
+    // Out-of-range levels rejected
+    for bad in [10u8, 11, 99, u8::MAX] {
+        let err = CompressionLevel::new(bad).expect_err("level > 9 must fail");
+        assert!(matches!(err, BulkHashError::InvalidCompressionLevel(_)));
+    }
+
+    // 2. FromStr aliases (case-insensitive, trimmed) and invalid inputs
+    let valid_cases = [
+        ("none", CompressionLevel::NONE),
+        ("  STORED ", CompressionLevel::NONE),
+        ("uncompressed", CompressionLevel::NONE),
+        ("0", CompressionLevel::NONE),
+        ("fast", CompressionLevel::FAST),
+        ("Fastest", CompressionLevel::FAST),
+        ("1", CompressionLevel::FAST),
+        ("3", CompressionLevel::new(3).expect("3")),
+        ("balanced", CompressionLevel::BALANCED),
+        ("Default", CompressionLevel::BALANCED),
+        ("normal", CompressionLevel::BALANCED),
+        ("6", CompressionLevel::BALANCED),
+        ("best", CompressionLevel::BEST),
+        ("MAX", CompressionLevel::BEST),
+        ("smallest", CompressionLevel::BEST),
+        ("9", CompressionLevel::BEST),
+    ];
+    for (input, expected) in valid_cases {
+        let parsed: CompressionLevel = input.parse().expect("valid compression string");
+        assert_eq!(parsed, expected, "input '{input}'");
+    }
+
+    for invalid in ["", "   ", "-1", "10", "99", "ultra", "zstd"] {
+        let err = invalid
+            .parse::<CompressionLevel>()
+            .expect_err("invalid string must fail");
+        assert!(
+            matches!(err, BulkHashError::InvalidCompressionLevel(_)),
+            "unexpected error for '{invalid}': {err:?}"
+        );
+    }
+
+    // 3. Serde roundtrip (numeric serialization + numeric & preset string deserialization)
+    assert_eq!(
+        serde_json::to_value(CompressionLevel::BEST).expect("serialize"),
+        serde_json::json!(9)
+    );
+    assert_eq!(
+        serde_json::from_str::<CompressionLevel>("0").expect("de 0"),
+        CompressionLevel::NONE
+    );
+    assert_eq!(
+        serde_json::from_str::<CompressionLevel>("4").expect("de 4"),
+        CompressionLevel::new(4).expect("4")
+    );
+    assert_eq!(
+        serde_json::from_str::<CompressionLevel>(r#""fast""#).expect("de fast"),
+        CompressionLevel::FAST
+    );
+    assert_eq!(
+        serde_json::from_str::<CompressionLevel>(r#""best""#).expect("de best"),
+        CompressionLevel::BEST
+    );
+    assert!(serde_json::from_str::<CompressionLevel>("10").is_err());
+    assert!(serde_json::from_str::<CompressionLevel>("-1").is_err());
+    assert!(serde_json::from_str::<CompressionLevel>(r#""bogus""#).is_err());
+
+    // 4. CompressionMetadata validation & serde invariants
+    let stored_meta = CompressionMetadata::from_level(CompressionLevel::NONE);
+    assert_eq!(stored_meta.method, ArchiveCompressionMethod::Stored);
+    assert_eq!(stored_meta.level, CompressionLevel::NONE);
+    assert_eq!(
+        serde_json::to_value(stored_meta).expect("ser stored meta"),
+        serde_json::json!({ "method": "stored", "level": 0 })
+    );
+
+    let best_meta = CompressionMetadata::from_level(CompressionLevel::BEST);
+    assert_eq!(
+        serde_json::to_value(best_meta).expect("ser best meta"),
+        serde_json::json!({ "method": "deflate", "level": 9 })
+    );
+    assert_eq!(
+        serde_json::from_value::<CompressionMetadata>(serde_json::json!({
+            "method": "deflate",
+            "level": "best"
+        }))
+        .expect("de best meta via preset alias"),
+        best_meta
+    );
+
+    // Mismatched method/level MUST be rejected both programmatically and during deserialization
+    assert!(matches!(
+        CompressionMetadata::new(ArchiveCompressionMethod::Stored, CompressionLevel::BALANCED),
+        Err(BulkHashError::InvalidCompressionLevel(_))
+    ));
+    assert!(matches!(
+        CompressionMetadata::new(ArchiveCompressionMethod::Deflate, CompressionLevel::NONE),
+        Err(BulkHashError::InvalidCompressionLevel(_))
+    ));
+    assert!(
+        serde_json::from_value::<CompressionMetadata>(serde_json::json!({
+            "method": "stored",
+            "level": 6
+        }))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<CompressionMetadata>(serde_json::json!({
+            "method": "deflate",
+            "level": 0
+        }))
+        .is_err()
+    );
+
+    // 5. GUI/IPC serialization of BulkHashError::InvalidCompressionLevel
+    let err = BulkHashError::InvalidCompressionLevel(String::from("level 42 out of range"));
+    let err_json = serde_json::to_value(&err).expect("serialize error");
+    assert_eq!(err_json["kind"], "InvalidCompressionLevel");
+    assert!(
+        err_json["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("level 42 out of range"))
+    );
+}
+
+#[test]
+fn snapshot_compression_levels_zip_methods_file_sizes_and_inspection() {
+    let ts = DateTime::from_timestamp(1_765_500_000, 0).expect("valid ts");
+    let (tree, count, total_size) = build_compressible_test_tree(ts);
+    let expected_tree_hash =
+        HashAlgorithm::Sha256.get_hash_from_bytes(&serde_json::to_vec(&tree).expect("tree json"));
+
+    let meta = MetaData::new(count, Duration::from_millis(250), ts)
+        .with_algorithm(HashAlgorithm::Blake3)
+        .with_total_size(total_size);
+
+    let level_3 = CompressionLevel::new(3).expect("level 3");
+    let cases = [
+        ("none", CompressionLevel::NONE),
+        ("fast", CompressionLevel::FAST),
+        ("level3", level_3),
+        ("balanced", CompressionLevel::BALANCED),
+        ("best", CompressionLevel::BEST),
+    ];
+
+    let mut sizes = std::collections::HashMap::new();
+    let mut dirs = Vec::new();
+
+    for (label, level) in cases {
+        let dir = TempDir::new(&format!("comp_{label}"));
+        let saved_path = FileManager::save_file_with_compression(dir.path(), &tree, &meta, level)
+            .expect("save with compression");
+
+        // Verify ZIP entry methods match Stored (0) vs Deflated (1..=9)
+        let expected_zip_method = level.method().to_zip_method();
+        for entry_name in ["meta.json", "tree.json", "hash.sha256"] {
+            assert_eq!(
+                inspect_zip_entry_method(&saved_path, entry_name),
+                expected_zip_method,
+                "ZIP entry '{entry_name}' mismatch for {label}"
+            );
+        }
+
+        // Verify inspect_version reports declared compression without reading tree.json
+        let version_info = FileManager::inspect_version(&saved_path).expect("inspect version");
+        assert!(!version_info.is_encrypted());
+        assert_eq!(version_info.compression(), Some(level.to_metadata()));
+
+        // Verify inspect_compression reports accurate ZIP byte stats & declared metadata
+        let stats = FileManager::inspect_compression(&saved_path).expect("inspect compression");
+        let file_size = fs::metadata(&saved_path).expect("stat file").len();
+        assert_eq!(stats.declared, Some(level.to_metadata()));
+        assert_eq!(stats.tree_zip_method, Some(level.method()));
+        assert_eq!(stats.archive_file_size, file_size);
+        assert!(!stats.encrypted);
+        assert!(stats.total_uncompressed_bytes > 50_000);
+        assert!(stats.tree_compressed_bytes.is_some());
+        assert!(stats.tree_uncompressed_bytes.is_some());
+
+        if level.is_uncompressed() {
+            assert_eq!(stats.total_compressed_bytes, stats.total_uncompressed_bytes);
+            assert_eq!(stats.tree_compressed_bytes, stats.tree_uncompressed_bytes);
+            assert!((stats.compression_ratio() - 1.0).abs() < f64::EPSILON);
+            assert!(stats.space_savings_percent().abs() < f64::EPSILON);
+        } else {
+            assert!(stats.total_compressed_bytes < stats.total_uncompressed_bytes);
+            assert!(stats.compression_ratio() < 0.5);
+            assert!(stats.space_savings_percent() > 50.0);
+        }
+
+        // Verify full roundtrip integrity and metadata preservation
+        let loaded = FileManager::open_file(&saved_path).expect("open compressed snapshot");
+        assert_eq!(loaded.get_tree(), &tree);
+        assert_eq!(loaded.get_hash(), expected_tree_hash);
+        assert_eq!(loaded.get_compression(), Some(level.to_metadata()));
+        assert_eq!(loaded.get_compression_level(), Some(level));
+        assert_eq!(loaded.get_meta().get_compression(), Some(level.to_metadata()));
+
+        sizes.insert(label, (file_size, stats));
+        dirs.push(dir);
+    }
+
+    // Verify default save_file uses Balanced (level 6)
+    let default_dir = TempDir::new("comp_default");
+    let default_path = FileManager::save_file(default_dir.path(), &tree, &meta).expect("save_file");
+    let default_loaded = FileManager::open_file(&default_path).expect("open default");
+    assert_eq!(
+        default_loaded.get_compression_level(),
+        Some(CompressionLevel::BALANCED)
+    );
+    assert_eq!(
+        fs::metadata(&default_path).expect("stat default").len(),
+        sizes["balanced"].0
+    );
+
+    // Verify measurable speed-vs-size compression curve on realistic tree JSON:
+    // None (uncompressed) >> Fast > Balanced & Best, and distinct compressed sizes prove each
+    // DEFLATE level (1, 6, 9) is genuinely wired into the ZIP writer rather than ignored.
+    let none_size = sizes["none"].0;
+    let fast_size = sizes["fast"].0;
+    let balanced_size = sizes["balanced"].0;
+    let best_size = sizes["best"].0;
+
+    assert!(
+        none_size > fast_size * 2,
+        "expected DEFLATE Fast ({fast_size}B) to shrink JSON dramatically vs Stored ({none_size}B)"
+    );
+    assert!(
+        fast_size > balanced_size && fast_size > best_size,
+        "expected Balanced ({balanced_size}B) and Best ({best_size}B) to compress smaller than Fast ({fast_size}B)"
+    );
+    assert_ne!(
+        sizes["balanced"].1.tree_compressed_bytes,
+        sizes["best"].1.tree_compressed_bytes,
+        "expected DEFLATE level 6 and level 9 to produce distinct compressed streams"
+    );
+    assert!(
+        sizes["best"].1.space_savings_percent() > sizes["fast"].1.space_savings_percent(),
+        "expected Best to report higher space savings than Fast"
+    );
+    assert!(
+        sizes["balanced"].1.space_savings_percent() > sizes["fast"].1.space_savings_percent(),
+        "expected Balanced to report higher space savings than Fast"
+    );
+}
+
+#[test]
+fn encrypted_snapshot_compression_levels_save_options_and_aad_binding() {
+    let ts = DateTime::from_timestamp(1_765_510_000, 0).expect("valid ts");
+    let (tree, count, total_size) = build_compressible_test_tree(ts);
+    let raw_tree_json = serde_json::to_vec(&tree).expect("serialize tree");
+    let expected_tree_hash = HashAlgorithm::Sha256.get_hash_from_bytes(&raw_tree_json);
+
+    let meta = MetaData::new(count, Duration::from_millis(120), ts)
+        .with_algorithm(HashAlgorithm::Sha256)
+        .with_total_size(total_size);
+    let password = "compression-aead-passphrase";
+
+    let mut tree_enc_sizes = std::collections::HashMap::new();
+    let mut saved_paths = std::collections::HashMap::new();
+    let mut dirs = Vec::new();
+
+    for (label, level) in [
+        ("none", CompressionLevel::NONE),
+        ("fast", CompressionLevel::FAST),
+        ("balanced", CompressionLevel::BALANCED),
+        ("best", CompressionLevel::BEST),
+    ] {
+        let dir = TempDir::new(&format!("enc_comp_{label}"));
+        let save_opts = SaveOptions::new()
+            .with_compression(level)
+            .with_encryption(fast_encryption_options(password));
+        assert_eq!(save_opts.compression(), level);
+        assert!(save_opts.encryption().is_some());
+
+        let saved_path =
+            FileManager::save_file_with_options(dir.path(), &tree, &meta, &save_opts)
+                .expect("save encrypted with compression");
+
+        // `tree.enc` MUST ALWAYS be Stored in ZIP regardless of level; `meta.json` & `hash.sha256`
+        // use the chosen outer ZIP compression method.
+        assert_eq!(
+            inspect_zip_entry_method(&saved_path, ENCRYPTED_TREE_ENTRY),
+            zip::CompressionMethod::Stored
+        );
+        assert_eq!(
+            inspect_zip_entry_method(&saved_path, "meta.json"),
+            level.method().to_zip_method()
+        );
+        assert_eq!(
+            inspect_zip_entry_method(&saved_path, "hash.sha256"),
+            level.method().to_zip_method()
+        );
+
+        // Passwordless inspection reports declared compression & encrypted status
+        let version_info = FileManager::inspect_version(&saved_path).expect("inspect enc version");
+        assert!(version_info.is_encrypted());
+        assert_eq!(version_info.compression(), Some(level.to_metadata()));
+
+        let enc_meta = version_info.encryption().expect("enc metadata");
+        if level.is_uncompressed() {
+            assert_eq!(enc_meta.payload_compression, PayloadCompression::None);
+        } else {
+            assert_eq!(enc_meta.payload_compression, PayloadCompression::Deflate);
+        }
+
+        let comp_stats =
+            FileManager::inspect_compression(&saved_path).expect("inspect enc compression");
+        assert!(comp_stats.encrypted);
+        assert_eq!(comp_stats.declared, Some(level.to_metadata()));
+        assert_eq!(
+            comp_stats.tree_zip_method,
+            Some(ArchiveCompressionMethod::Stored)
+        );
+        let ct_len = comp_stats.tree_compressed_bytes.expect("tree.enc size");
+        assert_eq!(comp_stats.tree_uncompressed_bytes, Some(ct_len));
+
+        if level.is_uncompressed() {
+            // Raw plaintext + 16-byte AES-GCM authentication tag
+            assert_eq!(ct_len, (raw_tree_json.len() + 16) as u64);
+        }
+
+        // Full decryption roundtrip verifies exact tree & hash
+        let loaded = FileManager::open_file_with_password(&saved_path, password)
+            .expect("decrypt compressed snapshot");
+        assert_eq!(loaded.get_tree(), &tree);
+        assert_eq!(loaded.get_hash(), expected_tree_hash);
+        assert_eq!(loaded.get_compression_level(), Some(level));
+
+        tree_enc_sizes.insert(label, ct_len);
+        saved_paths.insert(label, saved_path);
+        dirs.push(dir);
+    }
+
+    // Inner pre-encryption DEFLATE level measurably controls ciphertext size, and distinct
+    // ciphertext lengths between Fast (1), Balanced (6), and Best (9) prove each level is applied.
+    assert!(tree_enc_sizes["none"] > tree_enc_sizes["fast"] * 2);
+    assert!(tree_enc_sizes["fast"] > tree_enc_sizes["balanced"]);
+    assert!(tree_enc_sizes["fast"] > tree_enc_sizes["best"]);
+    assert_ne!(tree_enc_sizes["balanced"], tree_enc_sizes["best"]);
+
+    // Explicit `PayloadCompression::None` opt-out MUST be respected even with CompressionLevel::BEST
+    let optout_dir = TempDir::new("enc_comp_optout");
+    let optout_enc =
+        fast_encryption_options(password).with_payload_compression(PayloadCompression::None);
+    let optout_opts = SaveOptions::new()
+        .with_compression(CompressionLevel::BEST)
+        .with_encryption(optout_enc);
+    let optout_path =
+        FileManager::save_file_with_options(optout_dir.path(), &tree, &meta, &optout_opts)
+            .expect("save encrypted with PayloadCompression::None + BEST outer");
+    assert_eq!(
+        inspect_zip_entry_method(&optout_path, "meta.json"),
+        zip::CompressionMethod::Deflated
+    );
+    assert_eq!(
+        inspect_zip_entry_method(&optout_path, ENCRYPTED_TREE_ENTRY),
+        zip::CompressionMethod::Stored
+    );
+    let optout_info = FileManager::inspect_version(&optout_path).expect("inspect optout");
+    assert_eq!(
+        optout_info.encryption().expect("enc").payload_compression,
+        PayloadCompression::None
+    );
+    assert_eq!(
+        optout_info.compression(),
+        Some(CompressionLevel::BEST.to_metadata())
+    );
+    let optout_ct = read_zip_entry_bytes(&optout_path, ENCRYPTED_TREE_ENTRY);
+    assert_eq!(optout_ct.len(), raw_tree_json.len() + 16);
+    assert_eq!(
+        FileManager::open_file_with_password(&optout_path, password)
+            .expect("open optout")
+            .get_tree(),
+        &tree
+    );
+
+    // Tampering with `"compression"` inside `meta.json` MUST break AES-256-GCM AAD verification
+    let best_path = &saved_paths["best"];
+    let orig_meta = read_zip_entry_bytes(best_path, "meta.json");
+    let orig_ct = read_zip_entry_bytes(best_path, ENCRYPTED_TREE_ENTRY);
+    let orig_hash = read_zip_entry_bytes(best_path, "hash.sha256");
+
+    let mut tampered_meta_val: serde_json::Value =
+        serde_json::from_slice(&orig_meta).expect("parse best meta");
+    tampered_meta_val["compression"]["level"] = serde_json::json!(1);
+    let tampered_meta_bytes = serde_json::to_vec(&tampered_meta_val).expect("ser tampered meta");
+
+    let tamper_dir = TempDir::new("enc_comp_aad_tamper");
+    let tampered_path = tamper_dir.path().join("tampered_compression_aad.hashed");
+    write_raw_hashed_archive(
+        &tampered_path,
+        &[
+            ("meta.json", &tampered_meta_bytes),
+            (ENCRYPTED_TREE_ENTRY, &orig_ct),
+            ("hash.sha256", &orig_hash),
+        ],
+    );
+    assert!(matches!(
+        FileManager::open_file_with_password(&tampered_path, password),
+        Err(BulkHashError::DecryptionFailed(_))
+    ));
+}
+
+#[test]
+fn recompress_file_workflows_and_compression_preservation_across_lifecycle() {
+    let dir = TempDir::new("recompress_workflows");
+    let ts = DateTime::from_timestamp(1_765_520_000, 0).expect("valid ts");
+    let (tree, count, total_size) = build_compressible_test_tree(ts);
+    let expected_tree_hash =
+        HashAlgorithm::Sha256.get_hash_from_bytes(&serde_json::to_vec(&tree).expect("tree json"));
+    let meta = MetaData::new(count, Duration::from_millis(80), ts)
+        .with_algorithm(HashAlgorithm::Blake3)
+        .with_total_size(total_size);
+
+    // 1. Unencrypted out-of-place & in-place recompression: NONE -> BEST -> FAST -> NONE
+    let plain_dir = TempDir::new("recompress_plain_inplace");
+    let plain_path =
+        FileManager::save_file_with_compression(plain_dir.path(), &tree, &meta, CompressionLevel::NONE)
+            .expect("save uncompressed");
+    let size_none = fs::metadata(&plain_path).expect("stat none").len();
+    assert_eq!(
+        inspect_zip_entry_method(&plain_path, "tree.json"),
+        zip::CompressionMethod::Stored
+    );
+
+    let best_copy = dir.path().join("recompressed_best.hashed");
+    let report = FileManager::recompress_file(&plain_path, &best_copy, CompressionLevel::BEST)
+        .expect("recompress out-of-place to best");
+    assert!(!report.was_migrated());
+    let size_best = fs::metadata(&best_copy).expect("stat best").len();
+    assert!(size_best * 2 < size_none);
+    assert_eq!(
+        inspect_zip_entry_method(&best_copy, "tree.json"),
+        zip::CompressionMethod::Deflated
+    );
+    assert_eq!(
+        FileManager::open_file(&best_copy)
+            .expect("open best copy")
+            .get_compression_level(),
+        Some(CompressionLevel::BEST)
+    );
+
+    // In-place recompression on plain_path: NONE -> BEST -> NONE (zero temp leftovers)
+    FileManager::recompress_file(&plain_path, &plain_path, CompressionLevel::BEST)
+        .expect("in-place recompress to best");
+    assert_eq!(
+        fs::metadata(&plain_path).expect("stat inplace best").len(),
+        size_best
+    );
+    assert_eq!(
+        fs::read_dir(plain_dir.path()).expect("read dir").count(),
+        1
+    );
+
+    FileManager::recompress_file(&plain_path, &plain_path, CompressionLevel::NONE)
+        .expect("in-place recompress back to none");
+    assert_eq!(
+        inspect_zip_entry_method(&plain_path, "tree.json"),
+        zip::CompressionMethod::Stored
+    );
+    assert_eq!(
+        FileManager::open_file(&plain_path)
+            .expect("reopen plain")
+            .get_hash(),
+        expected_tree_hash
+    );
+
+    // 2. Recompressing a legacy v1 snapshot upgrades v1 -> v3 and applies target compression
+    let v1_path = dir.path().join("legacy_v1_recompress.hashed");
+    let v1_tree = r#"{"name":"/legacy","files":{"notes.txt":{"Ok":"abcd1234"}},"sub_directories":{}}"#;
+    let v1_hash = HashAlgorithm::Sha256.get_hash_from_bytes(v1_tree.as_bytes());
+    let v1_meta = format!(
+        r#"{{"version":1,"files_hashed":1,"hash_time":{{"secs":0,"nanos":500}},"date_utc":"{}","local_time":"2026-01-01T00:00:00Z","os":"linux"}}"#,
+        ts.to_rfc3339()
+    );
+    write_raw_hashed_archive(
+        &v1_path,
+        &[
+            ("meta.json", v1_meta.as_bytes()),
+            ("tree.json", v1_tree.as_bytes()),
+            ("hash.sha256", v1_hash.as_bytes()),
+        ],
+    );
+    let v1_recomp_report =
+        FileManager::recompress_file(&v1_path, &v1_path, CompressionLevel::BEST)
+            .expect("recompress legacy v1 in place");
+    assert!(v1_recomp_report.was_migrated());
+    assert_eq!(v1_recomp_report.original_version(), FORMAT_VERSION_V1);
+    assert_eq!(v1_recomp_report.target_version(), FORMAT_VERSION_V3);
+    let v1_reopened = FileManager::open_file(&v1_path).expect("open upgraded v1");
+    assert_eq!(v1_reopened.get_meta().get_version(), FORMAT_VERSION_V3);
+    assert_eq!(v1_reopened.get_compression_level(), Some(CompressionLevel::BEST));
+
+    // 3. Encrypted recompression: requires password, rejects wrong password without touching file,
+    // rotates salt & nonce, and toggles inner payload compression between NONE and BEST.
+    let password = "recompress-secret-pw";
+    let enc_dir = TempDir::new("recompress_enc");
+    let enc_path = FileManager::save_file_with_options(
+        enc_dir.path(),
+        &tree,
+        &meta,
+        &SaveOptions::new()
+            .with_compression(CompressionLevel::NONE)
+            .with_encryption(fast_encryption_options(password)),
+    )
+    .expect("save encrypted uncompressed");
+    let enc_size_none = fs::metadata(&enc_path).expect("stat enc none").len();
+    let enc_meta_before = FileManager::inspect_version(&enc_path)
+        .expect("inspect enc before")
+        .encryption()
+        .expect("enc meta before")
+        .clone();
+    assert_eq!(enc_meta_before.payload_compression, PayloadCompression::None);
+
+    // Without password -> PasswordRequired
+    assert!(matches!(
+        FileManager::recompress_file(&enc_path, &enc_path, CompressionLevel::BEST),
+        Err(BulkHashError::PasswordRequired(_))
+    ));
+
+    // Wrong password -> DecryptionFailed and file left completely untouched
+    let orig_enc_bytes = fs::read(&enc_path).expect("read orig enc bytes");
+    assert!(matches!(
+        FileManager::recompress_file_with_password(
+            &enc_path,
+            &enc_path,
+            CompressionLevel::BEST,
+            Some("wrong-password"),
+        ),
+        Err(BulkHashError::DecryptionFailed(_))
+    ));
+    assert_eq!(fs::read(&enc_path).expect("still intact"), orig_enc_bytes);
+
+    // Valid in-place encrypted recompression: NONE -> BEST
+    FileManager::recompress_file_with_password(
+        &enc_path,
+        &enc_path,
+        CompressionLevel::BEST,
+        Some(password),
+    )
+    .expect("recompress encrypted NONE -> BEST");
+    let enc_size_best = fs::metadata(&enc_path).expect("stat enc best").len();
+    assert!(enc_size_best * 2 < enc_size_none);
+    let enc_info_after = FileManager::inspect_version(&enc_path).expect("inspect enc after");
+    let enc_meta_after = enc_info_after.encryption().expect("enc meta after");
+    assert_ne!(enc_meta_after.salt, enc_meta_before.salt);
+    assert_ne!(enc_meta_after.nonce, enc_meta_before.nonce);
+    assert_eq!(enc_meta_after.kdf_params, enc_meta_before.kdf_params);
+    assert_eq!(enc_meta_after.payload_compression, PayloadCompression::Deflate);
+    assert_eq!(
+        enc_info_after.compression(),
+        Some(CompressionLevel::BEST.to_metadata())
+    );
+    assert_eq!(
+        FileManager::open_file_with_password(&enc_path, password)
+            .expect("decrypt recompressed")
+            .get_hash(),
+        expected_tree_hash
+    );
+
+    // 4. Compression level is preserved across migrate_file_with_password, reencrypt_file,
+    // decrypt_file, and encrypt_file.
+    let mig_copy = dir.path().join("mig_preserves_best.hashed");
+    FileManager::migrate_file_with_password(&enc_path, &mig_copy, Some(password))
+        .expect("migrate preserves best");
+    assert_eq!(
+        FileManager::inspect_version(&mig_copy)
+            .expect("inspect mig copy")
+            .compression(),
+        Some(CompressionLevel::BEST.to_metadata())
+    );
+
+    let rotated_path = dir.path().join("reencrypted_preserves_best.hashed");
+    let new_enc_opts = fast_encryption_options("rotated-new-pw");
+    FileManager::reencrypt_file(&enc_path, &rotated_path, password, &new_enc_opts)
+        .expect("reencrypt preserves best");
+    assert_eq!(
+        FileManager::inspect_version(&rotated_path)
+            .expect("inspect rotated")
+            .compression(),
+        Some(CompressionLevel::BEST.to_metadata())
+    );
+
+    let decrypted_path = dir.path().join("decrypted_preserves_best.hashed");
+    FileManager::decrypt_file(&rotated_path, &decrypted_path, "rotated-new-pw")
+        .expect("decrypt preserves best");
+    assert_eq!(
+        FileManager::inspect_version(&decrypted_path)
+            .expect("inspect decrypted")
+            .compression(),
+        Some(CompressionLevel::BEST.to_metadata())
+    );
+
+    let reencrypted_plain = dir.path().join("encrypted_preserves_best.hashed");
+    FileManager::encrypt_file(&decrypted_path, &reencrypted_plain, &new_enc_opts)
+        .expect("encrypt preserves best");
+    assert_eq!(
+        FileManager::inspect_version(&reencrypted_plain)
+            .expect("inspect reencrypted plain")
+            .compression(),
+        Some(CompressionLevel::BEST.to_metadata())
+    );
+}
+
+#[test]
+fn compression_backwards_compatibility_corruption_and_future_version_resilience() {
+    let dir = TempDir::new("comp_compat_and_errors");
+    let ts = DateTime::from_timestamp(1_765_530_000, 0).expect("valid ts");
+
+    let tree_json = serde_json::json!({
+        "name": "/compat",
+        "files": {
+            "readme.md": { "hash": "1234abcd", "size": 128, "modified_utc": ts.to_rfc3339() }
+        },
+        "sub_directories": {}
+    });
+    let tree_bytes = serde_json::to_vec(&tree_json).expect("ser tree");
+    let tree_hash = HashAlgorithm::Sha256.get_hash_from_bytes(&tree_bytes);
+
+    // 1. Pre-compression v3 archive (omitting `"compression"` in meta.json) opens cleanly
+    let legacy_v3 = dir.path().join("pre_compression_v3.hashed");
+    let legacy_v3_meta = serde_json::json!({
+        "version": FORMAT_VERSION_V3,
+        "files_hashed": 1,
+        "hash_time": { "secs": 0, "nanos": 100 },
+        "date_utc": ts.to_rfc3339(),
+        "local_time": "2026-01-01T00:00:00Z",
+        "os": "linux"
+    });
+    write_raw_hashed_archive(
+        &legacy_v3,
+        &[
+            (
+                "meta.json",
+                &serde_json::to_vec(&legacy_v3_meta).expect("meta bytes"),
+            ),
+            ("tree.json", &tree_bytes),
+            ("hash.sha256", tree_hash.as_bytes()),
+        ],
+    );
+    let legacy_info = FileManager::inspect_version(&legacy_v3).expect("inspect legacy v3");
+    assert_eq!(legacy_info.compression(), None);
+    let legacy_stats = FileManager::inspect_compression(&legacy_v3).expect("inspect comp stats");
+    assert_eq!(legacy_stats.declared, None);
+    assert_eq!(
+        legacy_stats.tree_zip_method,
+        Some(ArchiveCompressionMethod::Deflate)
+    );
+    let legacy_loaded = FileManager::open_file(&legacy_v3).expect("open legacy v3");
+    assert_eq!(legacy_loaded.get_compression(), None);
+    assert_eq!(legacy_loaded.get_compression_level(), None);
+
+    // 2. Corrupted `"compression"` entries in supported v3 archives return InvalidCompressionLevel
+    let bad_compression_payloads = [
+        ("out_of_range", serde_json::json!({ "method": "deflate", "level": 99 })),
+        ("stored_nonzero", serde_json::json!({ "method": "stored", "level": 6 })),
+        ("deflate_zero", serde_json::json!({ "method": "deflate", "level": 0 })),
+        ("unknown_method", serde_json::json!({ "method": "zstd", "level": 3 })),
+    ];
+
+    for (name, bad_comp) in bad_compression_payloads {
+        let bad_path = dir.path().join(format!("bad_comp_{name}.hashed"));
+        let bad_meta = serde_json::json!({
+            "version": FORMAT_VERSION_V3,
+            "files_hashed": 1,
+            "hash_time": { "secs": 0, "nanos": 100 },
+            "date_utc": ts.to_rfc3339(),
+            "local_time": "2026-01-01T00:00:00Z",
+            "os": "linux",
+            "compression": bad_comp
+        });
+        write_raw_hashed_archive(
+            &bad_path,
+            &[
+                ("meta.json", &serde_json::to_vec(&bad_meta).expect("bad meta")),
+                ("tree.json", &tree_bytes),
+                ("hash.sha256", tree_hash.as_bytes()),
+            ],
+        );
+
+        assert!(
+            matches!(
+                FileManager::inspect_version(&bad_path),
+                Err(BulkHashError::InvalidCompressionLevel(_))
+            ),
+            "inspect_version should reject {name}"
+        );
+        assert!(
+            matches!(
+                FileManager::inspect_compression(&bad_path),
+                Err(BulkHashError::InvalidCompressionLevel(_))
+            ),
+            "inspect_compression should reject {name}"
+        );
+        assert!(
+            matches!(
+                FileManager::open_file(&bad_path),
+                Err(BulkHashError::InvalidCompressionLevel(_))
+            ),
+            "open_file should reject {name}"
+        );
+    }
+
+    // 3. Unsupported future v99 archive with future compression method (`zstd`) MUST report
+    // `UnsupportedVersion(99)` cleanly on open_file and succeed on inspect_version/inspect_compression
+    let future_path = dir.path().join("future_v99_zstd.hashed");
+    let future_meta = serde_json::json!({
+        "version": 99,
+        "compression": { "method": "zstd", "level": 19 }
+    });
+    write_raw_hashed_archive(
+        &future_path,
+        &[(
+            "meta.json",
+            &serde_json::to_vec(&future_meta).expect("future meta"),
+        )],
+    );
+    assert!(matches!(
+        FileManager::open_file(&future_path),
+        Err(BulkHashError::UnsupportedVersion(99))
+    ));
+    let future_info = FileManager::inspect_version(&future_path).expect("inspect future v99");
+    assert_eq!(future_info.version, 99);
+    assert!(!future_info.is_supported());
+    assert_eq!(future_info.compression(), None);
+    let future_comp =
+        FileManager::inspect_compression(&future_path).expect("inspect_compression future v99");
+    assert_eq!(future_comp.declared, None);
 }

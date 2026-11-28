@@ -1,5 +1,8 @@
 use crate::core::io::{
-    directory_node::DirectoryNode, encryption::EncryptionMetadata, meta_data::MetaData,
+    compression::{CompressionLevel, CompressionMetadata},
+    directory_node::DirectoryNode,
+    encryption::EncryptionMetadata,
+    meta_data::MetaData,
     migration::MigrationReport,
 };
 
@@ -71,5 +74,15 @@ impl BulkHashFileStruct {
     #[must_use]
     pub const fn get_encryption(&self) -> Option<&EncryptionMetadata> {
         self.meta.get_encryption()
+    }
+
+    #[must_use]
+    pub const fn get_compression(&self) -> Option<CompressionMetadata> {
+        self.meta.get_compression()
+    }
+
+    #[must_use]
+    pub const fn get_compression_level(&self) -> Option<CompressionLevel> {
+        self.meta.get_compression_level()
     }
 }

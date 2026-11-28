@@ -1,6 +1,7 @@
 use crate::core::hash_manager::HashAlgorithm;
 use crate::core::hidden_filter::HiddenFileFilter;
 use crate::core::ignore_list::IgnoreList;
+use crate::core::io::compression::{CompressionLevel, CompressionMetadata};
 use crate::core::io::encryption::EncryptionMetadata;
 use crate::core::io::migration::CURRENT_FORMAT_VERSION;
 use chrono::{DateTime, Local, SecondsFormat, Utc};
@@ -26,6 +27,8 @@ pub struct MetaData {
     migrated_from: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     encryption: Option<EncryptionMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compression: Option<CompressionMetadata>,
 }
 
 impl MetaData {
@@ -45,6 +48,7 @@ impl MetaData {
             total_size: None,
             migrated_from: None,
             encryption: None,
+            compression: None,
         }
     }
 
@@ -84,6 +88,14 @@ impl MetaData {
         self
     }
 
+    pub(crate) const fn with_compression_metadata(
+        mut self,
+        compression: Option<CompressionMetadata>,
+    ) -> Self {
+        self.compression = compression;
+        self
+    }
+
     pub fn get_algorithm(&self) -> Option<HashAlgorithm> {
         self.algorithm
     }
@@ -115,6 +127,19 @@ impl MetaData {
     #[must_use]
     pub const fn get_encryption(&self) -> Option<&EncryptionMetadata> {
         self.encryption.as_ref()
+    }
+
+    #[must_use]
+    pub const fn get_compression(&self) -> Option<CompressionMetadata> {
+        self.compression
+    }
+
+    #[must_use]
+    pub const fn get_compression_level(&self) -> Option<CompressionLevel> {
+        match self.compression {
+            Some(meta) => Some(meta.level),
+            None => None,
+        }
     }
 
     pub fn get_local_time(&self) -> &str {

@@ -14,10 +14,15 @@ use crate::core::{
     hash_manager::HashAlgorithm,
     io::{
         bulk_hash_error::BulkHashError,
+        compression::{
+            ArchiveCompressionMethod, ArchiveCompressionStats, CompressionLevel,
+            CompressionMetadata, parse_compression_metadata,
+        },
         directory_node::DirectoryNode,
         encryption::{
-            ENCRYPTED_TREE_ENTRY, EncryptionOptions, build_tree_aad, decrypt_tree_payload,
-            encrypt_tree_payload, parse_encryption_metadata, prepare_encryption_metadata,
+            ENCRYPTED_TREE_ENTRY, EncryptionOptions, PayloadCompression, build_tree_aad,
+            decrypt_tree_payload, encrypt_tree_payload_with_compression, parse_encryption_metadata,
+            prepare_encryption_metadata_with_compression,
         },
         meta_data::MetaData,
         migration::{
@@ -40,6 +45,7 @@ static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 struct ProbedArchive {
     archive: ZipArchive<BufReader<File>>,
+    archive_file_size: u64,
     entries: Vec<String>,
     meta_bytes: Vec<u8>,
     meta_value: Value,
@@ -48,10 +54,75 @@ struct ProbedArchive {
     path_display: String,
 }
 
+/// Builder-style configuration for saving `.hashed` snapshot archives.
+///
+/// Combines configurable ZIP/payload compression strength ([`CompressionLevel`]) with optional
+/// AES-256-GCM + Argon2id snapshot encryption ([`EncryptionOptions`]).
+#[derive(Debug, Clone, Default)]
+pub struct SaveOptions {
+    compression: CompressionLevel,
+    encryption: Option<EncryptionOptions>,
+}
+
+impl SaveOptions {
+    /// Creates default save options ([`CompressionLevel::BALANCED`], unencrypted).
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            compression: CompressionLevel::BALANCED,
+            encryption: None,
+        }
+    }
+
+    /// Configures the `.hashed` ZIP / payload compression level (`0` = Stored, `1..=9` = DEFLATE).
+    #[must_use]
+    pub const fn with_compression(mut self, compression: CompressionLevel) -> Self {
+        self.compression = compression;
+        self
+    }
+
+    /// Enables AES-256-GCM + Argon2id snapshot encryption with `encryption`.
+    #[must_use]
+    pub fn with_encryption(mut self, encryption: EncryptionOptions) -> Self {
+        self.encryption = Some(encryption);
+        self
+    }
+
+    /// Sets optional snapshot encryption (`Some` to encrypt, `None` for plaintext).
+    #[must_use]
+    pub fn with_optional_encryption(mut self, encryption: Option<EncryptionOptions>) -> Self {
+        self.encryption = encryption;
+        self
+    }
+
+    #[must_use]
+    pub const fn compression(&self) -> CompressionLevel {
+        self.compression
+    }
+
+    #[must_use]
+    pub const fn encryption(&self) -> Option<&EncryptionOptions> {
+        self.encryption.as_ref()
+    }
+
+    /// Validates configured save options (e.g., encryption password and KDF safety bounds).
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`EncryptionOptions::validate`] errors when encryption is enabled.
+    pub fn validate(&self) -> Result<(), BulkHashError> {
+        if let Some(enc) = &self.encryption {
+            enc.validate()?;
+        }
+        Ok(())
+    }
+}
+
 pub struct FileManager {}
 
 impl FileManager {
-    /// Saves an unencrypted snapshot into `folder` using the current `.hashed` format version.
+    /// Saves an unencrypted snapshot into `folder` using the current `.hashed` format version
+    /// and default balanced ZIP compression ([`CompressionLevel::BALANCED`]).
     ///
     /// # Errors
     ///
@@ -62,11 +133,33 @@ impl FileManager {
         json: &DirectoryNode,
         meta: &MetaData,
     ) -> Result<PathBuf, BulkHashError> {
-        Self::save_file_with_encryption(folder, json, meta, None)
+        Self::save_file_internal(
+            folder.as_ref(),
+            json,
+            meta,
+            CompressionLevel::default(),
+            None,
+        )
+    }
+
+    /// Saves an unencrypted snapshot into `folder` using the specified [`CompressionLevel`]
+    /// (`0` = uncompressed `Stored` for maximum speed, `1..=9` = ZIP DEFLATE from fast to smallest).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BulkHashError::PathNotFound`], [`BulkHashError::NotADirectory`],
+    /// [`BulkHashError::UnsupportedVersion`], or I/O / serialization errors.
+    pub fn save_file_with_compression(
+        folder: impl AsRef<Path>,
+        json: &DirectoryNode,
+        meta: &MetaData,
+        compression: CompressionLevel,
+    ) -> Result<PathBuf, BulkHashError> {
+        Self::save_file_internal(folder.as_ref(), json, meta, compression, None)
     }
 
     /// Saves a password-protected (AES-256-GCM + Argon2id) snapshot into `folder` using the
-    /// current `.hashed` format version.
+    /// current `.hashed` format version and default balanced compression.
     ///
     /// A fresh cryptographically random 128-bit salt and 96-bit nonce are generated on every call,
     /// and the serialized `meta.json` bytes are cryptographically bound as AES-GCM AAD.
@@ -83,11 +176,17 @@ impl FileManager {
         meta: &MetaData,
         options: &EncryptionOptions,
     ) -> Result<PathBuf, BulkHashError> {
-        Self::save_file_with_encryption(folder, json, meta, Some(options))
+        Self::save_file_internal(
+            folder.as_ref(),
+            json,
+            meta,
+            CompressionLevel::default(),
+            Some(options),
+        )
     }
 
     /// Saves a snapshot into `folder`, optionally encrypting the file tree when `encryption` is
-    /// `Some`.
+    /// `Some`, using default balanced compression.
     ///
     /// # Errors
     ///
@@ -99,7 +198,52 @@ impl FileManager {
         meta: &MetaData,
         encryption: Option<&EncryptionOptions>,
     ) -> Result<PathBuf, BulkHashError> {
-        let folder_path = folder.as_ref();
+        Self::save_file_internal(
+            folder.as_ref(),
+            json,
+            meta,
+            CompressionLevel::default(),
+            encryption,
+        )
+    }
+
+    /// Saves a snapshot into `folder` using unified [`SaveOptions`] (combining ZIP/payload
+    /// compression level and optional AES-256-GCM encryption).
+    ///
+    /// For encrypted snapshots:
+    /// - `meta.json` and `hash.sha256` use `options.compression()` in the ZIP container.
+    /// - `tree.enc` is always stored uncompressed (`Stored`) in the ZIP container because
+    ///   ciphertext is incompressible; instead, `options.compression()` controls the inner
+    ///   pre-encryption DEFLATE level (unless `PayloadCompression::None` was explicitly selected
+    ///   on [`EncryptionOptions`], which is always respected).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BulkHashError::PathNotFound`], [`BulkHashError::NotADirectory`],
+    /// [`BulkHashError::UnsupportedVersion`], encryption errors, or I/O / serialization errors.
+    pub fn save_file_with_options(
+        folder: impl AsRef<Path>,
+        json: &DirectoryNode,
+        meta: &MetaData,
+        options: &SaveOptions,
+    ) -> Result<PathBuf, BulkHashError> {
+        options.validate()?;
+        Self::save_file_internal(
+            folder.as_ref(),
+            json,
+            meta,
+            options.compression(),
+            options.encryption(),
+        )
+    }
+
+    fn save_file_internal(
+        folder_path: &Path,
+        json: &DirectoryNode,
+        meta: &MetaData,
+        compression: CompressionLevel,
+        encryption: Option<&EncryptionOptions>,
+    ) -> Result<PathBuf, BulkHashError> {
         let folder_display = folder_path.to_string_lossy().into_owned();
 
         let exists = folder_path
@@ -129,7 +273,7 @@ impl FileManager {
         );
         let output_path = folder_path.join(file_name);
 
-        let write_result = Self::write_archive(&output_path, json, meta, encryption);
+        let write_result = Self::write_archive(&output_path, json, meta, compression, encryption);
         if let Err(err) = write_result {
             let _ = fs::remove_file(&output_path);
             return Err(err);
@@ -138,14 +282,14 @@ impl FileManager {
         Ok(output_path)
     }
 
-    /// Inspects a `.hashed` archive's format version, encryption status, and entry list without
-    /// reading, decrypting, or deserializing `tree.json` / `tree.enc`.
+    /// Inspects a `.hashed` archive's format version, encryption status, compression metadata,
+    /// and entry list without reading, decrypting, or deserializing `tree.json` / `tree.enc`.
     ///
     /// # Errors
     ///
     /// Returns an error if the file does not exist, has an invalid extension, is not a valid ZIP
-    /// archive, has a missing/corrupted `meta.json`, or has invalid encryption parameters in a
-    /// supported format version.
+    /// archive, has a missing/corrupted `meta.json`, or has invalid encryption/compression
+    /// parameters in a supported format version.
     pub fn inspect_version(path: impl AsRef<Path>) -> Result<ArchiveVersionInfo, BulkHashError> {
         let probed = Self::open_and_probe_archive(path.as_ref())?;
         let registry = MigrationRegistry::with_builtin_migrations();
@@ -176,13 +320,74 @@ impl FileManager {
             None
         };
 
+        let compression =
+            Self::extract_compression_metadata(&probed.meta_value, compatibility.is_supported())?;
+
         Ok(ArchiveVersionInfo {
             version: probed.version,
             current_version: CURRENT_FORMAT_VERSION,
             compatibility,
             encrypted: probed.encrypted,
             encryption,
+            compression,
             entries: probed.entries,
+        })
+    }
+
+    /// Inspects a `.hashed` archive's declared compression metadata and actual ZIP central
+    /// directory byte statistics without decompressing or decrypting `tree.json` / `tree.enc`.
+    ///
+    /// Works on both unencrypted and password-encrypted snapshots without requiring a password.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file does not exist, has an invalid extension, is not a valid ZIP
+    /// archive, has a missing/corrupted `meta.json`, or has invalid compression metadata in a
+    /// supported format version.
+    pub fn inspect_compression(
+        path: impl AsRef<Path>,
+    ) -> Result<ArchiveCompressionStats, BulkHashError> {
+        let mut probed = Self::open_and_probe_archive(path.as_ref())?;
+        let registry = MigrationRegistry::with_builtin_migrations();
+        let compatibility = registry.check_compatibility(probed.version);
+        let declared =
+            Self::extract_compression_metadata(&probed.meta_value, compatibility.is_supported())?;
+
+        let primary_tree_entry = if probed.encrypted {
+            ENCRYPTED_TREE_ENTRY
+        } else {
+            "tree.json"
+        };
+
+        let mut total_compressed_bytes = 0u64;
+        let mut total_uncompressed_bytes = 0u64;
+        let mut tree_zip_method = None;
+        let mut tree_compressed_bytes = None;
+        let mut tree_uncompressed_bytes = None;
+
+        for idx in 0..probed.archive.len() {
+            let entry = probed.archive.by_index_raw(idx)?;
+            let compressed = entry.compressed_size();
+            let uncompressed = entry.size();
+            total_compressed_bytes = total_compressed_bytes.saturating_add(compressed);
+            total_uncompressed_bytes = total_uncompressed_bytes.saturating_add(uncompressed);
+
+            if entry.name()?.as_ref() == primary_tree_entry {
+                tree_zip_method = ArchiveCompressionMethod::from_zip_method(entry.compression());
+                tree_compressed_bytes = Some(compressed);
+                tree_uncompressed_bytes = Some(uncompressed);
+            }
+        }
+
+        Ok(ArchiveCompressionStats {
+            declared,
+            tree_zip_method,
+            archive_file_size: probed.archive_file_size,
+            total_compressed_bytes,
+            total_uncompressed_bytes,
+            tree_compressed_bytes,
+            tree_uncompressed_bytes,
+            encrypted: probed.encrypted,
         })
     }
 
@@ -252,11 +457,14 @@ impl FileManager {
             .get_migration()
             .cloned()
             .unwrap_or_else(|| MigrationReport::up_to_date(CURRENT_FORMAT_VERSION));
+        let compression =
+            Self::resolve_compression_for_encryption(loaded.get_compression_level(), options);
 
         let staged_path = Self::write_archive_staged(
             dest_parent,
             loaded.get_tree(),
             loaded.get_meta(),
+            compression,
             Some(options),
         )?;
         if let Err(err) = Self::replace_file_from_staged(&staged_path, dest_ref, &dest_display) {
@@ -269,7 +477,7 @@ impl FileManager {
 
     /// Decrypts an encrypted `.hashed` snapshot (`source`) using `password` and writes an
     /// unencrypted v3 archive atomically to `destination` (safe even when `source` and
-    /// `destination` refer to the same path).
+    /// `destination` refer to the same path), preserving the archive's compression level.
     ///
     /// # Errors
     ///
@@ -296,9 +504,15 @@ impl FileManager {
             .get_migration()
             .cloned()
             .unwrap_or_else(|| MigrationReport::up_to_date(CURRENT_FORMAT_VERSION));
+        let compression = loaded.get_compression_level().unwrap_or_default();
 
-        let staged_path =
-            Self::write_archive_staged(dest_parent, loaded.get_tree(), loaded.get_meta(), None)?;
+        let staged_path = Self::write_archive_staged(
+            dest_parent,
+            loaded.get_tree(),
+            loaded.get_meta(),
+            compression,
+            None,
+        )?;
         if let Err(err) = Self::replace_file_from_staged(&staged_path, dest_ref, &dest_display) {
             let _ = fs::remove_file(&staged_path);
             return Err(err);
@@ -340,12 +554,96 @@ impl FileManager {
             .get_migration()
             .cloned()
             .unwrap_or_else(|| MigrationReport::up_to_date(CURRENT_FORMAT_VERSION));
+        let compression =
+            Self::resolve_compression_for_encryption(loaded.get_compression_level(), new_options);
 
         let staged_path = Self::write_archive_staged(
             dest_parent,
             loaded.get_tree(),
             loaded.get_meta(),
+            compression,
             Some(new_options),
+        )?;
+        if let Err(err) = Self::replace_file_from_staged(&staged_path, dest_ref, &dest_display) {
+            let _ = fs::remove_file(&staged_path);
+            return Err(err);
+        }
+
+        Ok(report)
+    }
+
+    /// Rewrites an existing unencrypted `.hashed` snapshot (`source`) at the specified
+    /// [`CompressionLevel`] and writes the result atomically to `destination` (safe even when
+    /// `source` and `destination` refer to the same path).
+    ///
+    /// Older unencrypted v1/v2 snapshots are verified and upgraded to [`CURRENT_FORMAT_VERSION`]
+    /// as part of the operation; the returned [`MigrationReport`] records any format upgrade.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BulkHashError::PasswordRequired`] if `source` is encrypted (use
+    /// [`Self::recompress_file_with_password`]), or validation / I/O / corruption errors.
+    pub fn recompress_file(
+        source: impl AsRef<Path>,
+        destination: impl AsRef<Path>,
+        compression: CompressionLevel,
+    ) -> Result<MigrationReport, BulkHashError> {
+        Self::recompress_file_with_password(source, destination, compression, None)
+    }
+
+    /// Password-aware counterpart to [`Self::recompress_file`] supporting both unencrypted and
+    /// AES-256-GCM encrypted `.hashed` snapshots.
+    ///
+    /// For encrypted archives, preserves the password and Argon2id KDF parameters, generates a
+    /// brand-new CSPRNG salt and nonce, and updates the inner payload compression to match
+    /// `compression` ([`PayloadCompression::None`] when `compression == CompressionLevel::NONE`,
+    /// otherwise [`PayloadCompression::Deflate`] at `compression.level()`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BulkHashError::PasswordRequired`], [`BulkHashError::EmptyPassword`],
+    /// [`BulkHashError::DecryptionFailed`], or validation / I/O / corruption errors.
+    pub fn recompress_file_with_password(
+        source: impl AsRef<Path>,
+        destination: impl AsRef<Path>,
+        compression: CompressionLevel,
+        password: Option<&str>,
+    ) -> Result<MigrationReport, BulkHashError> {
+        let source_ref = source.as_ref();
+        let dest_ref = destination.as_ref();
+        let (dest_parent, dest_display) = Self::validate_destination_path(dest_ref)?;
+
+        let loaded = Self::open_file_internal(source_ref, password)?;
+        let report = loaded
+            .get_migration()
+            .cloned()
+            .unwrap_or_else(|| MigrationReport::up_to_date(CURRENT_FORMAT_VERSION));
+
+        let encryption = if let Some(enc_meta) = loaded.get_encryption() {
+            let Some(pwd) = password else {
+                return Err(BulkHashError::PasswordRequired(
+                    source_ref.to_string_lossy().into_owned(),
+                ));
+            };
+            let target_payload_compression = if compression.is_uncompressed() {
+                PayloadCompression::None
+            } else {
+                PayloadCompression::Deflate
+            };
+            let opts = EncryptionOptions::new(pwd)?
+                .with_kdf_params(enc_meta.kdf_params)?
+                .with_payload_compression(target_payload_compression);
+            Some(opts)
+        } else {
+            None
+        };
+
+        let staged_path = Self::write_archive_staged(
+            dest_parent,
+            loaded.get_tree(),
+            loaded.get_meta(),
+            compression,
+            encryption.as_ref(),
         )?;
         if let Err(err) = Self::replace_file_from_staged(&staged_path, dest_ref, &dest_display) {
             let _ = fs::remove_file(&staged_path);
@@ -373,8 +671,9 @@ impl FileManager {
         Self::migrate_file_with_password(source, destination, None)
     }
 
-    /// Password-aware counterpart to [`Self::migrate_file`] that preserves encryption on
-    /// password-protected archives (generating a fresh salt and nonce if written).
+    /// Password-aware counterpart to [`Self::migrate_file`] that preserves encryption and
+    /// compression settings on password-protected archives (generating a fresh salt and nonce if
+    /// written).
     ///
     /// # Errors
     ///
@@ -400,10 +699,12 @@ impl FileManager {
         }
 
         let preserved_encryption = Self::preserve_encryption_options(&loaded, password)?;
+        let preserved_compression = loaded.get_compression_level().unwrap_or_default();
         let staged_path = Self::write_archive_staged(
             dest_parent,
             loaded.get_tree(),
             loaded.get_meta(),
+            preserved_compression,
             preserved_encryption.as_ref(),
         )?;
         if let Err(err) = Self::replace_file_from_staged(&staged_path, dest_ref, &dest_display) {
@@ -453,10 +754,12 @@ impl FileManager {
 
         let parent_dir = Self::resolve_parent_dir(path_ref);
         let preserved_encryption = Self::preserve_encryption_options(&loaded, password)?;
+        let preserved_compression = loaded.get_compression_level().unwrap_or_default();
         let staged_path = Self::write_archive_staged(
             parent_dir,
             loaded.get_tree(),
             loaded.get_meta(),
+            preserved_compression,
             preserved_encryption.as_ref(),
         )?;
 
@@ -519,6 +822,8 @@ impl FileManager {
                 probed.path_display
             )));
         }
+
+        let _ = Self::extract_compression_metadata(&probed.meta_value, true)?;
 
         if probed.encrypted {
             let enc_val = probed.meta_value.get("encryption").ok_or_else(|| {
@@ -676,6 +981,39 @@ impl FileManager {
         Ok(Some(opts))
     }
 
+    const fn resolve_compression_for_encryption(
+        existing: Option<CompressionLevel>,
+        enc_options: &EncryptionOptions,
+    ) -> CompressionLevel {
+        match existing {
+            Some(level) if level.is_uncompressed() => match enc_options.payload_compression() {
+                PayloadCompression::None => CompressionLevel::NONE,
+                PayloadCompression::Deflate => CompressionLevel::BALANCED,
+            },
+            Some(level) => level,
+            None => CompressionLevel::BALANCED,
+        }
+    }
+
+    fn extract_compression_metadata(
+        meta_value: &Value,
+        strict: bool,
+    ) -> Result<Option<CompressionMetadata>, BulkHashError> {
+        let Some(comp_val) = meta_value
+            .as_object()
+            .and_then(|obj| obj.get("compression"))
+            .filter(|val| !val.is_null())
+        else {
+            return Ok(None);
+        };
+
+        if strict {
+            Ok(Some(parse_compression_metadata(comp_val)?))
+        } else {
+            Ok(parse_compression_metadata(comp_val).ok())
+        }
+    }
+
     fn validate_destination_path(dest_ref: &Path) -> Result<(&Path, String), BulkHashError> {
         let dest_display = dest_ref.to_string_lossy().into_owned();
         Self::validate_hashed_extension(dest_ref, &dest_display)?;
@@ -721,6 +1059,10 @@ impl FileManager {
 
         let file = File::open(path_ref)
             .map_err(|err| BulkHashError::from_io(err, path_display.clone()))?;
+        let archive_file_size = file
+            .metadata()
+            .map_err(|err| BulkHashError::from_io(err, path_display.clone()))?
+            .len();
         let reader = BufReader::new(file);
 
         let mut archive = ZipArchive::new(reader)?;
@@ -750,6 +1092,7 @@ impl FileManager {
 
         Ok(ProbedArchive {
             archive,
+            archive_file_size,
             entries,
             meta_bytes,
             meta_value,
@@ -792,24 +1135,28 @@ impl FileManager {
         output_path: &Path,
         json: &DirectoryNode,
         meta: &MetaData,
+        compression: CompressionLevel,
         encryption: Option<&EncryptionOptions>,
     ) -> Result<(), BulkHashError> {
         let output_display = output_path.to_string_lossy().into_owned();
         let file = File::create(output_path)
             .map_err(|err| BulkHashError::from_io(err, output_display.clone()))?;
-        Self::write_archive_to_file(file, json, meta, encryption, &output_display)
+        Self::write_archive_to_file(file, json, meta, compression, encryption, &output_display)
     }
 
     fn write_archive_staged(
         parent_dir: &Path,
         json: &DirectoryNode,
         meta: &MetaData,
+        compression: CompressionLevel,
         encryption: Option<&EncryptionOptions>,
     ) -> Result<PathBuf, BulkHashError> {
         let (temp_path, file) = Self::create_unique_temp_file(parent_dir)?;
         let temp_display = temp_path.to_string_lossy().into_owned();
 
-        if let Err(err) = Self::write_archive_to_file(file, json, meta, encryption, &temp_display) {
+        if let Err(err) =
+            Self::write_archive_to_file(file, json, meta, compression, encryption, &temp_display)
+        {
             let _ = fs::remove_file(&temp_path);
             return Err(err);
         }
@@ -821,26 +1168,36 @@ impl FileManager {
         file: File,
         json: &DirectoryNode,
         meta: &MetaData,
+        compression: CompressionLevel,
         encryption: Option<&EncryptionOptions>,
         output_display: &str,
     ) -> Result<(), BulkHashError> {
         let writer = BufWriter::new(file);
         let mut zip = ZipWriter::new(writer);
 
-        let deflated_options =
-            SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        let entry_options = compression.to_zip_file_options();
+        let compression_meta = Some(compression.to_metadata());
 
         if let Some(enc_options) = encryption {
-            let enc_meta = prepare_encryption_metadata(enc_options)?;
-            let effective_meta = meta.clone().with_encryption_metadata(Some(enc_meta.clone()));
+            let enc_meta = prepare_encryption_metadata_with_compression(enc_options, compression)?;
+            let effective_meta = meta
+                .clone()
+                .with_encryption_metadata(Some(enc_meta.clone()))
+                .with_compression_metadata(compression_meta);
             let meta_bytes = serde_json::to_vec(&effective_meta)?;
 
             let aad = build_tree_aad(effective_meta.get_version(), &meta_bytes);
             let tree_bytes = Zeroizing::new(serde_json::to_vec(json)?);
-            let ciphertext = encrypt_tree_payload(&tree_bytes, enc_options, &enc_meta, &aad)?;
+            let ciphertext = encrypt_tree_payload_with_compression(
+                &tree_bytes,
+                enc_options,
+                &enc_meta,
+                &aad,
+                compression,
+            )?;
             let ciphertext_hash = HashAlgorithm::Sha256.get_hash_from_bytes(&ciphertext);
 
-            zip.start_file("meta.json", deflated_options)?;
+            zip.start_file("meta.json", entry_options)?;
             zip.write_all(&meta_bytes)
                 .map_err(|err| BulkHashError::from_io(err, output_display))?;
 
@@ -852,22 +1209,25 @@ impl FileManager {
             zip.write_all(&ciphertext)
                 .map_err(|err| BulkHashError::from_io(err, output_display))?;
 
-            zip.start_file("hash.sha256", deflated_options)?;
+            zip.start_file("hash.sha256", entry_options)?;
             zip.write_all(ciphertext_hash.as_bytes())
                 .map_err(|err| BulkHashError::from_io(err, output_display))?;
         } else {
-            let clean_meta = meta.clone().with_encryption_metadata(None);
-            zip.start_file("meta.json", deflated_options)?;
+            let clean_meta = meta
+                .clone()
+                .with_encryption_metadata(None)
+                .with_compression_metadata(compression_meta);
+            zip.start_file("meta.json", entry_options)?;
             serde_json::to_writer(&mut zip, &clean_meta)?;
 
             let tree = serde_json::to_vec(json)?;
             let hash = HashAlgorithm::Sha256.get_hash_from_bytes(&tree);
 
-            zip.start_file("tree.json", deflated_options)?;
+            zip.start_file("tree.json", entry_options)?;
             zip.write_all(&tree)
                 .map_err(|err| BulkHashError::from_io(err, output_display))?;
 
-            zip.start_file("hash.sha256", deflated_options)?;
+            zip.start_file("hash.sha256", entry_options)?;
             zip.write_all(hash.as_bytes())
                 .map_err(|err| BulkHashError::from_io(err, output_display))?;
         }

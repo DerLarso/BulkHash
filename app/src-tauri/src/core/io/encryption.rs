@@ -7,10 +7,11 @@ use aes_gcm::{
 };
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use flate2::{Compression, read::DeflateDecoder, write::DeflateEncoder};
+use flate2::{read::DeflateDecoder, write::DeflateEncoder};
 use zeroize::Zeroizing;
 
 use crate::core::io::bulk_hash_error::BulkHashError;
+use crate::core::io::compression::CompressionLevel;
 
 /// ZIP archive entry name for encrypted directory trees in `.hashed` format v3+.
 pub const ENCRYPTED_TREE_ENTRY: &str = "tree.enc";
@@ -424,6 +425,29 @@ pub fn prepare_encryption_metadata(
     EncryptionMetadata::generate(options.kdf_params(), options.payload_compression())
 }
 
+/// Generates fresh [`EncryptionMetadata`] (with brand-new random salt and nonce) while aligning
+/// inner payload compression with `compression`:
+/// - If `compression` is [`CompressionLevel::NONE`] (level `0`), inner payload compression is
+///   disabled ([`PayloadCompression::None`]) so zero DEFLATE overhead is incurred.
+/// - Otherwise, honors `options.payload_compression()` (including an explicit opt-out via
+///   [`PayloadCompression::None`]).
+///
+/// # Errors
+///
+/// Returns an error if `options` are invalid or the OS CSPRNG fails.
+pub fn prepare_encryption_metadata_with_compression(
+    options: &EncryptionOptions,
+    compression: CompressionLevel,
+) -> Result<EncryptionMetadata, BulkHashError> {
+    options.validate()?;
+    let effective_payload_compression = if compression.is_uncompressed() {
+        PayloadCompression::None
+    } else {
+        options.payload_compression()
+    };
+    EncryptionMetadata::generate(options.kdf_params(), effective_payload_compression)
+}
+
 /// Parses and validates an [`EncryptionMetadata`] header from a parsed `meta.json` JSON value.
 ///
 /// # Errors
@@ -502,7 +526,9 @@ pub fn derive_key(
     }
 }
 
-/// Encrypts `plaintext_tree_json` using AES-256-GCM with an Argon2id-derived key and AAD.
+/// Encrypts `plaintext_tree_json` using AES-256-GCM with an Argon2id-derived key and AAD,
+/// using the default DEFLATE compression level when `metadata.payload_compression` is
+/// [`PayloadCompression::Deflate`].
 ///
 /// Intermediate plaintext compression buffers and the derived key are zeroized on drop.
 ///
@@ -516,6 +542,32 @@ pub fn encrypt_tree_payload(
     metadata: &EncryptionMetadata,
     aad: &[u8],
 ) -> Result<Vec<u8>, BulkHashError> {
+    encrypt_tree_payload_with_compression(
+        plaintext_tree_json,
+        options,
+        metadata,
+        aad,
+        CompressionLevel::default(),
+    )
+}
+
+/// Encrypts `plaintext_tree_json` using AES-256-GCM with an Argon2id-derived key and AAD,
+/// applying `compression` to the pre-encryption DEFLATE stream when
+/// `metadata.payload_compression` is [`PayloadCompression::Deflate`].
+///
+/// Intermediate plaintext compression buffers and the derived key are zeroized on drop.
+///
+/// # Errors
+///
+/// Returns an error if `options` or `metadata` are invalid, compression fails, key derivation
+/// fails, or AES-256-GCM encryption fails.
+pub fn encrypt_tree_payload_with_compression(
+    plaintext_tree_json: &[u8],
+    options: &EncryptionOptions,
+    metadata: &EncryptionMetadata,
+    aad: &[u8],
+    compression: CompressionLevel,
+) -> Result<Vec<u8>, BulkHashError> {
     metadata.validate()?;
     let nonce_bytes = metadata.decode_nonce()?;
     let key = derive_key(options.password(), metadata)?;
@@ -523,7 +575,7 @@ pub fn encrypt_tree_payload(
     let compressed_buf: Option<Zeroizing<Vec<u8>>> = match metadata.payload_compression {
         PayloadCompression::None => None,
         PayloadCompression::Deflate => {
-            let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+            let mut encoder = DeflateEncoder::new(Vec::new(), compression.to_flate2_compression());
             encoder.write_all(plaintext_tree_json).map_err(|err| {
                 BulkHashError::EncryptionFailed(format!(
                     "failed to compress tree payload prior to encryption: {err}"
