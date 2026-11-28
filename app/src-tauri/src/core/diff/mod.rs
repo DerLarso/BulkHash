@@ -1,5 +1,6 @@
 pub mod file_status;
 pub mod folder_status;
+pub mod statistics;
 pub mod tree_diff;
 pub mod warnings;
 
@@ -11,6 +12,11 @@ pub use file_status::{
 pub use folder_status::{
     FolderStatus, FolderStatusCounts, FolderStatusFilter, FolderStatusSummary,
     ParseFolderStatusError, derive_folder_status, propagate_folder_statuses,
+};
+pub use statistics::{
+    DiffStatistics, FolderStorageStats, StorageStatistics, compute_diff_statistics,
+    compute_folder_storage_stats, compute_storage_statistics, compute_subtree_statistics,
+    format_bytes, format_signed_bytes,
 };
 pub use tree_diff::{
     ComparisonOptions, DiffDirIter, DiffDirectoryNode, DiffFileEntry, DiffFileIter, EntryPresence,

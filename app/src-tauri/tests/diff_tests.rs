@@ -1,12 +1,13 @@
 use bulk_hash_lib::core::{
     diff::{
-        ComparisonOptions, ComparisonWarning, DiffDirectoryNode, DiffFileEntry, EntryPresence,
-        FileComparisonOutcome, FileStatus, FileStatusCounts, FileStatusDetail, FileStatusFilter,
-        FileStatusPolicy, FolderStatus, FolderStatusCounts, FolderStatusFilter,
-        MAX_WARNING_SAMPLES, NameMatchingMode, PrecheckReport, TreeComparer, TreeDiff, WarningCode,
-        WarningDetails, WarningSeverity, classify_file_entry, classify_file_entry_detailed,
-        classify_pair, compare_snapshots, compare_snapshots_with_options, compare_trees,
-        compare_trees_with_options, extract_path_basename, infer_os_from_path,
+        ComparisonOptions, ComparisonWarning, DiffDirectoryNode, DiffFileEntry, DiffStatistics,
+        EntryPresence, FileComparisonOutcome, FileStatus, FileStatusCounts, FileStatusDetail,
+        FileStatusFilter, FileStatusPolicy, FolderStatus, FolderStatusCounts, FolderStatusFilter,
+        MAX_WARNING_SAMPLES, NameMatchingMode, PrecheckReport, StorageStatistics, TreeComparer,
+        TreeDiff, WarningCode, WarningDetails, WarningSeverity, classify_file_entry,
+        classify_file_entry_detailed, classify_pair, compare_snapshots,
+        compare_snapshots_with_options, compare_trees, compare_trees_with_options,
+        extract_path_basename, format_bytes, format_signed_bytes, infer_os_from_path,
         precheck_archive_files, precheck_metadata, precheck_snapshots, precheck_trees,
         precheck_trees_with_metadata,
     },
@@ -1798,4 +1799,260 @@ fn folder_status_filter_queries_parsing_and_serde_roundtrip() {
     let diff_json = serde_json::to_string(&diff).expect("serialize diff");
     let diff_decoded: TreeDiff = serde_json::from_str(&diff_json).expect("deserialize diff");
     assert_eq!(diff_decoded, diff);
+}
+
+#[test]
+fn diff_statistics_calculates_exact_change_counts_and_storage_deltas() {
+    let t1 = utc(2026, 9, 1, 10, 0, 0);
+    let t2 = utc(2026, 9, 2, 10, 0, 0);
+
+    let mut left = DirectoryNode::new(String::from("/app"));
+    left.insert_path(&["unchanged.bin"], file_entry(hash64('a'), 1_000, t1));
+    left.insert_path(&["grew.bin"], file_entry(hash64('b'), 500, t1));
+    left.insert_path(&["shrank.bin"], file_entry(hash64('c'), 800, t1));
+    left.insert_path(&["meta_only.bin"], file_entry(hash64('d'), 300, t1));
+    left.insert_path(&["deleted.bin"], file_entry(hash64('e'), 400, t1));
+
+    let mut right = DirectoryNode::new(String::from("/app"));
+    right.insert_path(&["unchanged.bin"], file_entry(hash64('a'), 1_000, t1));
+    right.insert_path(&["grew.bin"], file_entry(hash64('x'), 900, t2)); // +400
+    right.insert_path(&["shrank.bin"], file_entry(hash64('y'), 200, t2)); // -600
+    right.insert_path(&["meta_only.bin"], file_entry(hash64('d'), 300, t2)); // 0
+    right.insert_path(&["added.bin"], file_entry(hash64('z'), 1_200, t2)); // +1200
+
+    let mut diff = compare_trees(&left, &right);
+    let stats = diff.statistics();
+
+    assert_eq!(stats.total_files(), 6);
+    assert_eq!(stats.total_file_changes(), 5);
+    assert_eq!(stats.files.unchanged, 1);
+    assert_eq!(stats.files.modified, 3);
+    assert_eq!(stats.files.added, 1);
+    assert_eq!(stats.files.removed, 1);
+    assert_eq!(stats.files.error, 0);
+    assert_eq!(stats.content_modified_files, 2);
+    assert_eq!(stats.metadata_only_modified_files, 1);
+    assert!(stats.has_changes());
+    assert!(!stats.has_errors());
+    assert!(!stats.truncated);
+
+    let s = stats.storage();
+    assert_eq!(s.left_total_bytes, 3_000);
+    assert_eq!(s.right_total_bytes, 3_600);
+    assert_eq!(s.net_delta_bytes, 600);
+    assert_eq!(stats.net_size_delta(), 600);
+    assert_eq!(s.added_bytes, 1_200);
+    assert_eq!(s.removed_bytes, 400);
+    assert_eq!(s.modified_before_bytes, 1_600);
+    assert_eq!(s.modified_after_bytes, 1_400);
+    assert_eq!(s.modified_net_delta_bytes, -200);
+    assert_eq!(s.modified_growth_bytes, 400);
+    assert_eq!(s.modified_shrink_bytes, 600);
+    assert_eq!(s.unchanged_bytes, 1_000);
+    assert_eq!(s.total_bytes_gained(), 1_600); // 1200 added + 400 growth
+    assert_eq!(s.total_bytes_freed(), 1_000); // 400 removed + 600 shrink
+    assert!(s.is_size_complete());
+    assert!(!s.has_unknown_sizes());
+    assert!((s.net_delta_percent().expect("pct") - 20.0).abs() < 1e-9);
+    assert!((stats.file_change_ratio() - (5.0 / 6.0)).abs() < 1e-9);
+    assert!((stats.file_unchanged_ratio() - (1.0 / 6.0)).abs() < 1e-9);
+
+    // Reclassifying as content-only moves `meta_only.bin` from Modified to Unchanged!
+    diff.reclassify_statuses(FileStatusPolicy::content_only());
+    let content_stats = diff.statistics();
+    assert_eq!(content_stats.total_file_changes(), 4);
+    assert_eq!(content_stats.files.unchanged, 2);
+    assert_eq!(content_stats.files.modified, 2);
+    assert_eq!(content_stats.content_modified_files, 2);
+    assert_eq!(content_stats.metadata_only_modified_files, 0);
+    assert_eq!(content_stats.storage.unchanged_bytes, 1_300);
+    assert_eq!(content_stats.storage.modified_before_bytes, 1_300);
+    assert_eq!(content_stats.storage.modified_after_bytes, 1_100);
+    assert_eq!(content_stats.storage.net_delta_bytes, 600);
+
+    // Lossless JSON serde roundtrip.
+    let json = serde_json::to_string(&stats).expect("serialize DiffStatistics");
+    let decoded: DiffStatistics = serde_json::from_str(&json).expect("deserialize DiffStatistics");
+    assert_eq!(decoded, stats);
+}
+
+#[test]
+fn diff_statistics_handles_negative_deltas_unknown_sizes_truncation_and_empty_trees() {
+    let t = utc(2026, 9, 1, 10, 0, 0);
+
+    // Negative net delta + unknown sizes (legacy v1 / errored entries).
+    let mut left = DirectoryNode::new(String::from("/data"));
+    left.insert_path(&["big.bin"], file_entry(hash64('a'), 10_000, t));
+    left.insert_path(&["legacy.bin"], FileEntry::from_hash(hash64('b'), None, None));
+    left.insert_path(
+        &["broken.bin"],
+        FileEntry::from_error(String::from("io error"), None, None),
+    );
+
+    let mut right = DirectoryNode::new(String::from("/data"));
+    right.insert_path(&["big.bin"], file_entry(hash64('x'), 2_500, t));
+    right.insert_path(&["legacy.bin"], FileEntry::from_hash(hash64('b'), None, None));
+
+    let diff = compare_trees(&left, &right);
+    let stats = diff.statistics();
+    assert_eq!(stats.storage.left_total_bytes, 10_000);
+    assert_eq!(stats.storage.right_total_bytes, 2_500);
+    assert_eq!(stats.storage.net_delta_bytes, -7_500);
+    assert_eq!(stats.storage.abs_net_delta_bytes(), 7_500);
+    assert!((stats.storage.net_delta_percent().expect("pct") + 75.0).abs() < 1e-9);
+    assert_eq!(stats.storage.left_unknown_size_files, 2); // legacy.bin + broken.bin
+    assert_eq!(stats.storage.right_unknown_size_files, 1); // legacy.bin
+    assert!(stats.storage.has_unknown_sizes());
+    assert!(!stats.storage.is_size_complete());
+    assert!(stats.has_errors());
+
+    // Empty trees have 0% change and 100% unchanged ratio, 0.0% storage delta.
+    let empty = DirectoryNode::new(String::from("/empty"));
+    let empty_stats = compare_trees(&empty, &empty).statistics();
+    assert!(!empty_stats.has_changes());
+    assert_eq!(empty_stats.storage.net_delta_bytes, 0);
+    assert_eq!(empty_stats.storage.net_delta_percent(), Some(0.0));
+    assert!((empty_stats.file_change_ratio() - 0.0).abs() < 1e-9);
+    assert!((empty_stats.file_unchanged_ratio() - 1.0).abs() < 1e-9);
+
+    // Growing from 0 bytes to >0 bytes reports `None` for percentage (no infinity/NaN).
+    let mut non_empty = DirectoryNode::new(String::from("/empty"));
+    non_empty.insert_path(&["sub", "new.bin"], file_entry(hash64('1'), 500, t));
+    let grow_stats = compare_trees(&empty, &non_empty).statistics();
+    assert_eq!(grow_stats.storage.net_delta_bytes, 500);
+    assert_eq!(grow_stats.storage.net_delta_percent(), None);
+
+    // Truncated diff reflects `truncated = true` in statistics.
+    let trunc_diff =
+        compare_trees_with_options(&empty, &non_empty, &ComparisonOptions::new().with_max_depth(Some(0)));
+    assert!(trunc_diff.statistics().truncated);
+
+    // Empty added directory still reports `has_changes() == true` even with 0 changed files.
+    let mut with_empty_dir = DirectoryNode::new(String::from("/empty"));
+    with_empty_dir
+        .sub_directories
+        .insert(String::from("blank"), DirectoryNode::new(String::from("blank")));
+    let dir_only_stats = compare_trees(&empty, &with_empty_dir).statistics();
+    assert_eq!(dir_only_stats.total_file_changes(), 0);
+    assert_eq!(dir_only_stats.total_affected_directories(), 1);
+    assert!(dir_only_stats.has_changes());
+}
+
+#[test]
+fn per_folder_storage_stats_drilldown_top_changes_deep_trees_and_formatting() {
+    const DEPTH: usize = 2_000;
+    let t = utc(2026, 9, 1, 10, 0, 0);
+
+    let mut left = DirectoryNode::new(String::from("/project"));
+    left.insert_path(&["root.txt"], file_entry(hash64('r'), 100, t));
+    left.insert_path(&["assets", "img", "hero.png"], file_entry(hash64('a'), 5_000, t));
+    left.insert_path(&["docs", "guide.md"], file_entry(hash64('b'), 1_000, t));
+
+    let mut right = DirectoryNode::new(String::from("/project"));
+    right.insert_path(&["root.txt"], file_entry(hash64('r'), 100, t));
+    right.insert_path(&["assets", "img", "hero.png"], file_entry(hash64('a'), 5_000, t));
+    right.insert_path(&["assets", "img", "banner.png"], file_entry(hash64('c'), 8_000, t)); // +8000
+    right.insert_path(&["docs", "guide.md"], file_entry(hash64('d'), 200, t)); // -800
+    right.insert_path(&["videos", "intro.mp4"], file_entry(hash64('e'), 20_000, t)); // +20000
+
+    let diff = compare_trees(&left, &right);
+
+    // Full per-folder breakdown (pre-order): "", "assets", "assets/img", "docs", "videos".
+    let all_folders = diff.folder_storage_stats();
+    let folder_paths: Vec<&str> = all_folders.iter().map(|f| f.relative_path.as_str()).collect();
+    assert_eq!(
+        folder_paths,
+        vec!["", "assets", "assets/img", "docs", "videos"]
+    );
+
+    // Direct vs recursive storage on `assets`: 0 direct bytes, +8000 recursive bytes from `assets/img`.
+    let assets = &all_folders[1];
+    assert_eq!(assets.direct_net_delta_bytes(), 0);
+    assert_eq!(assets.recursive_net_delta_bytes(), 8_000);
+    assert_eq!(assets.recursive_storage.left_total_bytes, 5_000);
+    assert_eq!(assets.recursive_storage.right_total_bytes, 13_000);
+
+    // Drill-down immediate children of root sorted by abs recursive delta desc: videos (+20000), assets (+8000), docs (-800).
+    let top_level = diff
+        .child_folder_storage_stats("")
+        .expect("root children");
+    let top_level_names: Vec<&str> = top_level.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(top_level_names, vec!["videos", "assets", "docs"]);
+    assert_eq!(diff.child_folder_storage_stats("nonexistent"), None);
+
+    // Top 2 directories with non-zero DIRECT storage delta: videos (+20000), assets/img (+8000).
+    let top_direct = diff.top_folder_storage_changes(2);
+    let top_direct_paths: Vec<&str> = top_direct.iter().map(|f| f.relative_path.as_str()).collect();
+    assert_eq!(top_direct_paths, vec!["videos", "assets/img"]);
+    assert!(diff.top_folder_storage_changes(0).is_empty());
+
+    // Subtree `storage_statistics()` matches recursive folder stats.
+    assert_eq!(
+        diff.find_directory("assets")
+            .expect("assets")
+            .storage_statistics(),
+        assets.recursive_storage
+    );
+    assert_eq!(
+        diff.storage_statistics(),
+        StorageStatistics {
+            left_total_bytes: 6_100,
+            right_total_bytes: 33_300,
+            net_delta_bytes: 27_200,
+            added_bytes: 28_000,
+            removed_bytes: 0,
+            modified_before_bytes: 1_000,
+            modified_after_bytes: 200,
+            modified_net_delta_bytes: -800,
+            modified_growth_bytes: 0,
+            modified_shrink_bytes: 800,
+            unchanged_bytes: 5_100,
+            left_unknown_size_files: 0,
+            right_unknown_size_files: 0,
+        }
+    );
+
+    // Byte formatting helpers.
+    assert_eq!(format_bytes(0), "0 B");
+    assert_eq!(format_bytes(512), "512 B");
+    assert_eq!(format_bytes(1_024), "1.00 KiB");
+    assert_eq!(format_bytes(1_572_864), "1.50 MiB");
+    assert_eq!(format_signed_bytes(0), "0 B");
+    assert_eq!(format_signed_bytes(1_536), "+1.50 KiB");
+    assert_eq!(format_signed_bytes(-2_048), "-2.00 KiB");
+
+    // Stack-safe `folder_storage_stats()` on a 2,000-level deep tree.
+    let mut deep_l = DirectoryNode::new(String::from("/deep"));
+    let mut deep_r = DirectoryNode::new(String::from("/deep"));
+    let (mut cur_l, mut cur_r) = (&mut deep_l, &mut deep_r);
+    for level in 0..DEPTH {
+        let name = format!("d{level}");
+        cur_l = cur_l
+            .sub_directories
+            .entry(name.clone())
+            .or_insert_with(|| DirectoryNode::new(name.clone()));
+        cur_r = cur_r
+            .sub_directories
+            .entry(name.clone())
+            .or_insert_with(|| DirectoryNode::new(name));
+    }
+    cur_l
+        .files
+        .insert(String::from("leaf.bin"), file_entry(hash64('a'), 100, t));
+    cur_r
+        .files
+        .insert(String::from("leaf.bin"), file_entry(hash64('b'), 350, t));
+
+    let deep_diff = compare_trees(&deep_l, &deep_r);
+    let deep_folders = deep_diff.folder_storage_stats();
+    assert_eq!(deep_folders.len(), DEPTH + 1);
+    assert_eq!(deep_folders[0].recursive_net_delta_bytes(), 250);
+    assert_eq!(deep_folders[0].direct_net_delta_bytes(), 0);
+    assert_eq!(deep_folders[DEPTH].direct_net_delta_bytes(), 250);
+
+    drop(deep_diff);
+    let mut drain = vec![deep_l, deep_r];
+    while let Some(mut node) = drain.pop() {
+        drain.extend(std::mem::take(&mut node.sub_directories).into_values());
+    }
 }

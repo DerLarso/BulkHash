@@ -6,6 +6,10 @@ use crate::core::diff::folder_status::{
     FolderStatus, FolderStatusCounts, FolderStatusFilter, FolderStatusSummary,
     derive_folder_status, propagate_folder_statuses,
 };
+use crate::core::diff::statistics::{
+    DiffStatistics, FolderStorageStats, StorageStatistics, compute_diff_statistics,
+    compute_folder_storage_stats, compute_storage_statistics, compute_subtree_statistics,
+};
 use crate::core::diff::warnings::{
     ComparisonDiagnostics, ComparisonWarning, PrecheckContext, PrecheckReport, WarningCode,
     WarningContext, WarningSeverity, collect_warnings, evaluate_precheck,
@@ -743,6 +747,26 @@ impl DiffDirectoryNode {
         }
         grouped
     }
+
+    /// Computes comprehensive [`DiffStatistics`] (change counts and storage-space deltas) across
+    /// this directory and all nested descendants.
+    #[must_use]
+    pub fn statistics(&self) -> DiffStatistics {
+        compute_subtree_statistics(self)
+    }
+
+    /// Computes [`StorageStatistics`] across this directory and all nested descendants.
+    #[must_use]
+    pub fn storage_statistics(&self) -> StorageStatistics {
+        compute_storage_statistics(self)
+    }
+
+    /// Computes direct and recursive [`FolderStorageStats`] for this directory and every
+    /// descendant subdirectory in deterministic sorted pre-order.
+    #[must_use]
+    pub fn folder_storage_stats(&self) -> Vec<FolderStorageStats> {
+        compute_folder_storage_stats(self)
+    }
 }
 
 /// Stack-safe depth-first pre-order iterator over `&DiffDirectoryNode` entries.
@@ -1009,6 +1033,72 @@ impl TreeDiff {
     /// bottom-up across the entire diff tree iteratively (stack-safe).
     pub fn repropagate_folder_statuses(&mut self) {
         propagate_folder_statuses(&mut self.root);
+    }
+
+    /// Computes comprehensive [`DiffStatistics`] (total change counts, modification breakdown,
+    /// and byte-level storage deltas) across this diff.
+    #[must_use]
+    pub fn statistics(&self) -> DiffStatistics {
+        compute_diff_statistics(self)
+    }
+
+    /// Computes byte-level [`StorageStatistics`] across this diff.
+    #[must_use]
+    pub fn storage_statistics(&self) -> StorageStatistics {
+        self.root.storage_statistics()
+    }
+
+    /// Computes direct and recursive [`FolderStorageStats`] for the root and every subdirectory
+    /// in deterministic sorted pre-order (useful for per-folder bar charts and treemaps).
+    #[must_use]
+    pub fn folder_storage_stats(&self) -> Vec<FolderStorageStats> {
+        self.root.folder_storage_stats()
+    }
+
+    /// Returns [`FolderStorageStats`] for the immediate child subdirectories of
+    /// `parent_relative_path` (`""`, `"."`, or `"/"` for top-level folders), sorted by largest
+    /// absolute recursive storage delta descending, then by path ascending.
+    #[must_use]
+    pub fn child_folder_storage_stats(
+        &self,
+        parent_relative_path: &str,
+    ) -> Option<Vec<FolderStorageStats>> {
+        let parent = self.find_directory(parent_relative_path)?;
+        let target_depth = parent.depth().saturating_add(1);
+        let mut children: Vec<FolderStorageStats> = parent
+            .folder_storage_stats()
+            .into_iter()
+            .filter(|entry| entry.depth == target_depth)
+            .collect();
+        children.sort_by(|a, b| {
+            b.recursive_storage
+                .abs_net_delta_bytes()
+                .cmp(&a.recursive_storage.abs_net_delta_bytes())
+                .then_with(|| a.relative_path.cmp(&b.relative_path))
+        });
+        Some(children)
+    }
+
+    /// Returns up to `limit` directories with non-zero direct storage delta, ordered by largest
+    /// absolute direct byte delta descending, then by relative path ascending.
+    #[must_use]
+    pub fn top_folder_storage_changes(&self, limit: usize) -> Vec<FolderStorageStats> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let mut changed: Vec<FolderStorageStats> = self
+            .folder_storage_stats()
+            .into_iter()
+            .filter(|entry| entry.direct_storage.net_delta_bytes != 0)
+            .collect();
+        changed.sort_by(|a, b| {
+            b.direct_storage
+                .abs_net_delta_bytes()
+                .cmp(&a.direct_storage.abs_net_delta_bytes())
+                .then_with(|| a.relative_path.cmp(&b.relative_path))
+        });
+        changed.truncate(limit);
+        changed
     }
 
     /// Iteratively (stack-safe) recomputes [`DiffFileEntry::status`] across the entire diff tree
